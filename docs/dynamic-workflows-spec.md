@@ -20,6 +20,9 @@ We are adding **Dynamic Workflows** to Codex at feature parity with Claude Code'
 - **Resume**: `resumeFromRunId` replays the longest unchanged prefix of `agent()` calls from a `journal.jsonl` keyed by `(prompt, opts)`; first divergence onward runs live.
 - **Budget**: hard token ceiling; `agent()` throws once `spent >= total`.
 - **Surfacing**: background execution, completion notification, live phase/agent progress tree, script persisted and re-invocable by `scriptPath` or saved name.
+- **Live monitor view (parity)**: a `codex workflow watch <runId>` subcommand plus a TUI attach that render a live, in-place-updating progress tree of phases + agents for *running* background workflows — the Codex analog of Claude Code's `/workflows` live progress tree — and that remain viewable for completed runs (§9). Built on the aggregate app-server subscriptions (`subscribe_thread_created`, `subscribe_running_assistant_turn_count` in `app-server/src/request_processors/thread_processor.rs:2600,2628`) and the per-thread `Item*`/`Turn*` notifications already buffered per thread (`tui/src/app/thread_events.rs`, `tui/src/app/app_server_events.rs:143-158`).
+- **Agent event-stream swap (parity)**: from the monitor or an agent picker, drill into any specific running (sub)agent and watch **its** live event stream — tool calls, reasoning deltas, command output, MCP progress — as it streams, then swap back to the parent without losing the parent subscription (§9). Grounded in the app-server per-thread subscription primitive `thread/resume` (`app-server/src/thread_state.rs:48`) + the existing TUI focus/attach path (`select_agent_thread` → `attach_live_thread_for_selection`, `tui/src/app/session_lifecycle.rs:348,262`).
+- **Per-agent session saving (parity)**: every subagent persists its **own full rollout/session file** — the complete event stream (reasoning, tool calls, tool output, messages), not just its journaled return value — because each `agent()` spawns a first-class thread via `spawn_new_thread_with_source(ThreadSource::Subagent)` (`core/src/agent/control/spawn.rs:230-329`) with its own `RolloutRecorder`-backed file (`rollout/src/recorder.rs`), linked to the workflow root by `agent-graph-store` spawn edges (`agent-graph-store/src/local.rs`) and discoverable per run (§9).
 - **Feature-gated** behind a new `Feature::Workflow`.
 
 ### Non-goals (out of scope for v1)
@@ -28,7 +31,7 @@ We are adding **Dynamic Workflows** to Codex at feature parity with Claude Code'
 - `Promise.race`/first-wins branching on `parallel()` results across resume — v1 authoring model **forbids racing** on fan-out results (see §7). Barrier/no-barrier only.
 - Distributed/multi-host execution. A run lives on one host.
 - Journal compaction/retention tuning — uncompressed JSONL in v1.
-- A `/workflow ps` browsing/cancel UI (completion-notify only in v1).
+- A full workflow **control** UI — pause/resume/stop/restart/save keybindings à la Claude's `/workflows` footer. The v1 monitor view (§9) is **read-only watch + agent event-stream drill-in**; run control stays completion-notify plus the existing per-agent/thread cancel paths. (Read-only monitor and agent-stream swap ARE in v1 scope — only interactive run-control keybindings are deferred.)
 - Non-git isolation backends (only `isolation:'worktree'`).
 - Byte-reproducible V8 (JIT-disabled) builds — determinism is at the `agent()`-result level, not machine-code level.
 
@@ -301,7 +304,9 @@ Expose progress via the existing `ThreadGoal` channel — emit `ThreadGoal{token
 
 ---
 
-## 9. Progress, background, entrypoint & persistence
+## 9. Observability, progress, background, entrypoint & persistence
+
+This section specifies the three observability capabilities the design commits to at parity with Claude Code: **(1)** a live monitor view for running workflows, **(2)** agent event-stream swap (drill into a running subagent's live stream and back), and **(3)** per-agent session saving. The unifying insight from the Codex substrate is that **every agent — root and each subagent — is already a first-class app-server thread** with its own `thread_id`, its own rollout/session file, and its own live notification stream keyed by `thread_id`. Features (2) and (3) are therefore essentially *already present* in Codex and this spec grounds them in existing mechanisms; feature (1) is the genuine parity gap (the live data exists but no continuously auto-updating aggregate phase+agent tree does) and this spec specifies the view to build on top.
 
 ### New protocol events
 
@@ -325,6 +330,54 @@ Bridge to `ServerNotification` (macro at `app-server-protocol/src/protocol/commo
 
 Add a `WorkflowProgressCell` in `tui/src/app/agent_status_feed.rs`, built like the existing `AgentStatusHistoryCell` ("Sub-agents running") but maintaining a real tree keyed by `run_id`: workflow name → phases → (group nodes →) agent leaves. Reuse `multi_agents.rs` helpers (`agent_picker_status_dot_spans` for the status dot, `format_agent_picker_item_name` for the `[role]` label) and `render/line_utils::prefix_lines` for indentation. Each leaf: dot, label, live tokens, tool-call count. **Bound height** (constants like `AGENT_STATUS_PREVIEW_*`) by collapsing finished phases to one summary line. Re-render on each `workflow/*` notification via `request_redraw`. Any spinner/elapsed uses only event-supplied `started_at_ms` (Date.now is disabled).
 
+### Feature (1) — Live monitor view for RUNNING workflows (Codex analog of `/workflows`)
+
+**Status: PARTIAL — the live data plane exists; the auto-updating aggregate tree must be built.** Codex already routes every subagent's live events into a per-thread buffer even while another thread is foregrounded (`tui/src/app/thread_events.rs` `ThreadEventStore`/`ThreadEventChannel`; routing in `tui/src/app/app_server_events.rs:143-158`), and it already renders a `/agent`-style snapshot ("Sub-agents running" via `agent_status_feed.rs::AgentStatusHistoryCell` + `AgentStatusThreadPreview::from_store`). But that snapshot is pushed once into scrollback (`chat_widget.add_to_history`, wired at `session_lifecycle.rs:58-61`) and does **not** redraw in place, and Codex has no "phase" abstraction — only threads/turns/items. The monitor view closes exactly that gap.
+
+**Run/phase model.** Introduce a lightweight *workflow-run* abstraction over the existing thread-spawn tree: the workflow root thread plus its descendants from `agent-graph-store` (`list_thread_spawn_descendants`, `agent-graph-store/src/local.rs`), with the workflow's `phase()` markers (§4, journaled per §7) mapped onto the tree as grouping nodes. Where a run predates any `phase()` call, phases collapse to a single implicit "root" group. This gives phases → (group nodes →) agent leaves without inventing a second topology store.
+
+**Invocation — two entrypoints, same data:**
+- **Non-interactive / CI / detached terminal:** `codex workflow watch <runId>` (new clap subcommand alongside `codex workflow run`, `cli/src/main.rs:124`). It opens an app-server connection, calls `thread/list` / `thread/loaded/list` (`app-server-protocol/src/protocol/common.rs:621-638`) and `list_agents` (`core/src/tools/handlers/multi_agents_v2/list_agents.rs`) to enumerate the run's threads, subscribes to `subscribe_thread_created` (`app-server/src/request_processors/thread_processor.rs:2600`) and `subscribe_running_assistant_turn_count` (`thread_processor.rs:2628`) for aggregate lifecycle, and renders the tree to the terminal, redrawing on each `workflow/*` and per-thread `Item*`/`Turn*` notification. `--json` streams the same tree as newline-delimited JSON for scripting.
+- **Interactive:** inside the TUI, the `WorkflowProgressCell` becomes a **persistent, in-place-redrawn monitor panel** (not the one-shot scrollback cell). It is opened by `/workflow` with a running run selected, redraws on every `workflow/*` notification, and can be attached to a background run at any time — including one started earlier in the session — because the panel is a pure consumer of the buffered per-thread event stores and the aggregate subscriptions above.
+
+**What it renders (live, in place):** workflow name; per phase — agent count, rolled-up token total, elapsed (from event-supplied `started_at_ms`); per agent leaf — status dot, `label`, live token count, and tool-call count (streamed via `WorkflowAgentUpdated{token_usage, tool_call_count}`, rolled up from each subagent's own thread `TokenCount`/tool events). Finished phases collapse to one summary line to bound height.
+
+**Works for background runs.** The workflow host runs as a long-lived app-server task off the TUI thread (§"Background execution" below); the monitor is a pure notification consumer, so the primary session stays responsive while agents work and the user can open, close, and re-open the monitor at will. **Completed runs remain viewable**: the run's `journal.jsonl` + per-agent rollout files (§7, and feature (3) below) let `codex workflow watch <runId>` reconstruct and render a finished run after the fact, and the `workflow_runs` discovery index (§7) lists prior runs by name/id.
+
+### Feature (2) — Agent event-stream swap (drill into a running subagent, then swap back)
+
+**Status: HAVE — the end-to-end mechanism already ships in the TUI; parity work is UI polish, not new plumbing.** The workflow layer only has to expose the workflow's subagent threads to the existing selector.
+
+**The attach primitive.** The app-server streams per-thread notifications, each carrying `thread_id`/`turn_id`: `turn/started`, `item/started`, `item/completed`, `item/agentMessage/delta`, `item/reasoning/textDelta`, `item/commandExecution/outputDelta`, `item/mcpToolCall/progress`, etc. (the `ServerNotification` list, `app-server-protocol/src/protocol/common.rs:1613-1710`). `thread/resume` "sends the thread's history to the client and atomically subscrib[es] for new updates" (`app-server/src/thread_state.rs:48`) — i.e. it is exactly "attach to this agent's live stream (with backfill)". Subscription is per-connection-per-thread (`thread_state.rs` `subscribed_connection_ids` / `unsubscribe_connection_from_thread` / `wait_for_thread_subscriber`), and a client detaches with `thread/unsubscribe` (`ClientRequest::ThreadUnsubscribe`, `common.rs:510`). **Attaching to a child never drops the parent subscription** — subscriptions are independent per thread, which is what makes "swap back without losing the parent" free.
+
+**The swap-and-swap-back path (TUI reference impl to reuse verbatim):**
+- `AppEvent::SelectAgentThread` (`tui/src/app_event.rs:153`) → dispatched at `tui/src/app/event_dispatch.rs:1905` → `select_agent_thread` (`tui/src/app/session_lifecycle.rs:348`).
+- `select_agent_thread` calls `attach_live_thread_for_selection` (`session_lifecycle.rs:262`), which invokes `app_server.resume_thread(...)` (= `thread/resume`) to subscribe to the **child** thread's LIVE stream, falling back to `thread/read` replay-only if resume fails.
+- It stores the previously active receiver via `store_active_thread_receiver` (swap-back state), sets `active_thread_id` to the target, rebuilds the `ChatWidget`, then `replay_thread_snapshot` + `drain_active_thread_events` to paint the child's backfilled history and drain its buffered live events.
+- **Swap back** is symmetric: `activate_thread_channel` / `store_active_thread_receiver` (`tui/src/app/thread_routing.rs:57-104`) restore the parent (or previous) thread's stream; the active-agent footer label is kept in sync by `sync_active_agent_label` (`thread_routing.rs:190`).
+- **Selector UI:** `open_agent_picker` (`session_lifecycle.rs:10`) lists the subagents, and `previous_agent_shortcut` / `next_agent_shortcut` (`tui/src/multi_agents.rs`) cycle between them.
+
+**Workflow parity requirement.** A client MUST be able to attach to any workflow child `thread_id`'s live stream, watch its tool calls / reasoning deltas / command output / MCP progress **as they stream**, and detach back to the parent without losing the parent subscription. Concretely: the workflow monitor (feature 1) is the breadcrumbed entry point — selecting an agent leaf raises `AppEvent::SelectAgentThread` for that subagent's `thread_id`, reusing the whole path above; the agent picker is populated from the run's `list_thread_spawn_descendants`. The detail view updates **live** (it is a `thread/resume` subscription, not a cached snapshot); `Esc`/back detaches (`thread/unsubscribe`) and restores the monitor. No new transport, no new buffering — only wiring the workflow run's thread ids into `open_agent_picker` and the monitor's leaf-select handler.
+
+### Feature (3) — Per-agent session saving (independent full rollout per subagent)
+
+**Status: HAVE — each subagent already persists its own complete rollout file.** This is Codex's structural equivalent of Claude Code's per-agent transcript (`~/.claude/projects/.../subagents/agent-{agentId}.jsonl`). The workflow journal of §7 records each `agent()`'s **return value + tokens** for deterministic replay; feature (3) is the orthogonal, stronger guarantee that each subagent's **entire event stream** is independently persisted and recoverable after the fact.
+
+**Every `agent()` spawn is a full thread with its own session file.** The multi-agent spawn path (`core/src/tools/handlers/multi_agents_v2/spawn.rs:113-132`) calls `agent_control.spawn_agent_with_communication` → `spawn_agent_internal` (`core/src/agent/control/spawn.rs:230-329`) → `state.spawn_new_thread_with_source(... ThreadSource::Subagent ...)`, giving the subagent a brand-new `thread_id` and session. Each thread is created with its own `RolloutRecorder` (`thread-store/src/local/create_thread.rs:10-33`, `RolloutRecorderParams{ thread_id, parent_thread_id, ... }`), which writes `~/.codex/sessions/YYYY/MM/DD/rollout-<date>-<thread_id>.jsonl` (`rollout/src/recorder.rs:1509-1526`, header at `recorder.rs:80`). So **every subagent `thread_id` gets its own file**, and `agent()` MUST spawn via this path (it already does per §6) rather than any non-thread execution mode.
+
+**The FULL event stream is persisted — not just the return value.** The recorder writes the `RolloutItem` stream (`protocol/src/protocol.rs:3141`): `SessionMeta`, `ResponseItem`, `InterAgentCommunication(+Metadata)`, `Compacted`, `TurnContext`, `WorldState`, `EventMsg`. The persist policy (`rollout/src/policy.rs:38-53`) keeps `Message`, `AgentMessage`, `Reasoning`, `LocalShellCall`, `FunctionCall` (tool calls), `FunctionCallOutput`, `CustomToolCall(+Output)`, `WebSearchCall`, `ImageGenerationCall`, `Compaction`, plus `EventMsg` protocol events (`policy.rs:13`) — i.e. reasoning, tool calls, tool output, and messages: the whole event stream that the drill-in view (feature 2) renders live is the same data that lands in the file, so any agent's stream is fully recoverable/audit-able/resumable post-hoc.
+
+**Topology + recoverability.** Parent/child topology is persisted separately in `agent-graph-store` (`agent-graph-store/src/lib.rs` — "storage-neutral parent/child topology for thread-spawned agents"; `local.rs` `upsert_thread_spawn_edge` / `list_thread_spawn_children` / `list_thread_spawn_descendants`, with `Open`/`Closed` status). This is Codex's analog of a run graph linking the run's agents, and it is what both the monitor (feature 1) and the picker (feature 2) enumerate. Files are read back via `rollout/src/{list.rs,search.rs}` and the app-server `thread/read` + `thread/turns/list` + `thread/items/list` (`common.rs:638-651`), and each subagent is independently resumable from its rollout file.
+
+**Layout (guaranteed) and the one gap vs Claude Code.** Guaranteed per-subagent layout:
+
+```
+~/.codex/sessions/YYYY/MM/DD/rollout-<date>-<thread_id>.jsonl   # one per subagent thread — FULL event stream
+$CODEX_HOME/workflows/runs/<runId>/journal.jsonl               # per-run return/ordinal journal (§7)
+```
+
+The only difference from Claude Code is *colocation*: Codex keys transcripts by `thread_id` under a global date-partitioned `sessions/` dir and links them via `agent-graph-store` spawn edges + `parent_thread_id`, rather than grouping them into a single per-run transcript directory with a `journal.jsonl`. To reach exact Claude-Code parity (a per-run transcript dir), this spec **adds a run-scoped grouping/index** — NOT a second copy of the transcripts. The `workflow_runs` index (§7) and a `run_agents` projection over `list_thread_spawn_descendants` record, for each `runId`, the set of member subagent `thread_id`s and the absolute path of each one's rollout file, so tooling can enumerate "all transcripts for this run" and `codex workflow watch <runId>` can render a completed run. We deliberately lean on `agent-graph-store` as the run graph rather than inventing a new store; the per-agent rollout files remain the single source of truth for each agent's event stream, and the run index is a rebuildable projection.
+
 ### Background execution + completion notification
 
 Codex turns already run in the app-server off the TUI thread; the TUI is a pure notification consumer (`tui/src/app.rs:253-290`). The workflow host runs as a long-lived task emitting `workflow/*`; the TUI stays interactive. On completion, add `Notification::WorkflowComplete{name, status, agents, spent}` (`tui/src/chatwidget/notifications.rs`), raised on `workflow/completed`, reusing the coalesced desktop-notification path (`tui.notify()`, `tui/src/tui.rs:690`) and the `tui_notifications` allowlist. Give it **higher priority** than `AgentTurnComplete(0)` since the user is typically away.
@@ -333,7 +386,7 @@ Codex turns already run in the app-server off the TUI thread; the TUI is a pure 
 
 1. **Primary (load-bearing): a model-callable `workflow_run` tool** registered alongside `multi_agents_v2.rs` spawn/wait handlers. This is the only surface that lets the authoring model launch/compose workflows mid-turn and is the native home of the JS `workflow(name, args)` hook.
 2. **Human-interactive: ONE `SlashCommand::Workflow` variant** (`tui/src/slash_command.rs`). The slash enum is compile-time strum, order-sensitive ("DO NOT ALPHA-SORT") — so named workflows **cannot** each be a variant. `/workflow` with no arg opens a runtime-populated picker (exact `SlashCommand::Skills → open_skills_menu` pattern in `slash_dispatch.rs:421`); `/workflow <name> [json]` dispatches by name with the rest of the line as args.
-3. **Non-interactive/CI: `codex workflow run <name|path> --args <json> [--resume <runId>]`** in the clap `Subcommand` enum (`cli/src/main.rs:124`), mirroring `Exec`/`Cloud`.
+3. **Non-interactive/CI: `codex workflow run <name|path> --args <json> [--resume <runId>]`** in the clap `Subcommand` enum (`cli/src/main.rs:124`), mirroring `Exec`/`Cloud`. The same `workflow` subcommand also exposes **`codex workflow watch <runId> [--json]`** — the detached live monitor of feature (1) in §9 (aggregate subscriptions + per-thread `Item*`/`Turn*` redraw; `--json` streams the tree as NDJSON) — and **`codex workflow ls`** to list runs from the `workflow_runs` discovery index.
 
 ### Saved-workflow discovery
 
@@ -376,13 +429,25 @@ Add a `Feature::Workflow` in `codex-rs/features/src/feature_configs.rs` (alongsi
 | `codex-rs/app-server-protocol/src/protocol/v2/workflow.rs` | Add | `workflow/*` notification payloads |
 | `codex-rs/app-server-protocol/src/protocol/common.rs` | Modify | `ServerNotification` variants + `WorkflowsChanged` |
 | `codex-rs/app-server/src/bespoke_event_handling.rs` | Modify | EventMsg → ServerNotification mapping |
-| `codex-rs/tui/src/app/agent_status_feed.rs` | Add | `WorkflowProgressCell` |
+| `codex-rs/tui/src/app/agent_status_feed.rs` | Add | `WorkflowProgressCell` as a **persistent in-place-redrawn monitor panel** (feature 1), not the one-shot scrollback cell; reuse `AgentStatusThreadPreview::from_store` for leaf content |
+| `codex-rs/tui/src/app/thread_events.rs` | Reuse | `ThreadEventStore`/`ThreadEventChannel` per-thread buffers feed the monitor's per-agent rows (feature 1) |
+| `codex-rs/tui/src/app/app_server_events.rs` | Reuse | Per-thread notification routing (`:143-158`) that keeps subagent streams buffered while another thread is foregrounded |
+| `codex-rs/app-server/src/request_processors/thread_processor.rs` | Reuse | `subscribe_thread_created` (`:2600`) + `subscribe_running_assistant_turn_count` (`:2628`) as the monitor's aggregate lifecycle feed |
+| `codex-rs/app-server/src/thread_state.rs` | Reuse | `thread/resume` (`:48`, atomic history + live subscribe) = agent event-stream attach; `thread/unsubscribe` to detach (feature 2) |
+| `codex-rs/tui/src/app/session_lifecycle.rs` | Modify | Extend `select_agent_thread`/`attach_live_thread_for_selection`/`open_agent_picker` to the workflow run's subagent threads (feature 2 swap-in) |
+| `codex-rs/tui/src/app/thread_routing.rs` | Reuse | `activate_thread_channel`/`store_active_thread_receiver` (`:57-104`) swap-back; `sync_active_agent_label` (`:190`) footer |
+| `codex-rs/tui/src/app/event_dispatch.rs` | Reuse | `AppEvent::SelectAgentThread` dispatch (`:1905`) raised from monitor leaf-select |
+| `codex-rs/tui/src/multi_agents.rs` | Modify | `previous_agent_shortcut`/`next_agent_shortcut` extended to workflow monitor agent cycling |
+| `codex-rs/core/src/agent/control/spawn.rs` | Reuse | `spawn_new_thread_with_source(ThreadSource::Subagent)` (`:230-329`) — each subagent is a full thread w/ own rollout (feature 3) |
+| `codex-rs/thread-store/src/local/create_thread.rs` | Reuse | Per-thread `RolloutRecorder` (`:10-33`) so every subagent `thread_id` gets its own session file (feature 3) |
+| `codex-rs/rollout/src/recorder.rs` | Reuse | Per-thread `rollout-<date>-<thread_id>.jsonl` full event stream persisted per `policy.rs` (feature 3) |
+| `codex-rs/agent-graph-store/src/local.rs` | Modify | Run-scoped grouping/index over `upsert_thread_spawn_edge`/`list_thread_spawn_descendants` tying a run's subagent rollouts together (features 1 & 3) |
 | `codex-rs/tui/src/app.rs` | Modify | `workflow/*` notification match arms |
 | `codex-rs/tui/src/chatwidget/notifications.rs` | Modify | `Notification::WorkflowComplete` |
-| `codex-rs/tui/src/slash_command.rs` + `chatwidget/slash_dispatch.rs` | Modify | One `Workflow` variant + runtime picker dispatch |
-| `codex-rs/cli/src/main.rs` | Modify | `Subcommand::Workflow` |
+| `codex-rs/tui/src/slash_command.rs` + `chatwidget/slash_dispatch.rs` | Modify | One `Workflow` variant + runtime picker dispatch; opens the monitor panel for a running run |
+| `codex-rs/cli/src/main.rs` | Modify | `Subcommand::Workflow` with `run` / `watch <runId> [--json]` (detached live monitor, feature 1) / `ls` |
 | `codex-rs/features/src/feature_configs.rs` | Modify | `Feature::Workflow` (requires CodeMode + MultiAgentV2) |
-| `codex-rs/state/migrations/` + `state/src/model/` | Add | `workflow_runs` discovery index |
+| `codex-rs/state/migrations/` + `state/src/model/` | Add | `workflow_runs` discovery index + `run_agents` projection (member subagent `thread_id`s + rollout paths per run) |
 
 ---
 
@@ -394,7 +459,7 @@ Each milestone is independently shippable behind `Feature::Workflow` (Experiment
 `Feature::Workflow` (requires CodeMode + MultiAgentV2). Meta manifest parser + persisted-script registry (`core-workflows` loader, static parse). **Exit:** a script with `meta` parses, saves, and runs its body once in the existing isolate; a trivial `log()`/`phase()`-only workflow runs end-to-end; existing code-mode tests green.
 
 ### Phase 1 — MVP orchestration (the 80/20 value core)
-Bind `agent(prompt, opts)` on `run_codex_thread_one_shot` (final text / null). Wire `opts.schema` → `final_output_json_schema` (nearly free). Ship `parallel()`, item cap 4096, concurrency cap `min(16,cores-2)`, lifetime cap 1000, `args`, `log()`, `phase()`. **Exit:** fan-out workflows (map N prompts → N structured results) with live progress. Covers ~11 of the parity capabilities.
+Bind `agent(prompt, opts)` on `run_codex_thread_one_shot` (final text / null). Wire `opts.schema` → `final_output_json_schema` (nearly free). Ship `parallel()`, item cap 4096, concurrency cap `min(16,cores-2)`, lifetime cap 1000, `args`, `log()`, `phase()`. **Per-agent session saving (feature 3) lands here for free**: because `agent()` spawns via `spawn_new_thread_with_source(ThreadSource::Subagent)` (`core/src/agent/control/spawn.rs:230-329`), each subagent already gets its own `RolloutRecorder` file (`rollout/src/recorder.rs`) capturing its full event stream — verify and assert this in Phase 1 tests. **Exit:** fan-out workflows (map N prompts → N structured results) with live progress; each subagent has its own recoverable `rollout-<date>-<thread_id>.jsonl`. Covers ~11 of the parity capabilities.
 
 ### Phase 2 — Advanced scheduling & governance
 `pipeline()` no-barrier scheduler (prelude async chains + shared semaphore). `budget` hard-ceiling: expose `RolloutBudget` as a JS global; `agent()` throws pre-spawn on `remaining() <= 0`; resettable budget cell. `workflow()` nested one-level via the Phase-0 registry + depth guard. **Exit:** bounded, composable multi-stage workflows.
@@ -402,8 +467,15 @@ Bind `agent(prompt, opts)` on `run_codex_thread_one_shot` (final text / null). W
 ### Phase 3 — Determinism & resume (highest novelty; depends on 3a)
 **3a** Neutralize `Date.now`/argless `Date`/`Math.random`/`WeakRef`/`FinalizationRegistry`. **3b** `journal.jsonl` per `runId` (reuse RolloutRecorder append + ReverseJsonlScanner). **3c** `resumeFromRunId` prefix-replay loop keyed by `(prompt,opts)` ordinal; budget re-add on replay. **Exit:** crash/edit-resume of long runs.
 
-### Phase 4 — Background & progress UX + worktree isolation
-`workflow/*` protocol events + app-server notifications + TUI `WorkflowProgressCell` + completion notification. Entrypoints (`workflow_run` tool, `/workflow`, `codex workflow run`) fully wired. `isolation:'worktree'` lands as an independent workstream (`SpawnAgentOptions.cwd` + `git-utils` worktree lifecycle + workspace_roots). **Exit:** full parity.
+### Phase 4 — Observability, background & progress UX + worktree isolation
+`workflow/*` protocol events + app-server notifications + TUI `WorkflowProgressCell` + completion notification. Entrypoints (`workflow_run` tool, `/workflow`, `codex workflow run`) fully wired. `isolation:'worktree'` lands as an independent workstream (`SpawnAgentOptions.cwd` + `git-utils` worktree lifecycle + workspace_roots).
+
+The three observability capabilities of §9 land in this phase:
+- **4a — Live monitor view (feature 1).** Build the run/phase model over `agent-graph-store` `list_thread_spawn_descendants` and turn `WorkflowProgressCell` into a persistent in-place-redrawn panel driven by `subscribe_thread_created` + `subscribe_running_assistant_turn_count` (`thread_processor.rs:2600,2628`) and the per-thread `Item*`/`Turn*` notifications already buffered in `thread_events.rs`. Ship `codex workflow watch <runId> [--json]` (`cli/src/main.rs:124`) for detached/CI monitoring and `codex workflow ls`. Completed runs remain viewable via journal + per-agent rollouts. **This is the only genuinely new observability surface** — the data plane already exists.
+- **4b — Agent event-stream swap (feature 2).** Wire the monitor's agent leaves and `open_agent_picker` to raise `AppEvent::SelectAgentThread` for a subagent `thread_id`, reusing `select_agent_thread`/`attach_live_thread_for_selection` (`session_lifecycle.rs:348,262` — `thread/resume` attach) and `activate_thread_channel`/`store_active_thread_receiver` (`thread_routing.rs:57-104`) for swap-back. Detach via `thread/unsubscribe`. Mostly wiring; no new transport.
+- **4c — Per-agent session grouping (feature 3 completion).** The transcripts themselves ship in Phase 1; here add the run-scoped `run_agents` projection (member `thread_id`s + rollout paths per `runId`) so tooling and `codex workflow watch` can enumerate "all transcripts for this run."
+
+**Exit:** full parity — including live monitor of running workflows, drill-into/swap-back on any running subagent's live stream, and independently persisted per-agent sessions.
 
 ---
 
@@ -434,6 +506,9 @@ Bind `agent(prompt, opts)` on `run_codex_thread_one_shot` (final text / null). W
 | journal.jsonl per return | Records each agent return | **NEW** `codex-workflow-journal` (reuse RolloutRecorder) | M/L | subagents keep own rollout files |
 | Resume by prefix (`resumeFromRunId`) | Longest unchanged prefix replays | **NEW** ordinal + `(prompt,opts)` key + replay loop | XL/L | depends on determinism |
 | Background + progress tree + persisted/re-invocable | Backgrounded, live tree, saved | events + TUI cell + notify + saved dir + subcommand | L | data plane largely exists |
+| **Workflow monitor view (live, RUNNING)** | `/workflows` live progress tree of phases+agents, updates in place, viewable for running & completed | **PARTIAL→build**: persistent in-place-redrawn `WorkflowProgressCell` + `codex workflow watch <runId>`; run/phase model over `agent-graph-store`; data plane (`subscribe_thread_created`/`subscribe_running_assistant_turn_count`, per-thread `Item*`/`Turn*` buffers) already exists | M | `thread_processor.rs:2600,2628`; `thread_events.rs`; the one real observability gap |
+| **Agent event-stream swap / drill-in** | Drill into a running agent, watch its live event stream, swap back | **HAVE**: `thread/resume` attach (`thread_state.rs:48`) + `select_agent_thread`→`attach_live_thread_for_selection` (`session_lifecycle.rs:348,262`); swap-back via `thread_routing.rs:57-104`; detach via `thread/unsubscribe` | S/M | end-to-end mechanism ships today; wire workflow subagent thread ids into `open_agent_picker` |
+| **Per-agent session saving** | Each subagent transcript persisted independently, recoverable after the fact | **HAVE**: each `agent()` is a full thread (`spawn_new_thread_with_source(ThreadSource::Subagent)`, `control/spawn.rs:230-329`) w/ own `RolloutRecorder` `rollout-<date>-<thread_id>.jsonl` (`recorder.rs`) capturing the FULL event stream per `policy.rs`; add run-scoped grouping index | S | vs Claude Code: keyed by `thread_id` not colocated in a run dir; `agent-graph-store` edges serve as run graph |
 
 ---
 
