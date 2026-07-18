@@ -69,6 +69,8 @@ fn execute_request(source: &str) -> ExecuteRequest {
         yield_time_ms: Some(1),
         max_output_tokens: None,
         workflow: false,
+        args: None,
+        run_id: None,
     }
 }
 

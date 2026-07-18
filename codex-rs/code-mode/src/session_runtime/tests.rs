@@ -152,6 +152,8 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
                 enabled_tools: Vec::new(),
                 source: r#"text(String(load("candidate")));"#.to_string(),
                 workflow: false,
+                args: None,
+                run_id: None,
             },
             ObserveMode::YieldAfter(Duration::from_secs(1)),
         )
@@ -175,6 +177,8 @@ fn execute_request(source: &str) -> CreateCellRequest {
         enabled_tools: Vec::new(),
         source: source.to_string(),
         workflow: false,
+        args: None,
+        run_id: None,
     }
 }
 

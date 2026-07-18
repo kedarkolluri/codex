@@ -5,6 +5,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
+use crate::AgentSpawnOutcome;
 use crate::CellId;
 use crate::CodeModeNestedToolCall;
 use crate::CodeModeToolKind;
@@ -154,6 +155,15 @@ pub struct WireExecuteRequest {
     /// exec request.
     #[serde(default, skip_serializing_if = "is_false")]
     pub workflow: bool,
+    /// Mirrors [`ExecuteRequest::args`]. Serde-defaulted + skipped when absent so
+    /// a plain exec (and any pre-`args` peer) serializes with NO `args` key,
+    /// byte-identical to the pre-workflow wire format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<JsonValue>,
+    /// Mirrors [`ExecuteRequest::run_id`]. Serde-defaulted + skipped when absent
+    /// for the same wire back-compat reason as [`Self::args`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 /// Serde predicate: skip a `bool` field when it is `false`. Takes `&bool`
@@ -174,6 +184,8 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
             yield_time_ms: value.yield_time_ms,
             max_output_tokens: value.max_output_tokens.map(i32::try_from).transpose()?,
             workflow: value.workflow,
+            args: value.args,
+            run_id: value.run_id,
         })
     }
 }
@@ -189,6 +201,8 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
             yield_time_ms: value.yield_time_ms,
             max_output_tokens: value.max_output_tokens.map(usize::try_from).transpose()?,
             workflow: value.workflow,
+            args: value.args,
+            run_id: value.run_id,
         })
     }
 }
@@ -390,6 +404,40 @@ impl From<WireWaitOutcome> for WaitOutcome {
         match value {
             WireWaitOutcome::LiveCell(response) => Self::LiveCell(response.into()),
             WireWaitOutcome::MissingCell(response) => Self::MissingCell(response.into()),
+        }
+    }
+}
+
+/// The V1 wire representation of an [`AgentSpawnOutcome`]. Round-trips the three-way workflow
+/// `agent()` resolution (resolve-with-value / resolve-to-null / reject) across the host boundary so
+/// a process-owned host faithfully surfaces `Completed`/`Failed`/`Rejected` to the isolate promise.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "outcome", rename_all_fields = "camelCase")]
+pub enum WireAgentSpawnOutcome {
+    #[serde(rename = "completed")]
+    Completed { value: JsonValue },
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "rejected")]
+    Rejected { message: String },
+}
+
+impl From<AgentSpawnOutcome> for WireAgentSpawnOutcome {
+    fn from(value: AgentSpawnOutcome) -> Self {
+        match value {
+            AgentSpawnOutcome::Completed(value) => Self::Completed { value },
+            AgentSpawnOutcome::Failed => Self::Failed,
+            AgentSpawnOutcome::Rejected(message) => Self::Rejected { message },
+        }
+    }
+}
+
+impl From<WireAgentSpawnOutcome> for AgentSpawnOutcome {
+    fn from(value: WireAgentSpawnOutcome) -> Self {
+        match value {
+            WireAgentSpawnOutcome::Completed { value } => Self::Completed(value),
+            WireAgentSpawnOutcome::Failed => Self::Failed,
+            WireAgentSpawnOutcome::Rejected { message } => Self::Rejected(message),
         }
     }
 }

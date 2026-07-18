@@ -3,12 +3,16 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use codex_code_mode::AgentCallOpts;
+use codex_code_mode::AgentSpawnFuture;
+use codex_code_mode::AgentSpawnOutcome;
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSession;
@@ -27,7 +31,9 @@ use codex_code_mode::WaitRequest;
 use codex_code_mode::host::MAX_FRAME_BYTES;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
+use serde_json::Value as JsonValue;
 use serde_json::json;
+use tokio::sync::Barrier;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -212,6 +218,8 @@ fn execute_request(source: &str) -> ExecuteRequest {
         yield_time_ms: None,
         max_output_tokens: None,
         workflow: false,
+        args: None,
+        run_id: None,
     }
 }
 
@@ -871,4 +879,269 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
         events_a.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
+}
+
+/// A process-host `agent()` delegate that lives on the *client* side of the wire. The real host
+/// binary runs the V8 isolate; each `agent(prompt, opts?)` inside a workflow travels host ->
+/// `RemoteDelegate::spawn_agent` -> `DelegateRequest::SpawnAgent` over stdio -> this delegate, whose
+/// [`AgentSpawnOutcome`] travels back as `DelegateResponse::AgentSpawned` and settles the isolate
+/// promise. It stands in for core's spawn broker so a code-mode test can exercise the entire wire
+/// round-trip without a real core.
+struct SpawningDelegate {
+    spawn_calls: AtomicUsize,
+    barrier: Option<Arc<Barrier>>,
+    seen_ordinals: Mutex<Vec<u64>>,
+    seen_schema_ordinals: Mutex<Vec<u64>>,
+}
+
+impl SpawningDelegate {
+    fn new() -> Self {
+        Self {
+            spawn_calls: AtomicUsize::new(0),
+            barrier: None,
+            seen_ordinals: Mutex::new(Vec::new()),
+            seen_schema_ordinals: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn with_barrier(n: usize) -> Self {
+        let mut delegate = Self::new();
+        delegate.barrier = Some(Arc::new(Barrier::new(n)));
+        delegate
+    }
+
+    fn spawn_calls(&self) -> usize {
+        self.spawn_calls.load(Ordering::Acquire)
+    }
+
+    fn seen_ordinals(&self) -> Vec<u64> {
+        self.seen_ordinals.lock().expect("ordinals lock").clone()
+    }
+
+    fn seen_schema_ordinals(&self) -> Vec<u64> {
+        self.seen_schema_ordinals
+            .lock()
+            .expect("schema ordinals lock")
+            .clone()
+    }
+}
+
+impl CodeModeSessionDelegate for SpawningDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async { Err("unexpected tool call".to_string()) })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn spawn_agent<'a>(
+        &'a self,
+        _cell_id: CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: AgentCallOpts,
+        _cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        self.spawn_calls.fetch_add(1, Ordering::AcqRel);
+        self.seen_ordinals
+            .lock()
+            .expect("ordinals lock")
+            .push(ordinal);
+        // Prove `opts.schema` was forwarded across the wire (not dropped by the bridge).
+        let has_schema = opts.schema.is_some();
+        if has_schema {
+            self.seen_schema_ordinals
+                .lock()
+                .expect("schema ordinals lock")
+                .push(ordinal);
+        }
+        let barrier = self.barrier.clone();
+        Box::pin(async move {
+            if let Some(barrier) = barrier {
+                // Rendezvous: fills only if every concurrent `agent()` is in flight at once, so a
+                // bridge that serialized the wire round-trip would deadlock here.
+                barrier.wait().await;
+            }
+            match prompt.as_str() {
+                // Death-is-null: resolves the promise to JS `null`.
+                "dead" => AgentSpawnOutcome::Failed,
+                // Admission-time cap rejection: the isolate throws.
+                "cap" => AgentSpawnOutcome::Rejected("AgentCapReached".to_string()),
+                // A structured-output call: stands in for core's parsed+validated object, which the
+                // bridge must marshal into a real JS object via `json_to_v8`.
+                prompt if has_schema => {
+                    AgentSpawnOutcome::Completed(json!({ "answer": prompt, "score": 7 }))
+                }
+                // A schemaless call: a plain JS string.
+                prompt => {
+                    AgentSpawnOutcome::Completed(JsonValue::String(format!("final:{prompt}")))
+                }
+            }
+        })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+fn workflow_request(source: &str) -> ExecuteRequest {
+    let mut request = execute_request(source);
+    // Workflow mode installs the `agent()` global; a large yield window lets the cell run straight to
+    // its terminal `Result` (the `agent()` promises resolve promptly).
+    request.workflow = true;
+    request.yield_time_ms = Some(60_000);
+    request
+}
+
+fn result_texts(response: &RuntimeResponse) -> Vec<String> {
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = response
+    else {
+        panic!("expected terminal Result, got {response:?}");
+    };
+    assert_eq!(*error_text, None, "workflow errored: {error_text:?}");
+    content_items
+        .iter()
+        .filter_map(|item| match item {
+            FunctionCallOutputContentItem::InputText { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The real process-host bridge round-trips all three `AgentSpawnOutcome` variants end-to-end: a
+/// schemaless `Completed` (JS string), a `Failed` (JS `null`, no throw), a `Rejected` (the isolate
+/// throws the cap message), and a schema `Completed` (a real JS object, property-accessible), and it
+/// forwards `opts.schema` across the wire.
+#[tokio::test]
+async fn remote_agent_spawn_round_trips_all_three_outcomes_over_the_wire() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(SpawningDelegate::new());
+    let session = provider
+        .create_session(delegate.clone())
+        .await
+        .expect("create remote session");
+
+    let source = r#"
+const ok = await agent("ok");
+const dead = await agent("dead");
+let capText;
+try {
+  await agent("cap");
+  capText = "resolved";
+} catch (err) {
+  capText = "threw:" + String(err);
+}
+const structured = await agent("s", { schema: { type: "object" } });
+text(String(ok));
+text(String(dead));
+text(capText);
+text(typeof structured + ":" + structured.answer + ":" + structured.score);
+"#;
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        execute(&session, workflow_request(source)),
+    )
+    .await
+    .expect("workflow completed before timeout");
+    let texts = result_texts(&response);
+    assert_eq!(texts.len(), 4, "expected four output lines, got {texts:?}");
+    assert_eq!(
+        texts[0], "final:ok",
+        "schemaless Completed marshals to a JS string"
+    );
+    assert_eq!(
+        texts[1], "null",
+        "Failed resolves to JS null without throwing"
+    );
+    assert!(
+        texts[2].starts_with("threw:") && texts[2].contains("AgentCapReached"),
+        "Rejected must throw the cap message in the isolate, got {:?}",
+        texts[2],
+    );
+    assert_eq!(
+        texts[3], "object:s:7",
+        "schema Completed marshals to a property-accessible JS object",
+    );
+
+    session.shutdown().await.expect("shutdown remote session");
+
+    assert_eq!(delegate.spawn_calls(), 4, "one wire spawn per agent() call");
+    let ordinals = delegate.seen_ordinals();
+    assert_eq!(ordinals.len(), 4);
+    let mut distinct = ordinals.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        4,
+        "each agent() carried a distinct ordinal, got {ordinals:?}"
+    );
+    assert_eq!(
+        delegate.seen_schema_ordinals().len(),
+        1,
+        "exactly the schema call forwarded opts.schema across the wire",
+    );
+}
+
+/// 16 concurrent `agent()` calls in one `Promise.all` each cross the real host bridge and resolve by
+/// id independently: the client-side barrier only fills if all 16 wire round-trips are in flight at
+/// once, so nothing serializes them, and `Promise.all` preserves input order.
+#[tokio::test]
+async fn remote_sixteen_concurrent_agents_resolve_by_id_without_serialization() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(SpawningDelegate::with_barrier(16));
+    let session = provider
+        .create_session(delegate.clone())
+        .await
+        .expect("create remote session");
+
+    let source = r#"
+const results = await Promise.all(
+  Array.from({ length: 16 }, (_, i) => agent("a" + i)),
+);
+text(results.join(","));
+"#;
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        execute(&session, workflow_request(source)),
+    )
+    .await
+    .expect("all sixteen agents resolved before timeout");
+
+    let expected = (0..16)
+        .map(|i| format!("final:a{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    assert_eq!(result_texts(&response), vec![expected]);
+
+    session.shutdown().await.expect("shutdown remote session");
+
+    assert_eq!(delegate.spawn_calls(), 16);
+    let mut ordinals = delegate.seen_ordinals();
+    assert_eq!(ordinals.len(), 16);
+    ordinals.sort_unstable();
+    ordinals.dedup();
+    assert_eq!(
+        ordinals.len(),
+        16,
+        "each of the 16 agent() calls carried a distinct ordinal"
+    );
 }

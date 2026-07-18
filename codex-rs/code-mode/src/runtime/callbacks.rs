@@ -1,3 +1,4 @@
+use codex_code_mode_protocol::AgentCallOpts;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 
 use super::EXIT_SENTINEL;
@@ -67,6 +68,94 @@ pub(super) fn tool_callback(
         name: tool_name,
         kind: tool_kind,
         input,
+    });
+    retval.set(promise.into());
+}
+
+/// Workflow `agent(prompt, opts?)` global — spawns a subagent (§3 async bridge
+/// op; §6 `agent()` mapping). Modeled exactly on [`tool_callback`]: it mints a
+/// [`v8::PromiseResolver`], stamps `ordinal = state.next_agent_ordinal++`
+/// SYNCHRONOUSLY before returning the promise (§7 invocation ordinal; matching
+/// `tool_callback`'s `next_tool_call_id` bump), stores the `Global` resolver in
+/// `pending_tool_calls` under a fresh id, and emits a
+/// [`RuntimeEvent::AgentCall`] for the cell actor to route to the spawn helper.
+/// Because the isolate is single-threaded and `parallel`/`Promise.all` fire
+/// their thunks in array order up to the first `await`, the ordinal sequence is
+/// deterministic in source order regardless of host response arrival order. No
+/// host spawn wiring lives here — that is the `P1-cellactor-spawn-dispatch`
+/// ticket. Installed only for workflow runs (see `globals::install_globals`).
+pub(super) fn agent_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    // First positional argument: the prompt string. Require an actual string
+    // rather than coercing arbitrary values so a misuse surfaces immediately.
+    let prompt_value = if args.length() == 0 {
+        v8::undefined(scope).into()
+    } else {
+        args.get(0)
+    };
+    if !prompt_value.is_string() {
+        throw_type_error(scope, "agent expects a prompt string");
+        return;
+    }
+    let prompt = prompt_value.to_rust_string_lossy(scope);
+
+    // Optional second argument: the opts object. `null`/`undefined`/absent all
+    // map to the default (all-`None`) options. Unknown keys are ignored by
+    // `AgentCallOpts` (no `deny_unknown_fields`).
+    let opts = if args.length() < 2 {
+        AgentCallOpts::default()
+    } else {
+        let opts_value = args.get(1);
+        if opts_value.is_null() || opts_value.is_undefined() {
+            AgentCallOpts::default()
+        } else {
+            match v8_value_to_json(scope, opts_value) {
+                Ok(Some(json)) => match serde_json::from_value::<AgentCallOpts>(json) {
+                    Ok(opts) => opts,
+                    Err(error) => {
+                        throw_type_error(scope, &format!("invalid agent options: {error}"));
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    throw_type_error(scope, "agent options must be a plain object");
+                    return;
+                }
+                Err(error_text) => {
+                    throw_type_error(scope, &error_text);
+                    return;
+                }
+            }
+        }
+    };
+
+    let Some(resolver) = v8::PromiseResolver::new(scope) else {
+        throw_type_error(scope, "failed to create agent promise");
+        return;
+    };
+    let promise = resolver.get_promise(scope);
+    let resolver = v8::Global::new(scope, resolver);
+
+    let Some(state) = scope.get_slot_mut::<RuntimeState>() else {
+        throw_type_error(scope, "runtime state unavailable");
+        return;
+    };
+    // Stamp the source-order ordinal SYNCHRONOUSLY before the promise returns,
+    // so `Promise.all([agent(a),agent(b),agent(c)])` yields 0,1,2 in source
+    // order regardless of host resolution order (§7).
+    let ordinal = state.next_agent_ordinal;
+    state.next_agent_ordinal = state.next_agent_ordinal.saturating_add(1);
+    let id = format!("agent-{ordinal}");
+    let event_tx = state.event_tx.clone();
+    state.pending_tool_calls.insert(id.clone(), resolver);
+    let _ = event_tx.send(RuntimeEvent::AgentCall {
+        id,
+        ordinal,
+        prompt,
+        opts,
     });
     retval.set(promise.into());
 }
@@ -369,5 +458,252 @@ pub(super) fn exit_callback(
     }
     if let Some(error) = v8::String::new(scope, EXIT_SENTINEL) {
         scope.throw_exception(error.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Isolate-level tests for the workflow `agent()` global (P1-agent-callback).
+    //! These drive the real V8 runtime through [`spawn_runtime`] so the
+    //! synchronous ordinal stamping and id-keyed resolution are exercised
+    //! end-to-end, exactly as the acceptance criteria name.
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use codex_code_mode_protocol::AgentCallOpts;
+    use codex_code_mode_protocol::ExecuteRequest;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::super::PendingRuntimeMode;
+    use super::super::RuntimeCommand;
+    use super::super::RuntimeEvent;
+    use super::super::spawn_runtime;
+    use crate::FunctionCallOutputContentItem;
+
+    /// A workflow-mode request — the explicit `workflow` flag is the only thing
+    /// that authorizes the `agent` global.
+    fn workflow_execute_request(source: &str) -> ExecuteRequest {
+        ExecuteRequest {
+            tool_call_id: "call_1".to_string(),
+            enabled_tools: Vec::new(),
+            source: source.to_string(),
+            yield_time_ms: Some(1),
+            max_output_tokens: None,
+            workflow: true,
+            args: None,
+            run_id: None,
+        }
+    }
+
+    /// A plain (non-workflow) request: identical plumbing but without the flag,
+    /// so the `agent` global is never installed.
+    fn plain_execute_request(source: &str) -> ExecuteRequest {
+        ExecuteRequest {
+            workflow: false,
+            ..workflow_execute_request(source)
+        }
+    }
+
+    async fn next_event(event_rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>) -> RuntimeEvent {
+        tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("runtime event timeout")
+            .expect("runtime event channel closed")
+    }
+
+    /// Collect the first `count` [`RuntimeEvent::AgentCall`] events, skipping the
+    /// `Started`/`Pending` lifecycle events, and return their `(id, ordinal,
+    /// prompt, opts)` tuples in emission order.
+    async fn collect_agent_calls(
+        event_rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+        count: usize,
+    ) -> Vec<(String, u64, String, AgentCallOpts)> {
+        let mut calls = Vec::new();
+        while calls.len() < count {
+            match next_event(event_rx).await {
+                RuntimeEvent::AgentCall {
+                    id,
+                    ordinal,
+                    prompt,
+                    opts,
+                } => calls.push((id, ordinal, prompt, opts)),
+                RuntimeEvent::Started | RuntimeEvent::Pending => {}
+                other => panic!("unexpected event before agent calls: {other:?}"),
+            }
+        }
+        calls
+    }
+
+    /// Drain events until the runtime reports its terminal `Result`, returning
+    /// the ordered events observed (including the final `Result`).
+    async fn drain_to_result(
+        event_rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> Vec<RuntimeEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = next_event(event_rx).await;
+            let is_result = matches!(event, RuntimeEvent::Result { .. });
+            events.push(event);
+            if is_result {
+                return events;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_call_emits_one_pending_promise_event_resolvable_by_id() {
+        // `agent("p")` returns a pending Promise and emits exactly one AgentCall.
+        // Responding by the emitted id resolves that promise (proving the
+        // resolver is retrievable by id from `pending_tool_calls`).
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (runtime_tx, _runtime_control_tx, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request("text(await agent('solve'));"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let calls = collect_agent_calls(&mut event_rx, 1).await;
+        assert_eq!(calls.len(), 1);
+        let (id, ordinal, prompt, opts) = &calls[0];
+        assert_eq!(id, "agent-0");
+        assert_eq!(*ordinal, 0);
+        assert_eq!(prompt, "solve");
+        assert_eq!(*opts, AgentCallOpts::default());
+
+        runtime_tx
+            .send(RuntimeCommand::ToolResponse {
+                id: id.clone(),
+                result: json!("done"),
+            })
+            .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        // Exactly one AgentCall over the whole run.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::AgentCall { .. }))
+                .count(),
+            0,
+            "the single AgentCall was already consumed before draining: {events:?}"
+        );
+        let text = events.iter().find_map(|event| match event {
+            RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text }) => {
+                Some(text.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("done"));
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        assert!(error_text.is_none(), "workflow body must run cleanly");
+    }
+
+    #[tokio::test]
+    async fn parallel_agent_calls_stamp_source_order_ordinals_regardless_of_arrival() {
+        // Promise.all fires the three agent() thunks synchronously in array
+        // order, so ordinals are 0,1,2 in SOURCE order. Responding in REVERSE
+        // arrival order must not perturb the ordinals, and Promise.all preserves
+        // the source-order mapping of results.
+        let source = r#"
+const results = await Promise.all([
+  agent('a', { label: 'la' }),
+  agent('b', { phase: 'ph', agentType: 'reviewer' }),
+  agent('c'),
+]);
+text(results.join(','));
+"#;
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (runtime_tx, _runtime_control_tx, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let calls = collect_agent_calls(&mut event_rx, 3).await;
+        let ids: Vec<&str> = calls.iter().map(|(id, ..)| id.as_str()).collect();
+        let ordinals: Vec<u64> = calls.iter().map(|(_, ordinal, ..)| *ordinal).collect();
+        let prompts: Vec<&str> = calls
+            .iter()
+            .map(|(_, _, prompt, _)| prompt.as_str())
+            .collect();
+
+        assert_eq!(ordinals, vec![0, 1, 2], "ordinals must be source-ordered");
+        assert_eq!(ids, vec!["agent-0", "agent-1", "agent-2"]);
+        assert_eq!(prompts, vec!["a", "b", "c"]);
+
+        // opts fields are carried through unchanged onto the emitted event.
+        assert_eq!(calls[0].3.label.as_deref(), Some("la"));
+        assert_eq!(calls[1].3.phase.as_deref(), Some("ph"));
+        assert_eq!(calls[1].3.agent_type.as_deref(), Some("reviewer"));
+        assert_eq!(calls[2].3, AgentCallOpts::default());
+
+        // Respond in reverse arrival order: agent-2, then agent-1, then agent-0.
+        for (id, result) in [
+            ("agent-2", json!("C")),
+            ("agent-1", json!("B")),
+            ("agent-0", json!("A")),
+        ] {
+            runtime_tx
+                .send(RuntimeCommand::ToolResponse {
+                    id: id.to_string(),
+                    result,
+                })
+                .unwrap();
+        }
+
+        let events = drain_to_result(&mut event_rx).await;
+        let text = events.iter().find_map(|event| match event {
+            RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text }) => {
+                Some(text.clone())
+            }
+            _ => None,
+        });
+        // Promise.all preserves source-order mapping despite reverse resolution.
+        assert_eq!(text.as_deref(), Some("A,B,C"));
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        assert!(error_text.is_none(), "workflow body must run cleanly");
+    }
+
+    #[tokio::test]
+    async fn plain_exec_has_no_agent_global() {
+        // Workflow-ness is the explicit flag, never the source shape: a plain
+        // exec calling `agent()` sees a ReferenceError.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, _runtime_control_tx, _handle) = spawn_runtime(
+            HashMap::new(),
+            plain_execute_request("await agent('x');"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::AgentCall { .. })),
+            "plain exec must not emit agent calls: {events:?}"
+        );
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("agent is not defined"),
+            "expected ReferenceError for missing `agent` global, got: {error_text}"
+        );
     }
 }

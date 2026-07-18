@@ -4,6 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnOutcome;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -50,6 +52,22 @@ pub(crate) trait CellHost: Send + Sync + 'static {
         text: String,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Spawn a workflow subagent for an `agent(prompt, opts?)` call, resolving to an
+    /// [`AgentSpawnOutcome`]: `Completed` (a JSON string when schemaless, or the validated
+    /// `opts.schema` object), `Failed` (JS `null`; `agent()` never throws for agent failure), or
+    /// `Rejected` (throw an admission-time cap/budget rejection). The default resolves to `Failed`
+    /// so hosts without workflow spawning need no changes.
+    fn spawn_agent(
+        &self,
+        prompt: String,
+        ordinal: u64,
+        opts: AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (prompt, ordinal, opts, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
 
     fn commit_completion(
         &self,

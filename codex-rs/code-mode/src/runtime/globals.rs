@@ -1,4 +1,5 @@
 use super::RuntimeState;
+use super::callbacks::agent_callback;
 use super::callbacks::clear_timeout_callback;
 use super::callbacks::exit_callback;
 use super::callbacks::generated_image_callback;
@@ -12,6 +13,8 @@ use super::callbacks::store_callback;
 use super::callbacks::text_callback;
 use super::callbacks::tool_callback;
 use super::callbacks::yield_control_callback;
+use super::value::json_to_v8;
+use super::value::value_to_error_text;
 
 pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
     let global = scope.get_current_context().global(scope);
@@ -56,10 +59,135 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     if workflow {
         let phase = helper_function(scope, "phase", phase_callback)?;
         let log = helper_function(scope, "log", log_callback)?;
+        let agent = helper_function(scope, "agent", agent_callback)?;
         set_global(scope, global, "phase", phase.into())?;
         set_global(scope, global, "log", log.into())?;
+        set_global(scope, global, "agent", agent.into())?;
+
+        // Read-only host->isolate data globals. `args` is the invocation JSON
+        // (injected via `json_to_v8`, exactly like `build_tools_object` injects
+        // tool metadata); `workflow.runId` is the host-minted uuid v7. Both are
+        // defined non-writable/non-deletable so the script can neither reassign
+        // them nor derive ids/time/random itself (§4, §7).
+        install_workflow_args_global(scope, global)?;
+        install_workflow_object_global(scope, global)?;
+
+        // Pure JS orchestration prelude. `parallel()` is a position-preserving
+        // barrier defined entirely in the isolate (no host op) — it composes
+        // `agent()` promises and inherits host-side concurrency bounding from the
+        // scheduler semaphore (§4/§5). Gated on the same workflow flag as the
+        // other narrator globals so it never leaks into plain code-mode exec.
+        install_parallel_prelude(scope)?;
     }
     Ok(())
+}
+
+/// The injected JS workflow prelude. `parallel(thunks)` runs every thunk
+/// concurrently and awaits them all (barrier), preserving input position: a
+/// thunk that rejects resolves to `null` at its slot without failing siblings.
+/// The `thunks.length <= 4096` item cap (§5) is validated *before* any thunk is
+/// dispatched — `Array.prototype.map` only fires the thunks once the guard has
+/// passed. Implemented purely as `Promise.all(thunks.map(t => t().catch(() =>
+/// null)))`; there is no host op.
+const PARALLEL_PRELUDE: &str = r#"
+Object.defineProperty(globalThis, "parallel", {
+  value: function parallel(thunks) {
+    if (!Array.isArray(thunks)) {
+      throw new TypeError(
+        "parallel(thunks): expected an array of () => Promise thunks"
+      );
+    }
+    if (thunks.length > 4096) {
+      throw new RangeError(
+        "parallel(thunks): item cap exceeded — " +
+          thunks.length +
+          " thunks requested but the maximum is 4096"
+      );
+    }
+    return Promise.all(thunks.map((t) => t().catch(() => null)));
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
+"#;
+
+/// Compile and run the pure-JS [`PARALLEL_PRELUDE`] as a classic script so its
+/// `parallel` binding is visible to the workflow module evaluated afterward.
+fn install_parallel_prelude(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let source = v8::String::new(&tc, PARALLEL_PRELUDE)
+        .ok_or_else(|| "failed to allocate parallel prelude source".to_string())?;
+    let script = v8::Script::compile(&tc, source, None).ok_or_else(|| {
+        tc.exception()
+            .map(|exception| value_to_error_text(&mut tc, exception))
+            .unwrap_or_else(|| "failed to compile parallel prelude".to_string())
+    })?;
+    if script.run(&tc).is_none() {
+        return Err(tc
+            .exception()
+            .map(|exception| value_to_error_text(&mut tc, exception))
+            .unwrap_or_else(|| "failed to install parallel prelude".to_string()));
+    }
+    Ok(())
+}
+
+/// Install the read-only `args` global from the invocation JSON carried on the
+/// [`RuntimeState`]. Absent args install as `null`.
+fn install_workflow_args_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+) -> Result<(), String> {
+    let args = scope
+        .get_slot::<RuntimeState>()
+        .and_then(|state| state.args.clone());
+    let value: v8::Local<'s, v8::Value> = match args {
+        Some(args) => json_to_v8(scope, &args)
+            .ok_or_else(|| "failed to convert workflow args to a JS value".to_string())?,
+        None => v8::null(scope).into(),
+    };
+    define_readonly_property(scope, global, "args", value)
+}
+
+/// Install the read-only `workflow` object exposing the host-minted `runId`.
+/// Both the object binding and its `runId` property are non-writable. An absent
+/// run id installs `runId` as `null`.
+fn install_workflow_object_global<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    global: v8::Local<'s, v8::Object>,
+) -> Result<(), String> {
+    let run_id = scope
+        .get_slot::<RuntimeState>()
+        .and_then(|state| state.run_id.clone());
+    let workflow = v8::Object::new(scope);
+    let run_id_value: v8::Local<'s, v8::Value> = match run_id {
+        Some(run_id) => v8::String::new(scope, &run_id)
+            .ok_or_else(|| "failed to allocate workflow.runId".to_string())?
+            .into(),
+        None => v8::null(scope).into(),
+    };
+    define_readonly_property(scope, workflow, "runId", run_id_value)?;
+    define_readonly_property(scope, global, "workflow", workflow.into())
+}
+
+/// Define `name` on `object` as a non-writable, non-deletable data property so a
+/// workflow script can neither reassign nor delete it. In the ES-module (strict)
+/// runtime an assignment throws a `TypeError`; otherwise it is silently ignored.
+fn define_readonly_property<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    object: v8::Local<'s, v8::Object>,
+    name: &str,
+    value: v8::Local<'s, v8::Value>,
+) -> Result<(), String> {
+    let key = v8::String::new(scope, name)
+        .ok_or_else(|| format!("failed to allocate read-only global `{name}`"))?;
+    let attr = v8::PropertyAttribute::READ_ONLY | v8::PropertyAttribute::DONT_DELETE;
+    if object.define_own_property(scope, key.into(), value, attr) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("failed to define read-only global `{name}`"))
+    }
 }
 
 fn build_tools_object<'s>(

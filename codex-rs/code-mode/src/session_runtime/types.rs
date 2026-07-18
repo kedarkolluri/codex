@@ -2,6 +2,8 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnOutcome;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -83,6 +85,13 @@ pub(crate) struct CreateCellRequest {
     /// through the protocol `ExecuteRequest`. Gates the workflow-only narrator
     /// globals; see [`codex_code_mode_protocol::ExecuteRequest::workflow`].
     pub(crate) workflow: bool,
+    /// Invocation JSON threaded from the workflow handler; installed read-only as
+    /// the `args` global for workflow runs. See
+    /// [`codex_code_mode_protocol::ExecuteRequest::args`].
+    pub(crate) args: Option<JsonValue>,
+    /// Host-minted uuid v7 run identifier; exposed read-only as `workflow.runId`.
+    /// See [`codex_code_mode_protocol::ExecuteRequest::run_id`].
+    pub(crate) run_id: Option<String>,
 }
 
 /// Tool metadata exposed to code running inside a cell.
@@ -134,6 +143,22 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         text: String,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Spawn a workflow subagent for an `agent(prompt, opts?)` call, resolving to an
+    /// [`AgentSpawnOutcome`]: `Completed` (a JSON string when schemaless, or the validated
+    /// `opts.schema` object), `Failed` (JS `null`), or `Rejected` (throw). The default resolves to
+    /// `Failed` so delegates that do not support workflow spawning need no changes.
+    fn spawn_agent(
+        &self,
+        cell_id: CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
 
     fn cell_closed(&self, cell_id: &CellId);
 }

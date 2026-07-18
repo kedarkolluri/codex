@@ -12,12 +12,14 @@ use super::ProtocolVersion;
 use super::RequestId;
 use super::SessionId;
 use super::SupportedProtocolVersions;
+use super::WireAgentSpawnOutcome;
 use super::WireCellId;
 use super::WireExecuteRequest;
 use super::WireNestedToolCall;
 use super::WireRuntimeResponse;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use crate::AgentCallOpts;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +224,20 @@ pub enum DelegateRequest {
         cell_id: WireCellId,
         text: String,
     },
+    /// A workflow `agent(prompt, opts?)` spawn. `cell_id` routes the call to the owning cell's local
+    /// delegate (the real core spawn broker) just like [`Self::Notify`]; `ordinal` is the
+    /// deterministic source-order invocation ordinal used host-side for a replay-stable subagent
+    /// nickname.
+    #[serde(rename = "agent/spawn")]
+    SpawnAgent {
+        cell_id: WireCellId,
+        prompt: String,
+        ordinal: u64,
+        // Boxed to keep the (otherwise small) `DelegateRequest` — and every enum that embeds it —
+        // from being dominated by the wide `AgentCallOpts`; serde treats `Box<T>` transparently, so
+        // the wire shape is unchanged.
+        opts: Box<AgentCallOpts>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -231,6 +247,10 @@ pub enum DelegateResponse {
     ToolResult { result: JsonValue },
     #[serde(rename = "notification/delivered")]
     NotificationDelivered,
+    /// The resolution of a [`DelegateRequest::SpawnAgent`]: the three-way `agent()` outcome
+    /// (resolve-with-value / resolve-to-null / reject) round-tripped back to the host isolate.
+    #[serde(rename = "agent/spawned")]
+    AgentSpawned { outcome: WireAgentSpawnOutcome },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

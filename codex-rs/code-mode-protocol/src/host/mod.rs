@@ -26,6 +26,7 @@ pub use message::HostRequest;
 pub use message::HostResponse;
 pub use message::HostToClient;
 pub use message::WireResult;
+pub use payload::WireAgentSpawnOutcome;
 pub use payload::WireCellId;
 pub use payload::WireContentItem;
 pub use payload::WireExecuteRequest;

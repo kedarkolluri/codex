@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnFuture;
+use codex_code_mode_protocol::AgentSpawnOutcome;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
@@ -42,7 +45,7 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 .await?
             {
                 DelegateResponse::ToolResult { result } => Ok(result),
-                DelegateResponse::NotificationDelivered => {
+                DelegateResponse::NotificationDelivered | DelegateResponse::AgentSpawned { .. } => {
                     Err("code-mode client returned an invalid tool result".to_string())
                 }
             }
@@ -71,9 +74,43 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 .await?
             {
                 DelegateResponse::NotificationDelivered => Ok(()),
-                DelegateResponse::ToolResult { .. } => {
+                DelegateResponse::ToolResult { .. } | DelegateResponse::AgentSpawned { .. } => {
                     Err("code-mode client returned an invalid notification result".to_string())
                 }
+            }
+        })
+    }
+
+    /// Route a workflow `agent(prompt, opts?)` spawn over the wire to the client-side delegate (the
+    /// real core spawn broker) and await the three-way outcome. Any wire failure, cancellation, or
+    /// an unexpected response variant is death-is-null (`Failed`) — `agent()` never throws for a
+    /// transport failure — while an explicit `Rejected` from the client is faithfully preserved so
+    /// the isolate throws the cap/budget message.
+    fn spawn_agent<'a>(
+        &'a self,
+        cell_id: CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::SpawnAgent {
+                        cell_id: cell_id.into(),
+                        prompt,
+                        ordinal,
+                        opts: Box::new(opts),
+                    },
+                    cancellation_token,
+                )
+                .await
+            {
+                Ok(DelegateResponse::AgentSpawned { outcome }) => outcome.into(),
+                Ok(_) | Err(_) => AgentSpawnOutcome::Failed,
             }
         })
     }

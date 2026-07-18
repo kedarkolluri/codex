@@ -295,6 +295,25 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
             .await
     }
 
+    async fn spawn_agent(
+        &self,
+        cell_id: runtime::CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: codex_code_mode_protocol::AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.delegate
+            .spawn_agent(
+                protocol_cell_id(&cell_id),
+                prompt,
+                ordinal,
+                opts,
+                cancellation_token,
+            )
+            .await
+    }
+
     fn cell_closed(&self, cell_id: &runtime::CellId) {
         self.delegate.cell_closed(&protocol_cell_id(cell_id));
     }
@@ -321,6 +340,8 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             .collect(),
         source: request.source,
         workflow: request.workflow,
+        args: request.args,
+        run_id: request.run_id,
     }
 }
 

@@ -270,6 +270,25 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
+    async fn spawn_agent(
+        &self,
+        prompt: String,
+        ordinal: u64,
+        opts: codex_code_mode_protocol::AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.inner
+            .delegate
+            .spawn_agent(
+                self.cell_id.clone(),
+                prompt,
+                ordinal,
+                opts,
+                cancellation_token,
+            )
+            .await
+    }
+
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, JsonValue>,

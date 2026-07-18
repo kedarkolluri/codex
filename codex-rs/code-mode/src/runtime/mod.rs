@@ -10,6 +10,7 @@ use std::panic::catch_unwind;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
+use codex_code_mode_protocol::AgentCallOpts;
 use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::EnabledToolMetadata;
 use codex_code_mode_protocol::ExecuteRequest;
@@ -62,6 +63,25 @@ pub(crate) enum RuntimeEvent {
     Notify {
         call_id: String,
         text: String,
+    },
+    /// A workflow `agent(prompt, opts?)` spawn request (§3 async bridge op; §7
+    /// invocation ordinal). Structurally mirrors [`RuntimeEvent::ToolCall`]: the
+    /// `agent_callback` mints a resolver stored in `pending_tool_calls` under
+    /// `id`, stamps `ordinal` synchronously from `RuntimeState.next_agent_ordinal`
+    /// (source-ordered even under `Promise.all`), and emits this event for the
+    /// cell actor to route to the spawn helper. Emitted only for workflow runs.
+    /// This is the pure type surface both `P1-agent-callback` (emits) and
+    /// `P1-cellactor-spawn-dispatch` (consumes) build against; no code
+    /// constructs it yet.
+    #[allow(
+        dead_code,
+        reason = "constructed by the later agent_callback / cell_actor dispatch tickets"
+    )]
+    AgentCall {
+        id: String,
+        ordinal: u64,
+        prompt: String,
+        opts: AgentCallOpts,
     },
     /// A workflow `phase(title)` narrator/grouping marker. Emitted only for
     /// workflow runs; the protocol `WorkflowPhaseBegin/End` mapping + journaling
@@ -117,6 +137,8 @@ pub(crate) fn spawn_runtime(
         source: request.source,
         stored_values,
         workflow: request.workflow,
+        args: request.args,
+        run_id: request.run_id,
     };
 
     spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
@@ -160,6 +182,12 @@ struct RuntimeConfig {
     stored_values: HashMap<String, JsonValue>,
     /// Explicit workflow invocation mode carried from the `ExecuteRequest`.
     workflow: bool,
+    /// Invocation JSON carried from `ExecuteRequest::args`; installed read-only as
+    /// the `args` global for workflow runs.
+    args: Option<JsonValue>,
+    /// Host-minted uuid v7 run identifier from `ExecuteRequest::run_id`; exposed
+    /// read-only as `workflow.runId` for workflow runs.
+    run_id: Option<String>,
 }
 
 pub(super) struct RuntimeState {
@@ -171,6 +199,17 @@ pub(super) struct RuntimeState {
     enabled_tools: Vec<EnabledToolMetadata>,
     next_tool_call_id: u64,
     next_timeout_id: u64,
+    /// Monotonic source-order counter for `agent()` invocations. Stamped onto
+    /// each [`RuntimeEvent::AgentCall`] as its `ordinal` (§7 invocation ordinal),
+    /// bumped synchronously in `agent_callback` before the promise returns so the
+    /// sequence is deterministic across `parallel`/`Promise.all` concurrency and
+    /// stable for prefix-replay cache keying. Initialized to `0`. Not yet read by
+    /// non-test code; the `agent_callback` ticket wires the bump.
+    #[allow(
+        dead_code,
+        reason = "stamped by the later agent_callback ticket (P1-agent-callback)"
+    )]
+    next_agent_ordinal: u64,
     tool_call_id: String,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
     exit_requested: bool,
@@ -180,6 +219,14 @@ pub(super) struct RuntimeState {
     /// narrator globals (`phase`/`log`) so they never leak into plain code-mode
     /// exec sessions.
     workflow: bool,
+    /// Invocation JSON injected read-only as the `args` global. Only populated
+    /// (and only installed) for workflow runs; see
+    /// [`codex_code_mode_protocol::ExecuteRequest::args`].
+    args: Option<JsonValue>,
+    /// Host-minted uuid v7 run identifier exposed read-only as `workflow.runId`.
+    /// Only populated (and only installed) for workflow runs; see
+    /// [`codex_code_mode_protocol::ExecuteRequest::run_id`].
+    run_id: Option<String>,
 }
 
 pub(super) enum CompletionState {
@@ -226,10 +273,13 @@ fn run_runtime(
         enabled_tools: config.enabled_tools,
         next_tool_call_id: 1,
         next_timeout_id: 1,
+        next_agent_ordinal: 0,
         tool_call_id: config.tool_call_id,
         runtime_command_tx,
         exit_requested: false,
         workflow,
+        args: config.args,
+        run_id: config.run_id,
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
@@ -385,6 +435,8 @@ mod tests {
             yield_time_ms: Some(1),
             max_output_tokens: None,
             workflow: false,
+            args: None,
+            run_id: None,
         }
     }
 
@@ -396,6 +448,44 @@ mod tests {
             workflow: true,
             ..execute_request(source)
         }
+    }
+
+    /// A workflow-mode request carrying invocation `args` JSON and a host-minted
+    /// `run_id`, exercising the read-only `args` / `workflow.runId` globals.
+    fn workflow_execute_request_with_args(
+        source: &str,
+        args: serde_json::Value,
+        run_id: &str,
+    ) -> ExecuteRequest {
+        ExecuteRequest {
+            args: Some(args),
+            run_id: Some(run_id.to_string()),
+            ..workflow_execute_request(source)
+        }
+    }
+
+    /// Collect the ordered `text(...)` outputs from a drained event stream.
+    fn text_outputs(events: &[RuntimeEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                RuntimeEvent::ContentItem(FunctionCallOutputContentItem::InputText { text }) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Assert the terminal `Result` carried no error.
+    fn assert_result_ok(events: &[RuntimeEvent]) {
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        assert!(
+            error_text.is_none(),
+            "workflow body must run cleanly, got: {error_text:?}"
+        );
     }
 
     #[tokio::test]
@@ -673,6 +763,304 @@ await new Promise(() => {});
         assert!(
             error_text.contains("log expects non-empty text"),
             "expected the shared narrator validation error, got: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_args_global_exposes_invocation_json() {
+        // The invocation JSON is injected read-only as the `args` global; a
+        // workflow body reads `args.foo` and receives the value passed at
+        // invocation (acceptance: "reads args.foo and receives the value").
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(args.foo));\n",
+            "text(JSON.stringify(args.nested));\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request_with_args(
+                source,
+                serde_json::json!({ "foo": "bar", "nested": { "n": 1 } }),
+                "run-args-1",
+            ),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec!["bar".to_string(), "{\"n\":1}".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_run_id_global_is_host_minted_and_stable() {
+        // `workflow.runId` returns exactly the host-minted value and is stable
+        // across reads within the run (acceptance: "returns the host-minted uuid
+        // v7 and is stable within a run").
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const a = workflow.runId;\n",
+            "const b = workflow.runId;\n",
+            "text(a);\n",
+            "text(String(a === b));\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request_with_args(
+                source,
+                serde_json::Value::Null,
+                "0192f000-0000-7000-8000-0000000000ab",
+            ),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec![
+                "0192f000-0000-7000-8000-0000000000ab".to_string(),
+                "true".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_args_and_run_id_are_read_only() {
+        // Assignment to `args` or `workflow.runId` must throw or be silently
+        // ignored. Wrapping each write in try/catch and reading the value back
+        // proves the binding is unchanged under either behavior (acceptance:
+        // "assignment throws or is silently ignored, tested").
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "try { args = { foo: 'hacked' }; } catch (_e) {}\n",
+            "try { workflow.runId = 'hacked'; } catch (_e) {}\n",
+            "text(String(args.foo));\n",
+            "text(workflow.runId);\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request_with_args(
+                source,
+                serde_json::json!({ "foo": "original" }),
+                "run-readonly-1",
+            ),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec!["original".to_string(), "run-readonly-1".to_string()],
+            "read-only args/workflow.runId must be unchanged by assignment",
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_exec_does_not_install_args_or_workflow_globals() {
+        // The `args` and `workflow` globals are workflow-only: a plain code-mode
+        // exec that reads `args` sees a `ReferenceError`, never a leaked global.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(args.foo));\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("args is not defined"),
+            "expected ReferenceError for missing `args` global, got: {error_text}"
+        );
+    }
+
+    /// Drive a workflow-mode source and return the ordered `text(...)` outputs,
+    /// asserting the terminal `Result` carried no error. Shared by the
+    /// `parallel()` prelude tests below.
+    async fn run_workflow_text_outputs(source: &str) -> Vec<String> {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        text_outputs(&events)
+    }
+
+    #[tokio::test]
+    async fn parallel_returns_results_in_input_order() {
+        // Acceptance: `parallel` of N thunks returns an N-length array in input
+        // order (position-preserving), independent of completion order.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const results = await parallel([\n",
+            "  async () => 'a',\n",
+            "  async () => 'b',\n",
+            "  async () => 'c',\n",
+            "]);\n",
+            "text(String(results.length));\n",
+            "text(JSON.stringify(results));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["3".to_string(), "[\"a\",\"b\",\"c\"]".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_throwing_thunk_yields_null_without_failing_siblings() {
+        // Acceptance: a thunk that throws yields `null` at its position while its
+        // siblings still resolve to their values.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const results = await parallel([\n",
+            "  async () => 'ok',\n",
+            "  async () => { throw new Error('boom'); },\n",
+            "  async () => 'fine',\n",
+            "]);\n",
+            "text(JSON.stringify(results));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["[\"ok\",null,\"fine\"]".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_awaits_all_thunks_before_resolving() {
+        // Acceptance: `parallel` is a barrier — it awaits ALL thunks before
+        // resolving. The thunks complete in a different order than dispatched
+        // (descending `setTimeout` delays), yet at resolution every thunk has run
+        // (`completed === 3`) and the results stay position-preserving.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "let completed = 0;\n",
+            "const mk = (value, delay) => () =>\n",
+            "  new Promise((resolve) =>\n",
+            "    setTimeout(() => { completed += 1; resolve(value); }, delay)\n",
+            "  );\n",
+            "const results = await parallel([\n",
+            "  mk('a', 30),\n",
+            "  mk('b', 5),\n",
+            "  mk('c', 15),\n",
+            "]);\n",
+            "text(String(completed));\n",
+            "text(JSON.stringify(results));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["3".to_string(), "[\"a\",\"b\",\"c\"]".to_string()],
+            "barrier must await all thunks; results stay position-preserving",
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_at_cap_boundary_dispatches_all() {
+        // The 4096-item boundary is inclusive: exactly 4096 thunks dispatch and
+        // resolve without tripping the cap guard.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const thunks = [];\n",
+            "for (let i = 0; i < 4096; i++) thunks.push(async () => i);\n",
+            "const results = await parallel(thunks);\n",
+            "text(String(results.length));\n",
+            "text(String(results[0]) + ',' + String(results[4095]));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["4096".to_string(), "0,4095".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_over_cap_throws_before_any_dispatch() {
+        // Acceptance: >4096 items throws a descriptive cap error BEFORE any thunk
+        // is dispatched. `dispatched` staying at 0 proves the guard fires ahead of
+        // `Array.prototype.map` calling the thunks.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "let dispatched = 0;\n",
+            "const thunks = [];\n",
+            "for (let i = 0; i < 4097; i++)\n",
+            "  thunks.push(() => { dispatched += 1; return Promise.resolve(i); });\n",
+            "try {\n",
+            "  await parallel(thunks);\n",
+            "  text('NO_THROW');\n",
+            "} catch (e) {\n",
+            "  text(e.constructor.name);\n",
+            "  text(String(e.message.includes('4096')));\n",
+            "}\n",
+            "text('dispatched=' + dispatched);\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "RangeError".to_string(),
+                "true".to_string(),
+                "dispatched=0".to_string(),
+            ],
+            "cap must throw a descriptive RangeError before dispatching any thunk",
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_exec_does_not_install_parallel_prelude() {
+        // `parallel` is gated on the workflow flag exactly like the other
+        // narrator globals: a plain code-mode exec that calls it sees a
+        // `ReferenceError`, never a leaked binding.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "await parallel([async () => 1]);\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("parallel is not defined"),
+            "expected ReferenceError for missing `parallel` global, got: {error_text}"
         );
     }
 }

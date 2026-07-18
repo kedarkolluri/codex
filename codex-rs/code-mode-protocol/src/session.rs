@@ -22,6 +22,31 @@ pub type CodeModeSessionProviderFuture<'a> =
 pub type ToolInvocationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
 pub type NotificationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+/// The three-way resolution of a workflow `agent(prompt, opts?)` spawn, produced host-side and
+/// carried back to the isolate so the `agent()` promise can RESOLVE, resolve-to-null, or REJECT.
+///
+/// This is the shared seam type between core's spawn path and the code-mode bridge. `agent()` never
+/// throws for *agent* failure (death-is-null), but an *admission-time* cap/budget rejection is a
+/// distinct outcome the isolate surfaces as a thrown promise rejection.
+#[derive(Clone, Debug)]
+pub enum AgentSpawnOutcome {
+    /// Resolve the `agent()` promise with this value: a plain JS string (a schemaless call, carried
+    /// as [`JsonValue::String`]) or the validated JSON object for an `opts.schema` call (`§6`).
+    Completed(JsonValue),
+    /// Resolve the `agent()` promise to JS `null` — death-is-null. Covers a dead/aborted agent, an
+    /// unresolvable model/role/effort, an `opts.schema` parse/validation failure, or a host that
+    /// does not support workflow spawning.
+    Failed,
+    /// REJECT (throw) the `agent()` promise with this message. Reserved for an admission-time
+    /// scheduler lifetime-cap / budget rejection (e.g. `"AgentCapReached"` / `"BudgetExceeded"`),
+    /// which is *not* an agent failure and must not be silently swallowed as `null`.
+    Rejected(String),
+}
+
+/// Future returned by [`CodeModeSessionDelegate::spawn_agent`]. Resolves to an [`AgentSpawnOutcome`]
+/// that tells the isolate how to settle the `agent()` promise (resolve with a value, resolve to
+/// `null`, or throw).
+pub type AgentSpawnFuture<'a> = Pin<Box<dyn Future<Output = AgentSpawnOutcome> + Send + 'a>>;
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CellId(String);
@@ -99,6 +124,30 @@ pub trait CodeModeSessionDelegate: Send + Sync {
         text: String,
         cancellation_token: CancellationToken,
     ) -> NotificationFuture<'a>;
+
+    /// Spawn a workflow subagent for an `agent(prompt, opts?)` call and resolve to the child's final
+    /// answer.
+    ///
+    /// `ordinal` is the deterministic source-order invocation ordinal stamped by the runtime
+    /// (`RuntimeState.next_agent_ordinal`), used host-side to derive a replay-stable subagent
+    /// nickname. The returned future resolves to an [`AgentSpawnOutcome`]: `Completed(value)` on
+    /// success (a JSON string for a schemaless call, or the validated JSON object for an
+    /// `opts.schema` call), `Failed` (JS `null`) for any agent failure (a dead/aborted agent, an
+    /// unresolvable model/role/effort, a `schema` parse/validation failure, or a host that does not
+    /// support workflow spawning) — `agent()` never throws for agent failure — or `Rejected(msg)` to
+    /// throw an admission-time cap/budget rejection in the isolate. The default implementation
+    /// resolves to `Failed` so non-workflow hosts need no changes.
+    fn spawn_agent<'a>(
+        &'a self,
+        cell_id: CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: crate::AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
+        Box::pin(async { AgentSpawnOutcome::Failed })
+    }
 
     /// Releases delegate state associated with a cell after it reaches a terminal state.
     fn cell_closed(&self, cell_id: &CellId);

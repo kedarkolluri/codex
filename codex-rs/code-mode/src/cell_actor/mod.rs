@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use self::callbacks::CallbackCompletion;
 use self::callbacks::finish_callbacks;
 use self::callbacks::report_task_result;
+use self::callbacks::spawn_agent;
 use self::callbacks::spawn_notification;
 use self::callbacks::spawn_tool;
 use self::conversions::cell_tool_kind;
@@ -391,6 +392,35 @@ async fn run_cell<H: CellHost>(
                     // cell actor deliberately ignores these for now (they are
                     // still observable at the raw `RuntimeEvent` boundary).
                     RuntimeEvent::Phase { .. } | RuntimeEvent::WorkflowLog { .. } => {}
+                    // Workflow `agent()` spawn requests. Mirrors the `ToolCall`
+                    // path: spawn one independent task into the shared tool
+                    // JoinSet that routes the call through the host to the spawn
+                    // helper and settles the isolate promise by id via the same
+                    // resolve/reject commands a nested tool uses. The host's
+                    // `AgentSpawnOutcome` maps to `ToolResponse` (`Completed` -> JS
+                    // value, `Failed` -> JS null; `agent()` never throws for agent
+                    // failure) or `ToolError` (`Rejected` -> the isolate throws the
+                    // cap/budget message). The tasks do not touch the consume loop's
+                    // state, so N concurrent `agent()` calls resolve independently
+                    // and out-of-order.
+                    RuntimeEvent::AgentCall {
+                        id,
+                        ordinal,
+                        prompt,
+                        opts,
+                    } => {
+                        spawn_agent(
+                            &mut tool_tasks,
+                            Arc::clone(&host),
+                            id,
+                            prompt,
+                            ordinal,
+                            opts,
+                            runtime_tx.clone(),
+                            callback_cancellation_token.child_token(),
+                            task_failure_handler.clone(),
+                        );
+                    }
                     RuntimeEvent::Notify { call_id, text } => {
                         spawn_notification(
                             &mut notification_tasks,
