@@ -35,14 +35,14 @@ const STAGE1 = [
     {
       id: 'P1-agent-callback', issue: 10, headings: ['P1-agent-callback'],
       scope: 'codex-rs/code-mode/src/runtime/callbacks.rs and globals.rs (agent global, workflow-gated like phase/log from wave 2)',
-      extra: 'Model exactly on tool_callback: mint PromiseResolver, stamp ordinal = state.next_agent_ordinal++ SYNCHRONOUSLY before returning the promise, store resolver in pending_tool_calls under a fresh id, emit RuntimeEvent::AgentCall. No host spawn wiring (that is #12). The isolate test must prove Promise.all([agent(a),agent(b),agent(c)]) yields ordinals 0,1,2 in source order. Install the agent global ONLY for workflow runs, same gating mechanism phase/log use.',
+      extra: 'Model exactly on tool_callback: mint PromiseResolver, stamp ordinal = state.next_agent_ordinal++ SYNCHRONOUSLY before returning the promise, store resolver in pending_tool_calls under a fresh id, emit RuntimeEvent::AgentCall. No host spawn wiring (that is #12). The isolate test must prove Promise.all([agent(a),agent(b),agent(c)]) yields ordinals 0,1,2 in source order. GATING: wave 2 replaced source-sniffing with an EXPLICIT flag — install the agent global ONLY when RuntimeState.workflow is true (the same workflow: bool that gates phase()/log(), threaded from ExecuteRequest through RuntimeConfig). Follow exactly how globals.rs installs phase/log under that flag today.',
     },
   ],
   [
     {
       id: 'P1-opts-model-effort', issue: 13, headings: ['P1-opts-model-effort'],
-      scope: 'codex-rs/core/src/agent/control/spawn_await.rs (+ its tests) and, if needed, a small opts struct module next to it',
-      extra: 'Extend the wave-2 spawn_and_await_final_message config-build step: opts.model via apply_requested_spawn_agent_model_overrides, effort mapping low..max -> ReasoningEffort validated against supported_reasoning_levels; omitted values inherit parent config. This and the next two tickets all edit spawn_await.rs — you own the file for this chain, apply them sequentially.',
+      scope: 'codex-rs/core/src/agent/control/spawn_await.rs (+ its tests), core/src/agent/control.rs SpawnAgentOptions if a field is needed, and a small opts module next to spawn_await if needed',
+      extra: 'The committed helper is spawn_and_await_final_message(.., options: SpawnAgentOptions) and builds the child config via build_agent_spawn_config before spawning. Apply opts.model + opts.effort in that config-build step: opts.model via apply_requested_spawn_agent_model_overrides, effort mapping low..max -> ReasoningEffort validated against the resolved model supported_reasoning_levels; omitted values inherit parent config. Thread the requested model/effort in via SpawnAgentOptions (or a dedicated request struct) — decide and document. This and the next two tickets all edit spawn_await.rs — you own the file for this chain, apply them sequentially.',
     },
     {
       id: 'P1-opts-agenttype', issue: 14, headings: ['P1-opts-agenttype'],
@@ -58,8 +58,8 @@ const STAGE1 = [
   [
     {
       id: 'P1-args-injection', issue: 20, headings: ['P1-args-injection'],
-      scope: 'codex-rs/code-mode/src/runtime/globals.rs (+ mod.rs plumbing) and codex-rs/core/src/tools/code_mode/workflow_handler.rs (thread args + runId into the isolate)',
-      extra: 'Inject invocation JSON read-only as global args via json_to_v8 (build_tools_object precedent); mint runId host-side in Rust with uuid v7 (never in JS) exposed read-only as workflow.runId. Assignment to either must throw or be ignored (tested). Workflow-gated like phase/log.',
+      scope: 'codex-rs/code-mode/src/runtime/globals.rs (+ mod.rs plumbing), code-mode-protocol ExecuteRequest/RuntimeConfig (to carry args + runId, alongside the workflow flag added in wave 2), and codex-rs/core/src/tools/code_mode/workflow_handler.rs (set args + runId)',
+      extra: 'Inject invocation JSON read-only as global args via json_to_v8 (build_tools_object precedent); mint runId host-side in Rust with uuid v7 (never in JS) exposed read-only as workflow.runId. Thread args + runId from the workflow handler through ExecuteRequest -> RuntimeConfig the SAME way wave 2 threaded the workflow: bool flag (follow that exact plumbing, incl. the CreateCellRequest round-trip and wire snapshot). Install args/workflow.runId ONLY when RuntimeState.workflow is true. Assignment to either must throw or be ignored (tested).',
     },
   ],
 ]
@@ -69,7 +69,7 @@ const STAGE2 = [
     {
       id: 'P1-cellactor-spawn-dispatch', issue: 12, headings: ['P1-cellactor-spawn-dispatch'],
       scope: 'codex-rs/code-mode/src/cell_actor/mod.rs, codex-rs/core/src/tools/code_mode/delegate.rs (DispatchMessage::SpawnAgent), workflow_handler.rs wiring, and integration tests',
-      extra: 'Route RuntimeEvent::AgentCall (from #10, now in the tree) to the wave-2 spawn helper AgentControl::spawn_and_await_final_message: one independent tokio task per call in the existing JoinSet, answer fed back as RuntimeCommand::ToolResponse{id,result} so resolve_tool_response resolves by id. String -> JS string; None -> JS null (never throw for agent failure). Fixture-model integration test: await agent("p") resolves to child final text; dead agent -> null; 16 concurrent calls resolve independently out-of-order without serialization.',
+      extra: 'Route RuntimeEvent::AgentCall (from #10, now in the tree) to the wave-2 spawn helper. Its REAL committed signature is AgentControl::spawn_and_await_final_message(&self, base_instructions: &BaseInstructions, parent_turn: &TurnContext, parent_thread_id: ThreadId, input: Vec<UserInput>, options: SpawnAgentOptions) -> Option<String> (in core/src/agent/control/spawn_await.rs) — it constructs the Subagent source itself and returns Some(text)/None. The cell_actor/delegate live in code-mode and cannot depend on codex-core directly, so plumb the call through the host delegate that the workflow_handler already holds (the AgentControl + parent turn/thread context live on the core side, same place the workflow handler runs): add DispatchMessage::SpawnAgent carrying {prompt, opts}, handle it by spawning one independent tokio task in the existing JoinSet that invokes the helper, and feed the answer back as RuntimeCommand::ToolResponse{id,result} so resolve_tool_response resolves by id. String -> JS string; None -> JS null (never throw for agent failure). Study how the existing tool_callback dispatch bridges code-mode<->core (delegate boundary) and mirror it. Fixture-model integration test: await agent("p") resolves to child final text; dead agent -> null; 16 concurrent calls resolve independently out-of-order without serialization.',
     },
     {
       id: 'P1-opts-schema', issue: 16, headings: ['P1-opts-schema'],
@@ -98,7 +98,10 @@ const STAGE2 = [
   ],
 ]
 
-const buildPrompt = (t, priorInChain) => `You are implementing one ticket of the Dynamic Workflows feature in the codex repo at ${REPO} (branch claude/dynamic-workflows-impl; Rust workspace ${REPO}/codex-rs). Waves 1-2 are committed: Feature::Workflow + transitive deps, meta parser, budget getters/cell, workflow-journal types, codex-core-workflows loader, workflows watcher, CodeModeWorkflowHandler (runs a workflow body once in a fresh isolate), phase()/log() workflow-gated globals emitting RuntimeEvent::Phase/WorkflowLog, and AgentControl::spawn_and_await_final_message (registering spawn path, consume-to-completion).
+const buildPrompt = (t, priorInChain) => `You are implementing one ticket of the Dynamic Workflows feature in the codex repo at ${REPO} (branch claude/dynamic-workflows-impl; Rust workspace ${REPO}/codex-rs). Waves 1-2 are committed. GROUND TRUTH you must build on (verify by reading, do not re-derive):
+- Workflow-ness is an EXPLICIT flag, not source-sniffing: a serde-defaulted 'workflow: bool' threads ExecuteRequest -> WireExecuteRequest -> CreateCellRequest -> RuntimeConfig -> RuntimeState.workflow; it is omitted on the wire when false. phase()/log() globals install only when that flag is true. Any new workflow global (agent/args/budget/workflow.runId) gates the SAME way and, if it needs host->isolate data, threads through the SAME plumbing.
+- The spawn keystone is AgentControl::spawn_and_await_final_message(&self, base_instructions: &BaseInstructions, parent_turn: &TurnContext, parent_thread_id: ThreadId, input: Vec<UserInput>, options: SpawnAgentOptions) -> Option<String> in core/src/agent/control/spawn_await.rs. It spawns via the registering deferred path, subscribes to a non-competing broadcast event tap (Session::subscribe_events), filters terminal events by submission id, and returns Some(final_text)/None. Do NOT reintroduce next_event() draining or run_codex_thread_one_shot.
+- Committed too: Feature::Workflow + transitive deps, meta parser, budget getters/resettable cell, workflow-journal types, codex-core-workflows loader, workflows watcher, CodeModeWorkflowHandler.
 
 Ticket: ${t.id} — GitHub issue #${t.issue}.${priorInChain ? `\n\nThis ticket CONTINUES a chain: previous ticket "${priorInChain.ticket}" was just implemented in this working tree (files: ${JSON.stringify(priorInChain.files_changed)}; summary: ${priorInChain.summary.slice(0, 500)}). Build on it; never revert it.` : ''}
 
