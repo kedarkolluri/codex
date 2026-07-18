@@ -90,6 +90,7 @@ members = [
     "tools",
     "v8-poc",
     "websocket-client",
+    "workflow-journal",
     "utils/absolute-path",
     "utils/path-uri",
     "utils/cargo-bin",

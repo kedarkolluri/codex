@@ -4519,6 +4519,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-workflow-journal"
+version = "0.0.0"
+dependencies = [
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "color-eyre"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
