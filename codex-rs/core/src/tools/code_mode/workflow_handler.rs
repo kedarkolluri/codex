@@ -20,6 +20,8 @@
 //! the runtime, so existing code-mode behavior is unaffected.
 
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -30,6 +32,15 @@ use codex_features::Feature;
 use codex_features::Features;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use codex_workflow_journal::AgentCallLine;
+use codex_workflow_journal::JournalRecorder;
+use codex_workflow_journal::KEY_ALGO_VERSION;
+use codex_workflow_journal::ReplayJournal;
+use codex_workflow_journal::WorkflowRunMeta;
+use codex_workflow_journal::prompt_hash as content_hash;
+use codex_workflow_journal::storage::WorkflowRunPaths;
+use tracing::info;
+use tracing::warn;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::FunctionToolOutput;
@@ -245,6 +256,11 @@ struct CellRun {
 pub(crate) struct WorkflowRunLedger {
     cell_runs: Mutex<HashMap<CellId, CellRun>>,
     links: Mutex<Vec<WorkflowRunLink>>,
+    /// Per-run [`JournalRecorder`] keyed by the isolate cell executing the run, so the `agent()`
+    /// spawn dispatch (`delegate.rs`) and the `phase()`/`log()` marker path can append to the right
+    /// run's `journal.jsonl` (§7). Registered the moment the run's cell is created; dropped when the
+    /// cell closes.
+    recorders: Mutex<HashMap<CellId, Arc<JournalRecorder>>>,
 }
 
 impl WorkflowRunLedger {
@@ -294,12 +310,33 @@ impl WorkflowRunLedger {
             .and_then(|cell_runs| cell_runs.get(cell_id).map(|run| run.depth))
     }
 
+    /// Register the run's [`JournalRecorder`] under the cell executing it, so the `agent()` dispatch
+    /// and `phase()`/`log()` marker path append to the correct run's `journal.jsonl` (§7).
+    pub(crate) fn register_recorder(&self, cell_id: CellId, recorder: Arc<JournalRecorder>) {
+        if let Ok(mut recorders) = self.recorders.lock() {
+            recorders.insert(cell_id, recorder);
+        }
+    }
+
+    /// The [`JournalRecorder`] for the run executing in `cell_id`, if this is a journaled workflow
+    /// run. `None` for plain code-mode exec (which mints no run and installs no recorder).
+    pub(crate) fn recorder_for_cell(&self, cell_id: &CellId) -> Option<Arc<JournalRecorder>> {
+        self.recorders
+            .lock()
+            .ok()
+            .and_then(|recorders| recorders.get(cell_id).cloned())
+    }
+
     /// Drop the `cell_id → {run_id, depth}` entry once a cell reaches a terminal
     /// state so the map does not grow across a long session. The append-only link
-    /// list is retained (it is the run→parent record).
+    /// list is retained (it is the run→parent record). The per-run recorder is also
+    /// dropped; its per-line flush already made every appended line durable.
     pub(crate) fn forget_cell(&self, cell_id: &CellId) {
         if let Ok(mut cell_runs) = self.cell_runs.lock() {
             cell_runs.remove(cell_id);
+        }
+        if let Ok(mut recorders) = self.recorders.lock() {
+            recorders.remove(cell_id);
         }
     }
 
@@ -321,6 +358,17 @@ pub(crate) struct WorkflowRunOutput {
     pub(crate) response: RuntimeResponse,
     pub(crate) max_output_tokens: Option<usize>,
     pub(crate) started_at: Instant,
+    /// Host-minted uuid v7 run id of THIS run. A resumed run mints a fresh id (it is
+    /// itself resumable); the resume entrypoint reads it to locate the new
+    /// `runs/<runId>/` dir and record the `workflow_runs` discovery row.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read by resume_workflow_source; the --resume/workflow_run entrypoints are P4"
+        )
+    )]
+    pub(crate) run_id: String,
     /// The isolate cell the body ran in. A nested run needs this to terminate a
     /// cell that only `Yielded` (never reached a terminal `Result`) so its isolate
     /// and dispatch/ledger entry do not leak (finding #7).
@@ -355,6 +403,7 @@ pub(crate) fn validate_workflow_meta(code: &str) -> Result<(), FunctionCallError
 ///
 /// Shared by the [`CodeModeWorkflowHandler`] tool path and the integration test
 /// so both drive the identical run-body-once sequence.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_workflow_source(
     features: &Features,
     service: &CodeModeService,
@@ -363,6 +412,9 @@ pub(crate) async fn run_workflow_source(
     source: &str,
     args: serde_json::Value,
     lineage: WorkflowRunLineage,
+    codex_home: &Path,
+    budget_total: u64,
+    resume: Option<ResumeSeed>,
 ) -> Result<WorkflowRunOutput, FunctionCallError> {
     ensure_workflow_enabled(features)?;
 
@@ -379,6 +431,51 @@ pub(crate) async fn run_workflow_source(
     // the isolate — so `workflow.runId` is a host-authored value the script can
     // read but never derive. Exposed read-only inside the fresh isolate.
     let run_id = uuid::Uuid::now_v7().to_string();
+
+    // Journal `run_meta` (§7): hash the executed body and the injected args (structural-change
+    // detectors for resume), and carry the run name / budget ceiling. Computed BEFORE `args` is moved
+    // into the execute request. `name` re-parses the (already-validated) static manifest.
+    //
+    // The recorded `parent_run_id` is the RESUME provenance when this is a resumed run
+    // (the SOURCE run id, §7 "records parent_run_id = the source runId"), otherwise the
+    // nesting parent from `lineage` (a nested `workflow()` run). A top-level resumed run
+    // therefore records the source run id here while its `lineage` stays depth-0 with no
+    // nesting parent — the two notions of "parent" are deliberately distinct.
+    let parent_run_id = match resume.as_ref() {
+        Some(seed) => Some(seed.source_run_id.clone()),
+        None => lineage.parent_run_id.clone(),
+    };
+    let script_hash = content_hash(&exec_args.code);
+    let args_hash = content_hash(&serde_json::to_string(&args).unwrap_or_default());
+    let name = codex_code_mode::parse_workflow_meta(&exec_args.code)
+        .map(|meta| meta.name)
+        .unwrap_or_default();
+    let run_meta = WorkflowRunMeta::new(
+        run_id.clone(),
+        parent_run_id,
+        script_hash,
+        args_hash,
+        name,
+        budget_total,
+        KEY_ALGO_VERSION,
+        chrono::Utc::now().to_rfc3339(),
+    );
+
+    // Stage the prefix-replay seed IMMEDIATELY before `execute` so the top-level
+    // resumed cell — the first cell the runtime spawns — is the one that consumes it
+    // (§7 resume step 2; the seed is taken exactly once). The entries are serialized
+    // to JSON here because the code-mode session seam carries them as plain data. An
+    // empty prefix (fresh run, or a divergent resume) stages nothing, so replay stays
+    // inactive and every `agent()` dispatches live. Nested `workflow()` runs never
+    // resume, so they never stage.
+    if let Some(seed) = resume.as_ref() {
+        let staged = seed
+            .replay_entries
+            .iter()
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .collect::<Vec<_>>();
+        service.stage_replay_entries(staged);
+    }
 
     let started_at = Instant::now();
     let started_cell = service
@@ -409,6 +506,20 @@ pub(crate) async fn run_workflow_source(
         lineage.parent_run_id,
         lineage.depth,
     );
+    // Materialize the run's on-disk layout and start its journal writer BEFORE the body runs, so an
+    // `agent()`/`phase()`/`log()` fired during the body appends to the right run's `journal.jsonl`
+    // (§7 storage layout). Journaling is best-effort: a filesystem failure here must not fail the run
+    // (it degrades to an unjournaled run rather than aborting orchestration).
+    let paths = WorkflowRunPaths::new(codex_home, &run_id);
+    if let Err(err) = paths.initialize(&exec_args.code, &run_meta) {
+        warn!("failed to initialize workflow run dir for {run_id}: {err}");
+    }
+    match JournalRecorder::new(&paths, &run_meta).await {
+        Ok(recorder) => service
+            .workflow_run_ledger()
+            .register_recorder(cell_id.clone(), std::sync::Arc::new(recorder)),
+        Err(err) => warn!("failed to open workflow journal for {run_id}: {err}"),
+    }
     service.mark_cell_ready_for_dispatch(&cell_id);
     let response = started_cell
         .initial_response()
@@ -425,7 +536,224 @@ pub(crate) async fn run_workflow_source(
         max_output_tokens: exec_args.max_output_tokens,
         started_at,
         cell_id,
+        run_id,
     })
+}
+
+/// The prefix-replay seed handed to [`run_workflow_source`] to resume a prior run
+/// (`P3-resume-entry`, spec §7 "Resume algorithm" steps 1-3).
+///
+/// Built by [`load_resume_seed`] from the SOURCE run's `journal.jsonl`. Carries the
+/// source run id (recorded as the resumed run's `run_meta.parent_run_id`) and the
+/// journaled `agent_call` prefix that seeds the isolate's `ReplayState`. On a
+/// structural mismatch (`script_hash`/`args_hash`/`key_algo_version`) the prefix is
+/// **empty** so the resumed run diverges at ordinal 0 and runs entirely live — a
+/// structural change is early divergence, never a hard error (§7).
+#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "consumed by resume_workflow_source; the --resume/workflow_run entrypoints are P4"
+    )
+)]
+pub(crate) struct ResumeSeed {
+    /// The SOURCE run id being resumed. Recorded as the new run's
+    /// `run_meta.parent_run_id`; the resumed run itself mints a fresh id.
+    pub(crate) source_run_id: String,
+    /// The journaled `agent_call` prefix (ordinal-indexed) to seed replay with, or
+    /// empty on divergence (live from ordinal 0).
+    pub(crate) replay_entries: Vec<AgentCallLine>,
+    /// The first structural mismatch against the prior journal, if any. `None` means
+    /// the prior run's shape matches and the full prefix replays. Retained for
+    /// observability/tests; the empty `replay_entries` already encode the live-tail
+    /// behavior.
+    pub(crate) divergence: Option<codex_workflow_journal::Divergence>,
+}
+
+/// Load and validate the SOURCE run's journal to build a [`ResumeSeed`] for a
+/// resumed run (§7 "Resume algorithm" step 1).
+///
+/// Reads `runs/<source_run_id>/journal.jsonl` tail-first via
+/// [`ReplayJournal::load`] (`P3-journal-replay-read`), then checks the resumed run's
+/// `script_hash`/`args_hash`/`key_algo_version` against the recorded `run_meta`. A
+/// mismatch yields an EMPTY replay prefix (divergence at ordinal 0, live tail) rather
+/// than an error, per §7. A missing or unparseable source journal IS a hard error —
+/// there is nothing to resume from.
+///
+/// `source` is the CURRENT program text and `args` the CURRENT invocation JSON; their
+/// hashes are computed exactly as [`run_workflow_source`] computes the recorded ones
+/// (`parse_exec_source` → `content_hash` of the code, `content_hash` of the args
+/// JSON) so an unchanged script/args validate as compatible.
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the --resume/workflow_run entrypoints that call this are P4"
+    )
+)]
+pub(crate) fn load_resume_seed(
+    codex_home: &Path,
+    source_run_id: &str,
+    source: &str,
+    args: &serde_json::Value,
+) -> Result<ResumeSeed, FunctionCallError> {
+    let source_paths = WorkflowRunPaths::new(codex_home, source_run_id);
+    let prior = ReplayJournal::load(&source_paths.journal()).map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "cannot resume workflow run `{source_run_id}`: failed to load its journal: {err}"
+        ))
+    })?;
+
+    // Compute the CURRENT run's structural hashes the same way `run_workflow_source`
+    // records them, so an unchanged script/args are byte-identical and validate.
+    let exec_args =
+        codex_code_mode::parse_exec_source(source).map_err(FunctionCallError::RespondToModel)?;
+    let script_hash = content_hash(&exec_args.code);
+    let args_hash = content_hash(&serde_json::to_string(args).unwrap_or_default());
+
+    let divergence = prior.check_compatibility(&script_hash, &args_hash, KEY_ALGO_VERSION);
+    // On divergence the recorded prefix cannot be trusted, so seed NO entries: the
+    // resumed run diverges at ordinal 0 and runs the whole body live (§7). On a match
+    // the full recorded prefix seeds replay; the `agent_callback` prefix loop
+    // (`P3-resume-prefix-loop`) diverges at the first per-entry key/status mismatch.
+    let replay_entries = if divergence.is_some() {
+        Vec::new()
+    } else {
+        prior.entries().to_vec()
+    };
+
+    Ok(ResumeSeed {
+        source_run_id: source_run_id.to_string(),
+        replay_entries,
+        divergence,
+    })
+}
+
+/// Resume a prior workflow run from its `runId` (`P3-resume-entry`, spec §7 steps
+/// 1-2; `codex workflow run --resume <runId>` / the `workflow_run` tool).
+///
+/// Loads and validates the source journal ([`load_resume_seed`]), then re-enters the
+/// runtime through [`run_workflow_source`] with the seed installed. The resumed run
+/// mints a FRESH `runId` (it is itself resumable, with its own `runs/<runId>/` dir
+/// and journal) and records `run_meta.parent_run_id = source_run_id`. Its unchanged
+/// prefix replays from the journal with no new subagent spawns; the first divergent
+/// call and everything after it run live.
+///
+/// `index_provider`, when `Some`, is the model-provider id used to open the
+/// `workflow_runs` SQLite discovery index and record the resumed run's row
+/// (best-effort — the index is a rebuildable projection; JSONL is authoritative, so a
+/// failure here NEVER fails the resume). `None` skips the index write entirely (e.g.
+/// the hermetic in-process test lane).
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the --resume CLI path and workflow_run tool that call this are P4"
+    )
+)]
+pub(crate) async fn resume_workflow_source(
+    features: &Features,
+    service: &CodeModeService,
+    call_id: String,
+    enabled_tools: Vec<ToolDefinition>,
+    source: &str,
+    args: serde_json::Value,
+    codex_home: &Path,
+    budget_total: u64,
+    source_run_id: &str,
+    index_provider: Option<String>,
+) -> Result<WorkflowRunOutput, FunctionCallError> {
+    ensure_workflow_enabled(features)?;
+
+    let seed = load_resume_seed(codex_home, source_run_id, source, &args)?;
+    if let Some(divergence) = seed.divergence {
+        info!(
+            "resuming workflow run `{source_run_id}` diverges at ordinal 0 ({divergence:?}); \
+             running live from the start"
+        );
+    }
+
+    let output = run_workflow_source(
+        features,
+        service,
+        call_id,
+        enabled_tools,
+        source,
+        args,
+        // A resumed run is top-level: it has no `workflow()` NESTING parent and depth 0.
+        // Its resume provenance (the source run id) is carried via the `ResumeSeed`, not
+        // the lineage, and lands in `run_meta.parent_run_id`.
+        WorkflowRunLineage {
+            parent_run_id: None,
+            depth: 0,
+        },
+        codex_home,
+        budget_total,
+        Some(seed),
+    )
+    .await?;
+
+    // Best-effort `workflow_runs` discovery-index row for the resumed run so it is
+    // itself discoverable/resumable (§7 "the resume is itself resumable"). The index is
+    // a rebuildable projection of `runs/<runId>/meta.json`; JSONL is authoritative, so
+    // a failure to open/write it must NOT fail the resume (acceptance: "Resume path
+    // succeeds with the `workflow_runs` SQLite table absent").
+    if let Some(provider) = index_provider {
+        record_workflow_run_index(codex_home, provider, source, source_run_id, &output.run_id)
+            .await;
+    }
+
+    Ok(output)
+}
+
+/// Best-effort insert of the resumed run's `workflow_runs` discovery row
+/// (`P3-workflow-runs-index`). Opens the state runtime, re-parses the run name +
+/// script hash from `source`, and upserts a `running` row keyed by the fresh run id
+/// with `parent_run_id = source_run_id`. Every failure is logged and swallowed — the
+/// index is a rebuildable projection and never gates replay (JSONL is authoritative).
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "called by resume_workflow_source; the --resume/workflow_run entrypoints are P4"
+    )
+)]
+async fn record_workflow_run_index(
+    codex_home: &Path,
+    provider: String,
+    source: &str,
+    source_run_id: &str,
+    run_id: &str,
+) {
+    let Ok(exec_args) = codex_code_mode::parse_exec_source(source) else {
+        return;
+    };
+    let name = codex_code_mode::parse_workflow_meta(&exec_args.code)
+        .map(|meta| meta.name)
+        .unwrap_or_default();
+    let script_hash = content_hash(&exec_args.code);
+    let paths = WorkflowRunPaths::new(codex_home, run_id);
+    let params = codex_state::WorkflowRunUpsertParams {
+        run_id: run_id.to_string(),
+        name,
+        script_hash,
+        script_path: paths.script().display().to_string(),
+        parent_run_id: Some(source_run_id.to_string()),
+        status: codex_state::WorkflowRunStatus::Running,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    match codex_state::StateRuntime::init(codex_home.to_path_buf(), provider).await {
+        Ok(state) => {
+            if let Err(err) = state.upsert_workflow_run(&params).await {
+                warn!("failed to record workflow_runs row for resumed run {run_id}: {err}");
+            }
+        }
+        Err(err) => {
+            warn!("failed to open state runtime for workflow_runs row {run_id}: {err}");
+        }
+    }
 }
 
 /// The hard `workflow()` nesting ceiling: exactly ONE level, ALWAYS.
@@ -578,6 +906,10 @@ pub(crate) async fn run_workflow_by_name(
             parent_run_id,
             depth: child_depth,
         },
+        exec.turn.config.codex_home.as_path(),
+        budget.limit().unwrap_or(0).max(0) as u64,
+        // A nested `workflow()` run is never a resume; it always runs live.
+        None,
     )
     .await
     {
@@ -776,6 +1108,17 @@ impl CodeModeWorkflowHandler {
                 parent_run_id: None,
                 depth: 0,
             },
+            exec.turn.config.codex_home.as_path(),
+            exec.session
+                .services
+                .agent_control
+                .rollout_budget()
+                .limit()
+                .unwrap_or(0)
+                .max(0) as u64,
+            // A fresh model-callable run is not a resume; `--resume`/`workflow_run`
+            // resume routes through `resume_workflow_source`.
+            None,
         )
         .await?;
         // Script failures return on the `Ok` path as `RuntimeResponse::Result`
@@ -1455,5 +1798,292 @@ mod tests {
             }
             other => panic!("expected Fatal, got {other:?}"),
         }
+    }
+
+    // --- P3-resume-entry: resume entrypoint (load journal, validate, seed) ---
+
+    use super::content_hash;
+    use super::load_resume_seed;
+    use super::record_workflow_run_index;
+    use codex_workflow_journal::AgentCallLine;
+    use codex_workflow_journal::AgentCallOpts as JournalAgentCallOpts;
+    use codex_workflow_journal::AgentStatus;
+    use codex_workflow_journal::Divergence;
+    use codex_workflow_journal::JournalRecorder;
+    use codex_workflow_journal::KEY_ALGO_VERSION;
+    use codex_workflow_journal::WorkflowRunMeta;
+    use codex_workflow_journal::storage::WorkflowRunPaths;
+    use serde_json::json;
+    use std::path::Path;
+
+    /// A `status:completed` `agent_call` line at `ordinal` carrying the full linkage
+    /// (`child_thread_id`/`rollout_path`/`tokens_spent`) a completed line requires.
+    fn completed_agent_call(ordinal: u64) -> AgentCallLine {
+        AgentCallLine {
+            timestamp: None,
+            ordinal,
+            key: format!("blake3:k{ordinal}"),
+            prompt_hash: "ph".to_string(),
+            opts: JournalAgentCallOpts {
+                model: Some("gpt".to_string()),
+                effort: Some("high".to_string()),
+                agent_type: Some("reviewer".to_string()),
+                isolation: None,
+                schema_hash: None,
+            },
+            phase: Some("analyze".to_string()),
+            label: Some(format!("file-{ordinal}")),
+            child_thread_id: Some(format!("th_{ordinal}")),
+            rollout_path: Some(format!("/home/u/.codex/sessions/rollout-{ordinal}.jsonl")),
+            status: Some(AgentStatus::Completed),
+            ret: json!({ "ok": true, "n": ordinal }),
+            tokens_spent: Some(1000 + ordinal),
+            completion_seq: None,
+        }
+    }
+
+    /// Materialize a SOURCE run on disk under `home`: its `runs/<run_id>/` dir,
+    /// `script.js`/`meta.json`, and a `journal.jsonl` whose `run_meta` records the
+    /// hashes of `script`/`args` exactly as [`run_workflow_source`] would, followed by
+    /// `n_completed` completed `agent_call` lines. Returns the run's `WorkflowRunPaths`.
+    async fn write_source_run(
+        home: &Path,
+        run_id: &str,
+        script: &str,
+        args: &serde_json::Value,
+        n_completed: u64,
+    ) -> WorkflowRunPaths {
+        let exec = codex_code_mode::parse_exec_source(script).expect("parse source");
+        let script_hash = content_hash(&exec.code);
+        let args_hash = content_hash(&serde_json::to_string(args).expect("args json"));
+        let meta = WorkflowRunMeta::new(
+            run_id.to_string(),
+            None,
+            script_hash,
+            args_hash,
+            "triage".to_string(),
+            0,
+            KEY_ALGO_VERSION,
+            "2026-07-17T00:00:00Z".to_string(),
+        );
+        let paths = WorkflowRunPaths::new(home, run_id);
+        paths
+            .initialize(&exec.code, &meta)
+            .expect("initialize source run");
+        let recorder = JournalRecorder::new(&paths, &meta)
+            .await
+            .expect("open recorder");
+        for ordinal in 0..n_completed {
+            recorder
+                .record_agent_call(completed_agent_call(ordinal))
+                .await
+                .expect("append agent_call");
+        }
+        recorder.shutdown().await.expect("flush + close journal");
+        paths
+    }
+
+    const SAMPLE_WORKFLOW: &str = "export const meta = { name: 'triage', description: 'triage workflow' };\n\
+         export default async () => {};\n";
+
+    /// Acceptance: a resume over an UNCHANGED script/args loads the full recorded
+    /// prefix (ordinals 0..M) and reports no divergence, so every ordinal can replay
+    /// from cache.
+    #[tokio::test]
+    async fn load_resume_seed_identical_script_and_args_returns_full_prefix() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let args = json!({ "target": "src" });
+        write_source_run(home.path(), "src-run", SAMPLE_WORKFLOW, &args, 3).await;
+
+        let seed =
+            load_resume_seed(home.path(), "src-run", SAMPLE_WORKFLOW, &args).expect("load seed");
+
+        assert_eq!(seed.source_run_id, "src-run");
+        assert_eq!(
+            seed.divergence, None,
+            "unchanged script/args must not diverge"
+        );
+        assert_eq!(
+            seed.replay_entries.len(),
+            3,
+            "the whole recorded prefix seeds"
+        );
+        let ordinals: Vec<u64> = seed.replay_entries.iter().map(|e| e.ordinal).collect();
+        assert_eq!(ordinals, vec![0, 1, 2], "entries are ordinal-indexed 0..M");
+    }
+
+    /// Acceptance: a `script_hash` mismatch produces EARLY DIVERGENCE (empty prefix →
+    /// live from ordinal 0), never an error.
+    #[tokio::test]
+    async fn load_resume_seed_changed_script_diverges_at_zero() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let args = json!({ "target": "src" });
+        write_source_run(home.path(), "src-run", SAMPLE_WORKFLOW, &args, 3).await;
+
+        let edited = "export const meta = { name: \"triage\", version: \"1\" };\n\
+             export default async () => { /* edited */ };\n";
+        let seed = load_resume_seed(home.path(), "src-run", edited, &args).expect("load seed");
+
+        assert_eq!(seed.divergence, Some(Divergence::ScriptHash));
+        assert!(
+            seed.replay_entries.is_empty(),
+            "a structural change seeds no prefix so the run goes live at ordinal 0"
+        );
+    }
+
+    /// Acceptance: an `args_hash` mismatch also produces early divergence, not an error.
+    #[tokio::test]
+    async fn load_resume_seed_changed_args_diverges_at_zero() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_source_run(
+            home.path(),
+            "src-run",
+            SAMPLE_WORKFLOW,
+            &json!({ "target": "src" }),
+            2,
+        )
+        .await;
+
+        let seed = load_resume_seed(
+            home.path(),
+            "src-run",
+            SAMPLE_WORKFLOW,
+            &json!({ "target": "OTHER" }),
+        )
+        .expect("load seed");
+
+        assert_eq!(seed.divergence, Some(Divergence::ArgsHash));
+        assert!(seed.replay_entries.is_empty());
+    }
+
+    /// A missing source journal is a HARD error — there is nothing to resume from —
+    /// unlike a structural mismatch, which is soft divergence.
+    #[tokio::test]
+    async fn load_resume_seed_missing_source_journal_is_error() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let err = load_resume_seed(home.path(), "does-not-exist", SAMPLE_WORKFLOW, &json!(null))
+            .expect_err("missing source run must error");
+        match err {
+            FunctionCallError::RespondToModel(message) => {
+                assert!(message.contains("does-not-exist"), "message: {message}");
+            }
+            other => panic!("expected RespondToModel, got {other:?}"),
+        }
+    }
+
+    /// Acceptance: a resumed run records a `workflow_runs` discovery row keyed by its
+    /// FRESH run id with `parent_run_id` = the source run id, and status `running`.
+    #[tokio::test]
+    async fn record_workflow_run_index_writes_discoverable_row() {
+        let home = tempfile::tempdir().expect("tempdir");
+        record_workflow_run_index(
+            home.path(),
+            "openai".to_string(),
+            SAMPLE_WORKFLOW,
+            "src-run",
+            "fresh-run",
+        )
+        .await;
+
+        let state =
+            codex_state::StateRuntime::init(home.path().to_path_buf(), "openai".to_string())
+                .await
+                .expect("open state runtime");
+        let row = state
+            .get_workflow_run("fresh-run")
+            .await
+            .expect("query row")
+            .expect("row exists for the resumed run");
+        assert_eq!(row.run_id, "fresh-run");
+        assert_eq!(row.parent_run_id.as_deref(), Some("src-run"));
+        assert_eq!(row.name, "triage");
+        assert_eq!(row.status, codex_state::WorkflowRunStatus::Running);
+    }
+
+    /// The index write is best-effort: an unopenable state home (here, a path whose
+    /// parent is a FILE, so directory creation fails) must not panic — the resume path
+    /// stays alive because JSONL is authoritative.
+    #[tokio::test]
+    async fn record_workflow_run_index_is_best_effort_on_open_failure() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let file_path = home.path().join("not-a-dir");
+        std::fs::write(&file_path, b"x").expect("write file");
+        let unusable = file_path.join("state-home");
+
+        // Must return without panicking even though the state DB cannot be opened.
+        record_workflow_run_index(
+            &unusable,
+            "openai".to_string(),
+            SAMPLE_WORKFLOW,
+            "src-run",
+            "fresh-run",
+        )
+        .await;
+    }
+
+    /// Acceptance (end-to-end through the in-process seam): resuming a completed run
+    /// mints a FRESH run id and the resumed run is itself journaled/resumable — its
+    /// `runs/<fresh>/meta.json` records `parent_run_id` = the source run id. Drives the
+    /// full `stage_replay_entries` → `host.replay_entries()` → `ReplayState` seam via
+    /// the in-process code-mode session.
+    #[tokio::test]
+    async fn resume_mints_fresh_run_id_and_records_source_as_parent() {
+        use super::CodeModeService;
+        use super::resume_workflow_source;
+        use codex_code_mode::InProcessCodeModeSessionProvider;
+        use codex_features::Feature;
+        use codex_features::Features;
+        use std::sync::Arc;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        // A runnable workflow whose body produces a top-level result. Its recorded
+        // `script_hash`/`args_hash` (via `write_source_run`) match the same source/args
+        // passed to the resume, so validation is compatible and the prefix seeds.
+        let source = "export const meta = { name: 'triage', description: 'triage workflow' };\n\
+             text('resumed');";
+        let args = json!({ "target": "src" });
+        write_source_run(home.path(), "src-run", source, &args, 3).await;
+
+        let service = CodeModeService::new(Arc::new(InProcessCodeModeSessionProvider));
+        let mut features = Features::default();
+        features.enable(Feature::Workflow);
+
+        let output = resume_workflow_source(
+            &features,
+            &service,
+            "wf-resume-1".to_string(),
+            Vec::new(),
+            source,
+            args,
+            home.path(),
+            0,
+            "src-run",
+            // No index provider: the resume must succeed without the `workflow_runs`
+            // SQLite projection (JSONL is authoritative).
+            None,
+        )
+        .await
+        .expect("resume runs the body");
+
+        assert_ne!(
+            output.run_id, "src-run",
+            "the resumed run mints a FRESH, itself-resumable run id"
+        );
+
+        // The resumed run is journaled under its own fresh id, and its run_meta records
+        // the SOURCE run id as `parent_run_id` (§7 resume provenance).
+        let fresh_paths = WorkflowRunPaths::new(home.path(), &output.run_id);
+        let meta_json =
+            std::fs::read_to_string(fresh_paths.meta()).expect("resumed run meta.json exists");
+        let meta: WorkflowRunMeta =
+            serde_json::from_str(&meta_json).expect("resumed meta.json parses");
+        assert_eq!(meta.run_id, output.run_id);
+        assert_eq!(
+            meta.parent_run_id.as_deref(),
+            Some("src-run"),
+            "the resumed run records parent_run_id = the source runId"
+        );
+
+        service.shutdown().await.expect("shutdown service");
     }
 }

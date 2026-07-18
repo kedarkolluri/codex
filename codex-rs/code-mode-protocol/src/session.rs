@@ -203,6 +203,57 @@ pub trait CodeModeSessionDelegate: Send + Sync {
         None
     }
 
+    /// Prior-run journal `agent_call` lines seeding prefix-replay for a resumed run
+    /// (spec §7 "Resume algorithm" steps 1-3, `P3-resume-entry`).
+    ///
+    /// Returned as raw JSON `agent_call` records (each a serialized
+    /// `codex_workflow_journal::AgentCallLine`) so this protocol trait stays free of a
+    /// dependency on the journal crate — the code-mode runtime deserializes them into
+    /// the isolate's `ReplayState` when it spawns the cell. Like [`budget_handle`], this
+    /// is an in-process hand-off (never serialized over the `ExecuteRequest` wire).
+    ///
+    /// The default returns an empty vec so a fresh (non-resume) run — and every
+    /// non-workflow host — seeds no replay state and dispatches every `agent()` live.
+    /// A resume delegate hands the loaded prefix to the FIRST cell it spawns (the
+    /// top-level resumed run); later nested `workflow()` cells receive an empty vec and
+    /// run fresh.
+    ///
+    /// [`budget_handle`]: CodeModeSessionDelegate::budget_handle
+    fn replay_entries(&self, cell_id: CellId) -> Vec<JsonValue> {
+        let _ = cell_id;
+        Vec::new()
+    }
+
+    /// Journal a workflow `phase(title)` marker for the run executing in `cell_id` (§7 `phase` line).
+    /// The default is a no-op so non-workflow hosts need no changes.
+    fn journal_phase<'a>(&'a self, cell_id: CellId, title: String) -> NotificationFuture<'a> {
+        let _ = (cell_id, title);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Journal a workflow `log(message)` marker for the run executing in `cell_id` (§7 `log` line).
+    /// The default is a no-op so non-workflow hosts need no changes.
+    fn journal_log<'a>(&'a self, cell_id: CellId, message: String) -> NotificationFuture<'a> {
+        let _ = (cell_id, message);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Handle a prefix-replay cache hit for the run executing in `cell_id` (§7 "Resume algorithm"
+    /// step 3): re-append the replayed `agent_call` line to the run's journal and re-add its
+    /// `tokens_spent` to the shared budget, WITHOUT spawning a subagent — so `spent()`/`remaining()`
+    /// and the ceiling throw track the original run.
+    ///
+    /// `entry` is a raw JSON `agent_call` record (a serialized
+    /// `codex_workflow_journal::AgentCallLine`), mirroring [`replay_entries`] so this protocol trait
+    /// stays free of a dependency on the journal crate. The default is a no-op so non-workflow hosts
+    /// — and every host that neither journals nor meters — need no changes.
+    ///
+    /// [`replay_entries`]: CodeModeSessionDelegate::replay_entries
+    fn replay_agent<'a>(&'a self, cell_id: CellId, entry: JsonValue) -> NotificationFuture<'a> {
+        let _ = (cell_id, entry);
+        Box::pin(async { Ok(()) })
+    }
+
     /// Releases delegate state associated with a cell after it reaches a terminal state.
     fn cell_closed(&self, cell_id: &CellId);
 }

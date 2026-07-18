@@ -276,6 +276,37 @@ impl RolloutBudget {
         state.weighted_tokens_used >= state.config.limit_tokens as f64
     }
 
+    /// Replay-only re-add of a journaled `tokens_spent` into the weighted counter
+    /// (spec §7 resume step 3, §8 resume determinism of budget).
+    ///
+    /// During prefix replay each cached `agent_call` is resolved from the journal
+    /// WITHOUT running a live turn, so its recorded spend never flows through
+    /// [`record_usage`](Self::record_usage). This method re-adds that journaled
+    /// weighted spend directly under the existing lock, so after replaying the first
+    /// `k` cached entries `spent()`/`remaining()` — and therefore the pre-admission
+    /// ceiling throw ([`pre_admission_rejects`](Self::pre_admission_rejects)) — land
+    /// at the byte-identical ordinal they did in the original run.
+    ///
+    /// `tokens` is the journal's already-weighted output-token spend (the workflow
+    /// budget's `weighted_tokens_used == output-token spend`, see
+    /// [`workflow_output_weight_config`]), so it is added verbatim rather than
+    /// re-weighted. Negative values are clamped to 0. Unlike `record_usage` this is
+    /// invoked ONLY from the replay branch and NEVER from the live turn path; the
+    /// replay loop stops calling it at the first divergence ordinal (where replay
+    /// hands off to a live `record_usage`), so no cached entry is ever counted by
+    /// both paths.
+    //
+    // The sole production caller is the `agent_callback` prefix-replay branch
+    // (ticket `P3-resume-prefix-loop`), which lands separately; until then the
+    // method is exercised only by the unit tests below, so silence dead_code.
+    #[allow(dead_code)]
+    pub(crate) fn add_spent(&self, tokens: i64) {
+        let mut guard = self.lock();
+        if let Some(state) = guard.as_mut() {
+            state.weighted_tokens_used += tokens.max(0) as f64;
+        }
+    }
+
     pub(crate) fn pending_reminder(
         &self,
         thread_id: ThreadId,
@@ -913,6 +944,111 @@ mod tests {
         assert_eq!(handle.total(), 1_000);
         assert_eq!(handle.spent(), 250);
         assert_eq!(handle.remaining(), 750);
+    }
+
+    /// `add_spent(n)` increases the weighted counter by exactly `n` under the lock,
+    /// so `spent()` rises by `n` and `remaining()` falls by `n` — the primitive the
+    /// replay loop uses to re-charge journaled spend without running a live turn.
+    #[test]
+    fn add_spent_increases_spent_by_exactly_n() {
+        let budget = RolloutBudget::default();
+        budget.configure(config(1_000));
+        budget.record_usage(&output_usage(100)); // live spend baseline
+        assert_eq!(budget.spent(), 100);
+        assert_eq!(budget.remaining(), 900);
+
+        budget.add_spent(250);
+        assert_eq!(budget.spent(), 350, "add_spent must add exactly n");
+        assert_eq!(budget.remaining(), 650);
+
+        // Negative journaled values are clamped to 0 (no headroom is handed back).
+        budget.add_spent(-500);
+        assert_eq!(budget.spent(), 350);
+        assert_eq!(budget.remaining(), 650);
+    }
+
+    /// An unmetered (unconfigured) budget swallows `add_spent` without installing a
+    /// ceiling — a resumed run that carries no budget stays unmetered, exactly like
+    /// `record_usage` on an unconfigured cell.
+    #[test]
+    fn add_spent_is_a_noop_when_unmetered() {
+        let budget = RolloutBudget::default();
+        budget.add_spent(500);
+        assert_eq!(budget.limit(), None, "add_spent must not install a ceiling");
+        assert_eq!(budget.spent(), 0);
+        assert_eq!(budget.remaining(), 0);
+        assert!(!would_throw_pre_admission(&budget));
+    }
+
+    /// The core resume-determinism invariant (spec §8): after replaying the first `k`
+    /// journaled `tokens_spent` via `add_spent`, `spent()`/`remaining()` are
+    /// byte-identical to the values the ORIGINAL live run had after its first `k`
+    /// `record_usage` calls at every ordinal — and the pre-admission ceiling throw
+    /// fires at the identical ordinal in the resumed (replay-then-live) run as in the
+    /// uninterrupted run, with no double-counting at the divergence handoff.
+    #[test]
+    fn add_spent_replay_reproduces_live_spent_remaining_and_throw_boundary() {
+        const LIMIT: i64 = 250;
+        // Per-turn output spend of a fixed agent prefix. With the workflow
+        // output-weight config, journaled tokens_spent == weighted spend == these.
+        let per_turn = [100_i64, 100, 100, 100];
+
+        // --- Original uninterrupted live run: snapshot spent/remaining and the
+        // pre-admission gate BEFORE each turn's usage is recorded. ---
+        let live = RolloutBudget::default();
+        live.configure(config(LIMIT));
+        let mut live_spent = Vec::new();
+        let mut live_remaining = Vec::new();
+        let mut live_gate = Vec::new();
+        for &turn in &per_turn {
+            live_gate.push(live.pre_admission_rejects());
+            live_spent.push(live.spent());
+            live_remaining.push(live.remaining());
+            live.record_usage(&output_usage(turn));
+        }
+
+        // The gate must close partway through this prefix so the boundary is a real
+        // assertion (100+100+100 lands spend on 300 >= 250 → gate shut at ordinal 3).
+        assert_eq!(
+            live_gate,
+            vec![false, false, false, true],
+            "the uninterrupted run's throw boundary must be at ordinal 3"
+        );
+
+        // --- Resumed run: replay the first k=2 entries via add_spent, then go live
+        // from ordinal 2 onward via record_usage (the divergence handoff). ---
+        const K: usize = 2;
+        let resumed = RolloutBudget::default();
+        resumed.configure(config(LIMIT));
+        let mut resumed_spent = Vec::new();
+        let mut resumed_remaining = Vec::new();
+        let mut resumed_gate = Vec::new();
+        for (ordinal, &turn) in per_turn.iter().enumerate() {
+            resumed_gate.push(resumed.pre_admission_rejects());
+            resumed_spent.push(resumed.spent());
+            resumed_remaining.push(resumed.remaining());
+            if ordinal < K {
+                // Replay branch: re-add the journaled tokens_spent, no live turn.
+                resumed.add_spent(turn);
+            } else {
+                // Divergence onward runs live; the cached prefix is NOT re-added
+                // here, so there is no double-counting at the handoff.
+                resumed.record_usage(&output_usage(turn));
+            }
+        }
+
+        assert_eq!(
+            resumed_spent, live_spent,
+            "spent() must be byte-identical at every ordinal (replay + live)"
+        );
+        assert_eq!(
+            resumed_remaining, live_remaining,
+            "remaining() must be byte-identical at every ordinal (replay + live)"
+        );
+        assert_eq!(
+            resumed_gate, live_gate,
+            "the pre-admission throw must fire at the identical ordinal after resume"
+        );
     }
 
     /// Finding #10: an empty `reminder_at_remaining_tokens` suppresses ALL reminders,

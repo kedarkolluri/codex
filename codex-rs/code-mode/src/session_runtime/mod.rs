@@ -305,6 +305,31 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         self.inner.delegate.budget_handle()
     }
 
+    fn replay_entries(&self) -> Vec<codex_workflow_journal::AgentCallLine> {
+        self.inner.delegate.replay_entries(self.cell_id.clone())
+    }
+
+    async fn journal_phase(&self, title: String) {
+        self.inner
+            .delegate
+            .journal_phase(self.cell_id.clone(), title)
+            .await;
+    }
+
+    async fn journal_log(&self, message: String) {
+        self.inner
+            .delegate
+            .journal_log(self.cell_id.clone(), message)
+            .await;
+    }
+
+    async fn replay_agent(&self, entry: codex_workflow_journal::AgentCallLine) {
+        self.inner
+            .delegate
+            .replay_agent(self.cell_id.clone(), entry)
+            .await;
+    }
+
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, JsonValue>,

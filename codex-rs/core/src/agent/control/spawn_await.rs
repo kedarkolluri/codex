@@ -6,8 +6,37 @@ use crate::tools::handlers::multi_agents::build_agent_spawn_config;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use std::path::PathBuf;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::error::TryRecvError;
+
+/// The outcome of a workflow `agent()` spawn enriched with the run→agent linkage facts the journal
+/// (§7) records: the child's final assistant message plus its `child_thread_id`, absolute
+/// `rollout_path`, and the child's metered output-token spend for the call.
+///
+/// [`AgentControl::spawn_and_await_final_message`] returns only `final_text` for backward
+/// compatibility; the journaling host path uses [`AgentControl::spawn_and_await_journaled`] to also
+/// obtain `child_thread_id` / `rollout_path` / `tokens_spent` so a finalized `agent()` can be written
+/// as an `agent_call` line reconstructable from the journal alone.
+#[derive(Debug, Default)]
+pub(crate) struct SpawnAwaitOutcome {
+    /// The child's final assistant message on `TurnComplete`, or `None` on death/abort/spawn failure.
+    pub(crate) final_text: Option<String>,
+    /// Thread id of the spawned child, once it was registered. `None` when the spawn never happened
+    /// (a config-build/override/spawn failure before a child existed).
+    pub(crate) child_thread_id: Option<ThreadId>,
+    /// Absolute path of the child's own rollout session file, materialized before it is read.
+    pub(crate) rollout_path: Option<PathBuf>,
+    /// The child's metered output-token spend for this call (from its `token_usage_info`).
+    pub(crate) tokens_spent: Option<u64>,
+}
+
+impl SpawnAwaitOutcome {
+    /// A spawn that never produced a child (no linkage facts to record).
+    fn failed() -> Self {
+        Self::default()
+    }
+}
 
 impl AgentControl {
     /// Spawn a subagent through the **registering** spawn path and block until the child's first
@@ -58,6 +87,10 @@ impl AgentControl {
     /// - `None` on our turn's `EventMsg::TurnAborted`, a config-build/spawn/submit failure, or the
     ///   child reaching a final state (session-loop termination, or a final status observed after
     ///   the tap lagged) without ever yielding our turn's terminal event.
+    // The plain-`final_text` twin is retained for the `spawn_await_tests` behavioral coverage of the
+    // spawn path (registering path, schema threading, abort/teardown → None); production journaling
+    // uses `spawn_and_await_journaled`.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_and_await_final_message(
         &self,
@@ -67,13 +100,42 @@ impl AgentControl {
         input: Vec<UserInput>,
         final_output_json_schema: Option<serde_json::Value>,
         overrides: SpawnAgentConfigOverrides,
-        mut options: SpawnAgentOptions,
+        options: SpawnAgentOptions,
     ) -> Option<String> {
+        self.spawn_and_await_journaled(
+            base_instructions,
+            parent_turn,
+            parent_thread_id,
+            input,
+            final_output_json_schema,
+            overrides,
+            options,
+        )
+        .await
+        .final_text
+    }
+
+    /// Enriched twin of [`Self::spawn_and_await_final_message`] that additionally surfaces the child's
+    /// `child_thread_id`, absolute `rollout_path`, and metered `tokens_spent` so the workflow host can
+    /// write a §7 `agent_call` journal line — the authoritative run→agent link. Behaviorally identical
+    /// to `spawn_and_await_final_message` (same spawn path, same `final_text`); only the return type
+    /// carries the extra linkage facts, gathered from the (still-registered) child after its turn.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_and_await_journaled(
+        &self,
+        base_instructions: &BaseInstructions,
+        parent_turn: &TurnContext,
+        parent_thread_id: ThreadId,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+        overrides: SpawnAgentConfigOverrides,
+        mut options: SpawnAgentOptions,
+    ) -> SpawnAwaitOutcome {
         let mut config = match build_agent_spawn_config(base_instructions, parent_turn) {
             Ok(config) => config,
             Err(err) => {
                 warn!("failed to build subagent spawn config: {err}");
-                return None;
+                return SpawnAwaitOutcome::failed();
             }
         };
 
@@ -89,7 +151,7 @@ impl AgentControl {
                 Ok(state) => state,
                 Err(err) => {
                     warn!("thread manager dropped before resolving subagent overrides: {err}");
-                    return None;
+                    return SpawnAwaitOutcome::failed();
                 }
             };
             let parent_thread = match state.get_thread(parent_thread_id).await {
@@ -99,7 +161,7 @@ impl AgentControl {
                         "parent thread {parent_thread_id} not registered while resolving subagent \
                          overrides: {err}"
                     );
-                    return None;
+                    return SpawnAwaitOutcome::failed();
                 }
             };
             if let Err(err) = overrides
@@ -107,7 +169,7 @@ impl AgentControl {
                 .await
             {
                 warn!("failed to apply subagent model/effort overrides: {err}");
-                return None;
+                return SpawnAwaitOutcome::failed();
             }
         } else {
             // Even with no requested model/effort/agentType, the role layer must still run so a
@@ -117,7 +179,7 @@ impl AgentControl {
             // without upgrading the manager or looking up the parent thread.
             if let Err(err) = overrides.apply_role_layer(&mut config).await {
                 warn!("failed to apply default subagent role: {err}");
-                return None;
+                return SpawnAwaitOutcome::failed();
             }
         }
 
@@ -145,7 +207,7 @@ impl AgentControl {
             Ok(spawned) => spawned,
             Err(err) => {
                 warn!("subagent spawn failed: {err}");
-                return None;
+                return SpawnAwaitOutcome::failed();
             }
         };
 
@@ -156,11 +218,48 @@ impl AgentControl {
         // workflow monitor / live-attach depend on it), and a submit-failure reaps explicitly inside
         // `await_first_turn_final_message`.
         let mut reaper = SpawnedChildReaper::new(self.clone(), spawned.thread_id);
-        let result = self
+        let final_text = self
             .await_first_turn_final_message(spawned.thread_id, input, final_output_json_schema)
             .await;
         reaper.disarm();
-        result
+
+        // Gather the §7 run→agent linkage facts from the (still-registered) child: its absolute
+        // rollout path and its metered output-token spend for this call. A child that ran its turn
+        // keeps its natural lifecycle, so it is normally still registered here; if it has already been
+        // torn down (abort/teardown) these degrade to `None`, which is fine — the journal exempts
+        // non-`completed` lines from carrying linkage.
+        let (rollout_path, tokens_spent) = self.child_journal_facts(spawned.thread_id).await;
+        SpawnAwaitOutcome {
+            final_text,
+            child_thread_id: Some(spawned.thread_id),
+            rollout_path,
+            tokens_spent,
+        }
+    }
+
+    /// Read a spawned child's journal linkage facts — its absolute rollout path and metered
+    /// output-token spend — after its turn finalized. Materializes the child's rollout file first so
+    /// the recorded `rollout_path` points at a file that exists on disk (§7 acceptance). Both fields
+    /// degrade to `None` if the child is no longer registered.
+    async fn child_journal_facts(
+        &self,
+        child_thread_id: ThreadId,
+    ) -> (Option<PathBuf>, Option<u64>) {
+        let Ok(state) = self.upgrade() else {
+            return (None, None);
+        };
+        let Ok(child_thread) = state.get_thread(child_thread_id).await else {
+            return (None, None);
+        };
+        // Ensure the child's own rollout file is materialized before we record its path, so the
+        // journaled `rollout_path` resolves to an existing subagent session file.
+        child_thread.ensure_rollout_materialized().await;
+        let rollout_path = child_thread.rollout_path();
+        let tokens_spent = child_thread
+            .token_usage_info()
+            .await
+            .map(|info| info.total_token_usage.output_tokens.max(0) as u64);
+        (rollout_path, tokens_spent)
     }
 
     /// Best-effort terminate + deregister a subagent this helper spawned but will not (or no longer)

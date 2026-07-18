@@ -185,6 +185,41 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         None
     }
 
+    /// Prior-run journal `agent_call` lines seeding prefix-replay for a resumed run
+    /// (spec §7 "Resume algorithm", `P3-resume-entry`). The default returns an empty
+    /// vec so a fresh (non-resume) run seeds no replay state. See
+    /// [`codex_code_mode_protocol::CodeModeSessionDelegate::replay_entries`].
+    fn replay_entries(&self, cell_id: CellId) -> Vec<codex_workflow_journal::AgentCallLine> {
+        let _ = cell_id;
+        Vec::new()
+    }
+
+    /// Journal a workflow `phase(title)` marker for `cell_id` (§7 `phase` line). The default is a
+    /// no-op so delegates that do not journal need no changes.
+    fn journal_phase(&self, cell_id: CellId, title: String) -> impl Future<Output = ()> + Send {
+        let _ = (cell_id, title);
+        async {}
+    }
+
+    /// Journal a workflow `log(message)` marker for `cell_id` (§7 `log` line). The default is a
+    /// no-op so delegates that do not journal need no changes.
+    fn journal_log(&self, cell_id: CellId, message: String) -> impl Future<Output = ()> + Send {
+        let _ = (cell_id, message);
+        async {}
+    }
+
+    /// Handle a prefix-replay cache hit for `cell_id` (§7 resume step 3): re-append `entry` to the
+    /// run's journal and re-add its `tokens_spent` to the shared budget, WITHOUT spawning. The
+    /// default is a no-op so delegates that neither journal nor meter need no changes.
+    fn replay_agent(
+        &self,
+        cell_id: CellId,
+        entry: codex_workflow_journal::AgentCallLine,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (cell_id, entry);
+        async {}
+    }
+
     fn cell_closed(&self, cell_id: &CellId);
 }
 

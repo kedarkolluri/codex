@@ -106,6 +106,16 @@ impl CodeModeService {
         &self.workflow_run_ledger
     }
 
+    /// Stage the prior run's journal `agent_call` lines (serialized to JSON) as the
+    /// prefix-replay seed for the NEXT cell this service spawns — the resumed top-level
+    /// run (`P3-resume-entry`, spec §7 steps 1-3). Must be called immediately before
+    /// that run's [`execute`](Self::execute) so the top-level cell (never a nested
+    /// `workflow()` cell) consumes it; the seed is taken exactly once. An empty vec
+    /// clears any prior staging.
+    pub(crate) fn stage_replay_entries(&self, entries: Vec<serde_json::Value>) {
+        self.dispatch_broker.stage_replay_entries(entries);
+    }
+
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
         Arc::clone(&self.session_provider)
     }
@@ -501,6 +511,7 @@ mod tests {
             "text('workflow-ran');",
         );
 
+        let scratch = tempfile::tempdir().expect("scratch codex home");
         let output = run_workflow_source(
             &features,
             &service,
@@ -512,6 +523,9 @@ mod tests {
                 parent_run_id: None,
                 depth: 0,
             },
+            scratch.path(),
+            0,
+            None,
         )
         .await
         .expect("valid workflow runs its body once");
@@ -553,6 +567,7 @@ mod tests {
             "text(String(typeof workflow.runId === 'string' && workflow.runId.length > 0));\n",
         );
 
+        let scratch = tempfile::tempdir().expect("scratch codex home");
         let output = run_workflow_source(
             &features,
             &service,
@@ -564,6 +579,9 @@ mod tests {
                 parent_run_id: None,
                 depth: 0,
             },
+            scratch.path(),
+            0,
+            None,
         )
         .await
         .expect("workflow with args runs its body once");
@@ -611,6 +629,7 @@ mod tests {
             "text('workflow-ran');\n",
         );
 
+        let scratch = tempfile::tempdir().expect("scratch codex home");
         let output = run_workflow_source(
             &features,
             &service,
@@ -622,6 +641,9 @@ mod tests {
                 parent_run_id: None,
                 depth: 0,
             },
+            scratch.path(),
+            0,
+            None,
         )
         .await
         .expect("phase/log workflow runs its body once");
@@ -656,6 +678,7 @@ mod tests {
 
         // No `meta` manifest: rejected before the isolate ever runs. If it had run,
         // `text(...)` would have produced a `Result` output instead of an error.
+        let scratch = tempfile::tempdir().expect("scratch codex home");
         let err = run_workflow_source(
             &features,
             &service,
@@ -667,6 +690,9 @@ mod tests {
                 parent_run_id: None,
                 depth: 0,
             },
+            scratch.path(),
+            0,
+            None,
         )
         .await
         .expect_err("invalid meta must be rejected");
@@ -698,6 +724,7 @@ mod tests {
             "text('workflow-ran');",
         );
 
+        let scratch = tempfile::tempdir().expect("scratch codex home");
         run_workflow_source(
             &Features::default(),
             &service,
@@ -709,6 +736,9 @@ mod tests {
                 parent_run_id: None,
                 depth: 0,
             },
+            scratch.path(),
+            0,
+            None,
         )
         .await
         .expect_err("workflow is unreachable when the feature is disabled");

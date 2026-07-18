@@ -22,6 +22,16 @@ use codex_protocol::protocol::ThreadGoal;
 use codex_protocol::protocol::ThreadGoalStatus;
 use codex_protocol::protocol::ThreadGoalUpdatedEvent;
 use codex_protocol::user_input::UserInput;
+use codex_workflow_journal::AgentCallLine;
+use codex_workflow_journal::AgentCallOpts as JournalAgentCallOpts;
+use codex_workflow_journal::AgentStatus as JournalAgentStatus;
+use codex_workflow_journal::JournalRecorder;
+use codex_workflow_journal::KeyInputs;
+use codex_workflow_journal::LogLine;
+use codex_workflow_journal::NullOrdinal;
+use codex_workflow_journal::PhaseLine;
+use codex_workflow_journal::prompt_hash;
+use codex_workflow_journal::schema_hash;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -59,6 +69,17 @@ pub(super) struct CodeModeDispatchBroker {
     /// counter. Backs the in-process `budget_handle()` (§4/§8) so `budget.spent()` /
     /// `budget.remaining()` forward to live spend instead of static defaults.
     workflow_budget: std::sync::OnceLock<Arc<RolloutBudget>>,
+    /// Prefix-replay seed staged by the resume entrypoint (`P3-resume-entry`, spec §7
+    /// steps 1-3): the prior run's loaded `agent_call` journal lines, serialized as
+    /// JSON so this is a plain data hand-off. Set via [`stage_replay_entries`] just
+    /// before the resumed top-level run's `service.execute`, then consumed exactly
+    /// ONCE — by the first cell the runtime spawns, which is that top-level run
+    /// ([`replay_entries`]). Later nested `workflow()` cells find it empty and run
+    /// fresh. `None`/empty for every non-resume run, so a live run seeds no replay.
+    ///
+    /// [`stage_replay_entries`]: CodeModeDispatchBroker::stage_replay_entries
+    /// [`replay_entries`]: codex_code_mode_protocol::CodeModeSessionDelegate::replay_entries
+    pending_replay: Mutex<Option<Vec<JsonValue>>>,
 }
 
 impl CodeModeDispatchBroker {
@@ -70,6 +91,23 @@ impl CodeModeDispatchBroker {
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
             workflow_run_ledger,
             workflow_budget: std::sync::OnceLock::new(),
+            pending_replay: Mutex::new(None),
+        }
+    }
+
+    /// Stage the prior run's journal `agent_call` lines as the prefix-replay seed for
+    /// the next cell the runtime spawns (the resumed top-level run). Must be called
+    /// immediately before that run's `service.execute` so the top-level cell — never a
+    /// nested `workflow()` cell — is the one that consumes it. An empty `entries`
+    /// clears any prior staging (a no-op seed). See [`Self::pending_replay`].
+    pub(super) fn stage_replay_entries(&self, entries: Vec<JsonValue>) {
+        let staged = if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        };
+        if let Ok(mut slot) = self.pending_replay.lock() {
+            *slot = staged;
         }
     }
 
@@ -201,7 +239,7 @@ impl CodeModeDispatchBroker {
                         let host = Arc::clone(&host);
                         tokio::spawn(async move {
                             let result = tokio::select! {
-                                result = host.spawn_agent(prompt, ordinal, opts) => result,
+                                result = host.spawn_agent(cell_id, prompt, ordinal, opts) => result,
                                 _ = cancellation_token.cancelled() => return,
                             };
                             let _ = response_tx.send(result);
@@ -444,6 +482,117 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
         })
     }
 
+    fn replay_entries(&self, cell_id: CellId) -> Vec<JsonValue> {
+        // Hand the staged prefix-replay seed (spec §7 steps 1-3, `P3-resume-entry`) to
+        // the FIRST cell the runtime spawns after `stage_replay_entries` — the resumed
+        // top-level run. `take` consumes it so a later nested `workflow()` cell finds
+        // nothing staged and runs fresh (each nested run mints its own runId and is not
+        // a resume). `cell_id` is unused because staging happens before the cell id is
+        // known (the ledger's cell→run mapping is registered only after `execute`
+        // returns); the one-shot consume order is what binds the seed to the top-level
+        // run. A non-resume run stages nothing, so this returns empty and every
+        // `agent()` dispatches live.
+        let _ = cell_id;
+        self.pending_replay
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .unwrap_or_default()
+    }
+
+    fn journal_phase<'a>(&'a self, cell_id: CellId, title: String) -> NotificationFuture<'a> {
+        // Route the `phase(title)` marker to the run's journal (§7 `phase` line, ordinal always null).
+        // A `None` recorder (plain code-mode exec / unregistered cell) is a no-op.
+        Box::pin(async move {
+            // `phase()` can fire at the very top of the script body, BEFORE
+            // `run_workflow_source` registers this cell's recorder and opens the
+            // dispatch gate. Resolving the recorder eagerly would race registration and
+            // silently drop the line, so wait for the cell to be ready for dispatch
+            // (the gate opens immediately AFTER `register_recorder`) exactly as the
+            // agent-call path does, then resolve the recorder.
+            wait_until_cell_ready_for_dispatch(
+                &self.dispatch_gates,
+                &cell_id,
+                &CancellationToken::new(),
+            )
+            .await;
+            if let Some(recorder) = self.workflow_run_ledger.recorder_for_cell(&cell_id) {
+                recorder
+                    .record_phase(PhaseLine {
+                        timestamp: None,
+                        ordinal: NullOrdinal,
+                        title,
+                    })
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        })
+    }
+
+    fn journal_log<'a>(&'a self, cell_id: CellId, message: String) -> NotificationFuture<'a> {
+        // Route the `log(message)` marker to the run's journal (§7 `log` line, ordinal always null).
+        // Like `journal_phase`, wait for the recorder to be registered (dispatch gate
+        // open) before resolving it so an early-body `log()` is not dropped.
+        Box::pin(async move {
+            wait_until_cell_ready_for_dispatch(
+                &self.dispatch_gates,
+                &cell_id,
+                &CancellationToken::new(),
+            )
+            .await;
+            if let Some(recorder) = self.workflow_run_ledger.recorder_for_cell(&cell_id) {
+                recorder
+                    .record_log(LogLine {
+                        timestamp: None,
+                        ordinal: NullOrdinal,
+                        message,
+                    })
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        })
+    }
+
+    fn replay_agent<'a>(&'a self, cell_id: CellId, entry: JsonValue) -> NotificationFuture<'a> {
+        // Prefix-replay cache hit (spec §7 "Resume algorithm" step 3): the isolate matched this
+        // ordinal's recomputed `(prompt, opts)` key against the journaled entry and served the
+        // promise from its `return` WITHOUT spawning. Two host-side effects reproduce the original
+        // run byte-for-byte:
+        //
+        //  1. Re-add the journaled `tokens_spent` to the shared, tree-wide budget via the
+        //     replay-only `add_spent` (`P3-budget-readd`) so `spent()`/`remaining()` and the
+        //     pre-admission ceiling throw land at the identical ordinal as the original run
+        //     (spec §8 "Resume determinism of budget"). This happens FIRST and synchronously with
+        //     respect to the cell actor's serialized event drain, so a later divergent live
+        //     `agent()` observes the replayed spend before its own pre-admission check.
+        //  2. Re-append the entry to the NEW run's journal so the resumed run's `journal.jsonl`
+        //     records the replayed prefix and is itself resumable (§7). A `None` recorder (plain
+        //     code-mode exec / unregistered cell) skips the append.
+        //
+        // The entry crosses the wire-shaped protocol seam as JSON (see the trait doc); parse it back
+        // into a typed line here. A record that fails to parse is dropped best-effort — it must not
+        // disturb the run — matching the discard-on-failure policy of the journal markers above.
+        let recorder = self.workflow_run_ledger.recorder_for_cell(&cell_id);
+        let line: Option<AgentCallLine> = serde_json::from_value(entry).ok();
+        if let Some(line) = line.as_ref()
+            && let Some(tokens) = line.tokens_spent
+            && let Some(budget) = self.workflow_budget.get()
+        {
+            budget.add_spent(tokens as i64);
+        }
+        Box::pin(async move {
+            if let (Some(recorder), Some(line)) = (recorder, line) {
+                recorder
+                    .record_agent_call(line)
+                    .await
+                    .map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        })
+    }
+
     fn cell_closed(&self, cell_id: &CellId) {
         self.close_cell(cell_id);
     }
@@ -524,6 +673,79 @@ const WORKFLOW_SCHEMA_MAX_DEPTH: usize = 64;
 /// admissions are refused.
 const WORKFLOW_AGENT_TURN_TOKEN_ESTIMATE: i64 = 1_024;
 
+/// Per-`agent()`-call journal context (§7 write integration): the invariant fields (ordinal, cache
+/// key, prompt hash, canonicalized opts, phase/label) computed once from the invocation, plus the
+/// run's [`JournalRecorder`] (`None` for a non-journaled run). Wrapped in an `Arc` and cloned into the
+/// admission closure so each terminal outcome appends exactly one `agent_call` line.
+struct AgentCallJournalCtx {
+    /// The run's journal writer, or `None` for plain code-mode exec (no run / no journal).
+    recorder: Option<Arc<JournalRecorder>>,
+    /// Invocation ordinal — the spine of prefix-replay (§7).
+    ordinal: u64,
+    /// `blake3:` cache key over the canonical `(prompt, opts)` (label/phase excluded).
+    key: String,
+    /// Content hash of the raw prompt text.
+    prompt_hash: String,
+    /// Canonicalized cache-relevant opts recorded on the line.
+    opts: JournalAgentCallOpts,
+    /// Progress-attribution phase (`opts.phase`), if any.
+    phase: Option<String>,
+    /// Progress-attribution label (`opts.label`), if any.
+    label: Option<String>,
+}
+
+impl AgentCallJournalCtx {
+    /// Append one `agent_call` line for this invocation's terminal outcome. A no-op when the run is
+    /// not journaled. Best-effort: a write failure warns rather than failing the `agent()` call.
+    async fn record(
+        &self,
+        status: Option<JournalAgentStatus>,
+        ret: JsonValue,
+        child_thread_id: Option<String>,
+        rollout_path: Option<String>,
+        tokens_spent: Option<u64>,
+    ) {
+        let Some(recorder) = self.recorder.as_ref() else {
+            return;
+        };
+        let line = AgentCallLine {
+            timestamp: None,
+            ordinal: self.ordinal,
+            key: self.key.clone(),
+            prompt_hash: self.prompt_hash.clone(),
+            opts: self.opts.clone(),
+            phase: self.phase.clone(),
+            label: self.label.clone(),
+            child_thread_id,
+            rollout_path,
+            status,
+            ret,
+            tokens_spent,
+            completion_seq: None,
+        };
+        if let Err(err) = recorder.record_agent_call(line).await {
+            warn!(
+                "failed to journal workflow agent() call (ordinal {}): {err}",
+                self.ordinal
+            );
+        }
+    }
+
+    /// Record an `agent()` that THREW before (or instead of) spawning a child (a schema-bounds /
+    /// budget / lifetime-cap rejection): `status:error`, `return:null`, no child linkage — which §7
+    /// validation exempts from the completed-line linkage requirements.
+    async fn record_error(&self) {
+        self.record(
+            Some(JournalAgentStatus::Error),
+            JsonValue::Null,
+            None,
+            None,
+            None,
+        )
+        .await;
+    }
+}
+
 struct CoreTurnHost {
     exec: ExecContext,
     tool_runtime: ToolCallRuntime,
@@ -584,10 +806,46 @@ impl CoreTurnHost {
     /// [`finalize_agent_output`].
     async fn spawn_agent(
         &self,
+        cell_id: CellId,
         prompt: String,
         ordinal: u64,
         opts: AgentCallOpts,
     ) -> AgentSpawnOutcome {
+        // Build the §7 journal context from the ordinal + the `(prompt, opts)` the isolate sent,
+        // BEFORE any of `opts`/`prompt` is capped or moved below. The cache key and prompt hash are
+        // computed from the RAW prompt the isolate hashed (never the byte-capped copy) so a resumed
+        // run's recomputed key matches the journaled one; `label`/`phase` are recorded but excluded
+        // from the key. The recorder is `None` for plain code-mode exec (no run, no journal).
+        let journal = Arc::new(AgentCallJournalCtx {
+            recorder: self
+                .exec
+                .session
+                .services
+                .code_mode_service
+                .workflow_run_ledger()
+                .recorder_for_cell(&cell_id),
+            ordinal,
+            key: KeyInputs {
+                prompt: &prompt,
+                model: opts.model.as_deref(),
+                effort: opts.effort.as_deref(),
+                agent_type: opts.agent_type.as_deref(),
+                isolation: opts.isolation.as_deref(),
+                schema: opts.schema.as_ref(),
+            }
+            .cache_key(),
+            prompt_hash: prompt_hash(&prompt),
+            opts: JournalAgentCallOpts {
+                model: opts.model.clone(),
+                effort: opts.effort.clone(),
+                agent_type: opts.agent_type.clone(),
+                isolation: opts.isolation.clone(),
+                schema_hash: opts.schema.as_ref().map(schema_hash),
+            },
+            phase: opts.phase.clone(),
+            label: opts.label.clone(),
+        });
+
         // Bound the incoming `opts.schema` BEFORE it is threaded into any child prompt or recompiled
         // on return: an over-large / over-deep schema is a caller error, so REJECT the call with a
         // clear reason rather than admitting it and paying the context/CPU cost per child.
@@ -595,6 +853,7 @@ impl CoreTurnHost {
             && let Err(reason) = ensure_schema_within_bounds(schema)
         {
             warn!("workflow agent() rejected: {reason}");
+            journal.record_error().await;
             return AgentSpawnOutcome::Rejected(reason);
         }
         // Bound the incoming prompt before it becomes child context (truncate with a marker so an
@@ -631,6 +890,7 @@ impl CoreTurnHost {
         // its coverage can never drift.
         if budget.pre_admission_rejects() {
             warn!("workflow agent() rejected: BudgetExceeded (budget ceiling reached)");
+            journal.record_error().await;
             return AgentSpawnOutcome::Rejected("BudgetExceeded".to_string());
         }
 
@@ -659,6 +919,7 @@ impl CoreTurnHost {
                 let overrides = overrides.clone();
                 let preferred_agent_nickname = preferred_agent_nickname.clone();
                 let turn_sub_id = turn_sub_id.clone();
+                let journal = Arc::clone(&journal);
                 async move {
                     // Authoritative, race-free budget gate (finding #1, spec §5/§8). Reserve one
                     // per-turn estimate under the shared lock so N concurrent admissions SERIALIZE
@@ -673,6 +934,7 @@ impl CoreTurnHost {
                         // reported even without a further `agent()` attempt.
                         emit_budget_thread_goal(session, &turn_sub_id, budget).await;
                         warn!("workflow agent() rejected: BudgetExceeded (budget ceiling reached)");
+                        journal.record_error().await;
                         return SpawnAttempt::Finalized(AgentSpawnOutcome::Rejected(
                             "BudgetExceeded".to_string(),
                         ));
@@ -687,10 +949,10 @@ impl CoreTurnHost {
                         preferred_agent_nickname,
                         ..Default::default()
                     };
-                    let final_text = session
+                    let spawn_outcome = session
                         .services
                         .agent_control
-                        .spawn_and_await_final_message(
+                        .spawn_and_await_journaled(
                             &base_instructions,
                             turn,
                             parent_thread_id,
@@ -707,10 +969,49 @@ impl CoreTurnHost {
                     // `Failed`. Both are terminal `Finalized` outcomes, so the permit releases either
                     // way (the registry-backstop `AgentLimitReached` requeue is a scheduler unit
                     // concern; the keystone maps a saturated-registry spawn error to `None` here).
-                    let outcome = match finalize_agent_output(final_text, schema.as_ref()) {
-                        Some(value) => AgentSpawnOutcome::Completed(value),
-                        None => AgentSpawnOutcome::Failed,
-                    };
+                    let outcome =
+                        match finalize_agent_output(spawn_outcome.final_text, schema.as_ref()) {
+                            Some(value) => AgentSpawnOutcome::Completed(value),
+                            None => AgentSpawnOutcome::Failed,
+                        };
+                    // Journal the finalized `agent()` at admission-order step 7 (§5/§7): the
+                    // authoritative run→agent `agent_call` line carrying the child's `child_thread_id`
+                    // + absolute `rollout_path` + metered `tokens_spent`, plus the ordinal/key/opts.
+                    // A completed call records `status:completed` with its return; a dead/aborted child
+                    // records `status:null`/`return:null` (still carrying whatever linkage the child
+                    // produced). Awaited so the line is durable before the promise resolves.
+                    let child_thread_id = spawn_outcome.child_thread_id.map(|id| id.to_string());
+                    let rollout_path = spawn_outcome
+                        .rollout_path
+                        .as_ref()
+                        .map(|path| path.display().to_string());
+                    match &outcome {
+                        AgentSpawnOutcome::Completed(value) => {
+                            journal
+                                .record(
+                                    Some(JournalAgentStatus::Completed),
+                                    value.clone(),
+                                    child_thread_id,
+                                    rollout_path,
+                                    // A `completed` line MUST carry `tokens_spent` (§7 validate);
+                                    // default to 0 if the child reported no usage.
+                                    Some(spawn_outcome.tokens_spent.unwrap_or(0)),
+                                )
+                                .await;
+                        }
+                        _ => {
+                            // Death-is-null: a dead/aborted child is `status:null` + `return:null`.
+                            journal
+                                .record(
+                                    None,
+                                    JsonValue::Null,
+                                    child_thread_id,
+                                    rollout_path,
+                                    spawn_outcome.tokens_spent,
+                                )
+                                .await;
+                        }
+                    }
                     // Release the reservation on finalize (success AND failure alike). The child's
                     // real usage is already recorded via `record_usage`, so dropping the estimate
                     // reconciles the reservation against actual spend.
@@ -730,6 +1031,7 @@ impl CoreTurnHost {
             Ok(outcome) => outcome,
             // Lifetime cap reached (spec §5): terminal and monotonic — surfaced as a JS throw.
             Err(AgentCapReached { .. }) => {
+                journal.record_error().await;
                 AgentSpawnOutcome::Rejected("AgentCapReached".to_string())
             }
         }
