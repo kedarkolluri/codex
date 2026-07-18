@@ -2508,6 +2508,7 @@ version = "0.0.0"
 dependencies = [
  "codex-code-mode-protocol",
  "codex-protocol",
+ "codex-workflow-journal",
  "deno_core_icudata",
  "futures",
  "pretty_assertions",
@@ -2712,6 +2713,7 @@ dependencies = [
  "codex-utils-string",
  "codex-web-search-extension",
  "codex-windows-sandbox",
+ "codex-workflow-journal",
  "core_test_support",
  "csv",
  "ctor 0.6.3",
@@ -4550,9 +4552,14 @@ dependencies = [
 name = "codex-workflow-journal"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

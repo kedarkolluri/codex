@@ -8,9 +8,22 @@
 //! conversation-shaped and every rollout consumer would have to learn to handle
 //! new variants. The journal is its own append-only file with its own envelope.
 //!
-//! This crate defines only the wire types plus their serde round-trip tests.
-//! The recorder, replay reader, and cache-key hashing live in sibling modules
-//! added by later tickets.
+//! This crate defines the wire types plus their serde round-trip tests, and the
+//! canonical `(prompt, opts)` cache key ([`mod@key`]). The recorder and replay
+//! reader live in sibling modules added by later tickets.
+
+pub mod key;
+pub mod recorder;
+pub mod replay;
+
+pub use key::KEY_ALGO_VERSION;
+pub use key::KeyInputs;
+pub use key::prompt_hash;
+pub use key::schema_hash;
+pub use recorder::JournalRecorder;
+pub use replay::Divergence;
+pub use replay::ReplayEntry;
+pub use replay::ReplayJournal;
 
 use serde::Deserialize;
 use serde::Deserializer;
@@ -18,6 +31,8 @@ use serde::Serialize;
 use serde::Serializer;
 use serde::de::IgnoredAny;
 use serde_json::Value;
+
+pub mod storage;
 
 /// Zero-sized marker for the `ordinal` field on `phase`/`log` lines, which §7
 /// requires to be **always `null`** (only `agent_call` lines carry a numeric
