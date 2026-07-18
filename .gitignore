@@ -31,7 +31,9 @@ result
 
 # cli tools
 CLAUDE.md
-.claude/
+.claude/*
+!.claude/workflows/
+!.claude/workflows/**
 AGENTS.override.md
 
 # caches
