@@ -2748,6 +2748,49 @@ fn multi_agent_v2_toml_config(features: Option<&FeaturesToml>) -> Option<&MultiA
     }
 }
 
+/// `Feature::Workflow` transitively requires `Feature::CodeMode` and
+/// `Feature::MultiAgentV2` (§13 R6). `Features::normalize_dependencies` silently
+/// auto-enables those dependencies when they are unset, but if a workflow user
+/// has *explicitly* disabled one of them we must surface a hard error rather than
+/// silently overriding their choice. This inspects the raw config toml (before
+/// normalization collapses the "unset" vs "explicitly false" distinction) and
+/// fails with an actionable message naming the offending dependency.
+fn validate_workflow_feature_dependencies(
+    features: Option<&FeaturesToml>,
+    workflow_enabled: bool,
+) -> std::io::Result<()> {
+    if !workflow_enabled {
+        return Ok(());
+    }
+
+    let code_mode_disabled = features
+        .and_then(|f| f.code_mode.as_ref())
+        .and_then(FeatureToml::enabled)
+        == Some(false);
+    let multi_agent_v2_disabled = features
+        .and_then(|f| f.multi_agent_v2.as_ref())
+        .and_then(FeatureToml::enabled)
+        == Some(false);
+
+    let dependencies = [
+        ("code_mode", code_mode_disabled),
+        ("multi_agent_v2", multi_agent_v2_disabled),
+    ];
+
+    for (dependency_key, is_disabled) in dependencies {
+        if is_disabled {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "`features.workflow` requires `features.{dependency_key}`, but `features.{dependency_key}` is explicitly disabled. Remove the `enabled = false` override for `features.{dependency_key}` (or set it to `true`) to enable workflows."
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn token_budget_toml_config(features: Option<&FeaturesToml>) -> Option<&TokenBudgetConfigToml> {
     match features?.token_budget.as_ref()? {
         FeatureToml::Enabled(_) => None,
@@ -3069,6 +3112,10 @@ impl Config {
             configured_features,
             feature_requirements,
             &mut startup_warnings,
+        )?;
+        validate_workflow_feature_dependencies(
+            cfg.features.as_ref(),
+            features.enabled(Feature::Workflow),
         )?;
         let respect_system_proxy = features.enabled(Feature::RespectSystemProxy);
         let enable_network_proxy = features.enabled(Feature::NetworkProxy);
@@ -4357,3 +4404,7 @@ mod tests;
 #[cfg(test)]
 #[path = "config_loader_tests.rs"]
 mod config_loader_tests;
+
+#[cfg(test)]
+#[path = "workflow_dependency_tests.rs"]
+mod workflow_dependency_tests;

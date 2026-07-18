@@ -124,6 +124,27 @@ fn code_mode_only_requires_code_mode() {
 }
 
 #[test]
+fn workflow_requires_code_mode_and_multi_agent_v2() {
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Workflow);
+    features.normalize_dependencies();
+
+    assert_eq!(features.enabled(Feature::Workflow), true);
+    assert_eq!(features.enabled(Feature::CodeMode), true);
+    assert_eq!(features.enabled(Feature::MultiAgentV2), true);
+}
+
+#[test]
+fn workflow_off_does_not_enable_dependencies() {
+    let mut features = Features::with_defaults();
+    features.normalize_dependencies();
+
+    assert_eq!(features.enabled(Feature::Workflow), false);
+    assert_eq!(features.enabled(Feature::CodeMode), false);
+    assert_eq!(features.enabled(Feature::MultiAgentV2), false);
+}
+
+#[test]
 fn code_mode_host_is_stable_and_enabled_by_default() {
     assert_eq!(Feature::CodeModeHost.stage(), Stage::Stable);
     assert_eq!(Feature::CodeModeHost.default_enabled(), true);

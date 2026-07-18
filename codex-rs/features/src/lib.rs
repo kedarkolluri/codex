@@ -559,6 +559,19 @@ impl Features {
         if self.enabled(Feature::CodeModeOnly) && !self.enabled(Feature::CodeMode) {
             self.enable(Feature::CodeMode);
         }
+        // A workflow bridges the code-mode isolate and the multi-agent runtime, so
+        // `Feature::Workflow` transitively requires both `Feature::CodeMode` and
+        // `Feature::MultiAgentV2` (§13 R6). Silently auto-enable the dependencies when
+        // they are unset. Explicitly-disabled dependencies are caught as a hard error in
+        // config resolution (see `validate_workflow_feature_dependencies`).
+        if self.enabled(Feature::Workflow) {
+            if !self.enabled(Feature::CodeMode) {
+                self.enable(Feature::CodeMode);
+            }
+            if !self.enabled(Feature::MultiAgentV2) {
+                self.enable(Feature::MultiAgentV2);
+            }
+        }
     }
 }
 
