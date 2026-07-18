@@ -22,6 +22,10 @@ use codex_protocol::protocol::TurnEnvironmentSelections;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
+/// Buffered capacity of [`Session::event_observers`]. Generous so a briefly-slow observer lags
+/// (RecvError::Lagged, which callers treat as "re-scan") rather than silently missing events.
+const EVENT_OBSERVER_CHANNEL_CAPACITY: usize = 1024;
+
 /// Context for an initialized model agent
 ///
 /// A session has at most 1 running task at a time, and can be interrupted by user input.
@@ -29,6 +33,15 @@ pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
+    /// Lag-tolerant fan-out tap of every event delivered on this session.
+    ///
+    /// This is deliberately **non-competing** with `tx_event`: `tx_event` is an
+    /// `async_channel` (MPMC work-stealing) whose sole consumer is the app-server listener,
+    /// so a supervisor that needs to observe a session's events (e.g. a subagent
+    /// spawn-and-await helper waiting for `TurnComplete`) cannot use `next_event()` without
+    /// stealing recv()s from that listener. Instead it subscribes here and receives a *clone*
+    /// of each delivered event. See [`Session::subscribe_events`].
+    pub(super) event_observers: broadcast::Sender<Event>,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
@@ -1140,10 +1153,15 @@ impl Session {
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
             };
+            // Non-competing observer tap; see `Session::event_observers`. Capacity is generous so
+            // a briefly-slow subscriber lags (and re-scans for terminal events) rather than losing
+            // the terminal event outright.
+            let (event_observers, _) = broadcast::channel(EVENT_OBSERVER_CHANNEL_CAPACITY);
             let sess = Arc::new(Session {
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),
+                event_observers,
                 agent_status,
                 state: Mutex::new(state),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),

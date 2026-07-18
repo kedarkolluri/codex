@@ -716,6 +716,9 @@
             "web_search_request": {
               "type": "boolean"
             },
+            "workflow": {
+              "$ref": "#/definitions/FeatureToml_for_WorkflowConfigToml"
+            },
             "workspace_dependencies": {
               "type": "boolean"
             },
@@ -1000,6 +1003,16 @@
         },
         {
           "$ref": "#/definitions/TokenBudgetConfigToml"
+        }
+      ]
+    },
+    "FeatureToml_for_WorkflowConfigToml": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "$ref": "#/definitions/WorkflowConfigToml"
         }
       ]
     },
@@ -4600,6 +4613,15 @@
         }
       ]
     },
+    "WorkflowConfigToml": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
     "WorkspaceRootsToml": {
       "type": "object"
     }
@@ -5087,6 +5109,9 @@
         },
         "web_search_request": {
           "type": "boolean"
+        },
+        "workflow": {
+          "$ref": "#/definitions/FeatureToml_for_WorkflowConfigToml"
         },
         "workspace_dependencies": {
           "type": "boolean"

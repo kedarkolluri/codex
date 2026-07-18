@@ -4272,6 +4272,26 @@
           "properties": {
             "method": {
               "enum": [
+                "workflows/changed"
+              ],
+              "title": "Workflows/changedNotificationMethod",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/definitions/WorkflowsChangedNotification"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "title": "Workflows/changedNotification",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "enum": [
                 "thread/name/updated"
               ],
               "title": "Thread/name/updatedNotificationMethod",
@@ -5872,6 +5892,12 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "WorkflowsChangedNotification": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Notification emitted when watched saved-workflow files change.\n\nTreat this as an invalidation signal and re-discover saved workflows when refreshed workflow metadata is needed. Mirrors [`v2::SkillsChangedNotification`].",
+      "title": "WorkflowsChangedNotification",
       "type": "object"
     },
     "v2": {

@@ -28,6 +28,7 @@ pub use feature_configs::NetworkProxyUnixSocketPermissionToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
 pub use feature_configs::RolloutBudgetConfigToml;
 pub use feature_configs::TokenBudgetConfigToml;
+pub use feature_configs::WorkflowConfigToml;
 use legacy::LegacyFeatureToggles;
 pub use legacy::legacy_feature_keys;
 
@@ -148,6 +149,9 @@ pub enum Feature {
     Collab,
     /// Enable task-path-based multi-agent routing.
     MultiAgentV2,
+    /// Enable dynamic workflows (JS-authored orchestrations bridging code-mode
+    /// and the multi-agent runtime).
+    Workflow,
     /// Removed compatibility flag retained as a no-op.
     MultiAgentMode,
     /// Enable CSV-backed agent job tools.
@@ -555,6 +559,19 @@ impl Features {
         if self.enabled(Feature::CodeModeOnly) && !self.enabled(Feature::CodeMode) {
             self.enable(Feature::CodeMode);
         }
+        // A workflow bridges the code-mode isolate and the multi-agent runtime, so
+        // `Feature::Workflow` transitively requires both `Feature::CodeMode` and
+        // `Feature::MultiAgentV2` (§13 R6). Silently auto-enable the dependencies when
+        // they are unset. Explicitly-disabled dependencies are caught as a hard error in
+        // config resolution (see `validate_workflow_feature_dependencies`).
+        if self.enabled(Feature::Workflow) {
+            if !self.enabled(Feature::CodeMode) {
+                self.enable(Feature::CodeMode);
+            }
+            if !self.enabled(Feature::MultiAgentV2) {
+                self.enable(Feature::MultiAgentV2);
+            }
+        }
     }
 }
 
@@ -642,6 +659,8 @@ pub struct FeaturesToml {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multi_agent_v2: Option<FeatureToml<MultiAgentV2ConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<FeatureToml<WorkflowConfigToml>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_budget: Option<FeatureToml<TokenBudgetConfigToml>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout_budget: Option<FeatureToml<RolloutBudgetConfigToml>>,
@@ -679,6 +698,9 @@ impl FeaturesToml {
         if let Some(enabled) = self.multi_agent_v2.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::MultiAgentV2.key().to_string(), enabled);
         }
+        if let Some(enabled) = self.workflow.as_ref().and_then(FeatureToml::enabled) {
+            entries.insert(Feature::Workflow.key().to_string(), enabled);
+        }
         if let Some(enabled) = self.token_budget.as_ref().and_then(FeatureToml::enabled) {
             entries.insert(Feature::TokenBudget.key().to_string(), enabled);
         }
@@ -703,6 +725,7 @@ impl FeaturesToml {
         let Self {
             code_mode,
             multi_agent_v2,
+            workflow,
             token_budget,
             rollout_budget,
             current_time_reminder,
@@ -719,6 +742,8 @@ impl FeaturesToml {
                 materialize_resolved_feature_enabled(code_mode, enabled);
             } else if spec.id == Feature::MultiAgentV2 {
                 materialize_resolved_feature_enabled(multi_agent_v2, enabled);
+            } else if spec.id == Feature::Workflow {
+                materialize_resolved_feature_enabled(workflow, enabled);
             } else if spec.id == Feature::TokenBudget {
                 materialize_resolved_feature_enabled(token_budget, enabled);
             } else if spec.id == Feature::RolloutBudget {
@@ -1038,6 +1063,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::MultiAgentV2,
         key: "multi_agent_v2",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::Workflow,
+        key: "workflow",
+        stage: Stage::Experimental {
+            name: "Dynamic workflows",
+            menu_description: "Run JS-authored dynamic workflows that orchestrate code mode and multi-agent runs.",
+            announcement: "",
+        },
         default_enabled: false,
     },
     FeatureSpec {

@@ -1,7 +1,10 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnOutcome;
 use futures::FutureExt;
+use serde_json::Value as JsonValue;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -68,6 +71,143 @@ pub(super) fn spawn_tool<H: CellHost>(
                     Some(failure_reason),
                 )
             }
+        };
+        let _ = runtime_tx.send(command);
+        if let Some(failure_reason) = failure_reason {
+            report_task_failure(task_failure_handler.as_ref(), failure_reason);
+        }
+    });
+}
+
+/// Route a workflow `agent(prompt, opts?)` spawn request to the host and settle the isolate promise
+/// by id, mirroring [`spawn_tool`].
+///
+/// Each `agent()` call gets its own independent task in `tasks` (the shared tool JoinSet), so N
+/// concurrent `agent()` calls resolve independently and out-of-order — nothing here serializes them.
+/// The host's [`CellHost::spawn_agent`] returns an [`AgentSpawnOutcome`], which maps to one of two
+/// runtime commands, exactly reusing the tool-callback resolve/reject paths:
+/// - `Completed(value)` -> [`RuntimeCommand::ToolResponse`] carrying the host-marshaled JSON (a
+///   string when schemaless, or the validated `opts.schema` object), forwarded verbatim to
+///   `json_to_v8`.
+/// - `Failed` (death-is-null: a dead/aborted agent, or a schema parse/validation failure resolved
+///   host-side, or a panicked host task) -> [`RuntimeCommand::ToolResponse`] with JS `null`.
+/// - `Rejected(message)` -> [`RuntimeCommand::ToolError`], the same path a failed nested tool takes,
+///   so the isolate *rejects* (throws) the `agent()` promise with `message` (e.g. the 1001st
+///   `agent()`/over-budget call surfacing `AgentCapReached`/`BudgetExceeded`).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_agent<H: CellHost>(
+    tasks: &mut JoinSet<()>,
+    host: Arc<H>,
+    id: String,
+    prompt: String,
+    ordinal: u64,
+    opts: AgentCallOpts,
+    runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
+    cancellation_token: CancellationToken,
+    task_failure_handler: Option<TaskFailureHandler>,
+) {
+    tasks.spawn(async move {
+        let outcome = AssertUnwindSafe(async move {
+            host.spawn_agent(prompt, ordinal, opts, cancellation_token)
+                .await
+        })
+        .catch_unwind()
+        .await;
+        let (command, failure_reason) = match outcome {
+            Ok(AgentSpawnOutcome::Completed(value)) => {
+                (RuntimeCommand::ToolResponse { id, result: value }, None)
+            }
+            // Death-is-null: a failed/aborted agent resolves the promise to JS `null`, never throws.
+            Ok(AgentSpawnOutcome::Failed) => (
+                RuntimeCommand::ToolResponse {
+                    id,
+                    result: JsonValue::Null,
+                },
+                None,
+            ),
+            // Admission-time cap/budget rejection: reject (throw) the promise via the tool-error
+            // path so the isolate surfaces `message` instead of resolving `null`.
+            Ok(AgentSpawnOutcome::Rejected(message)) => (
+                RuntimeCommand::ToolError {
+                    id,
+                    error_text: message,
+                },
+                None,
+            ),
+            // A panicked host spawn task is a host failure, not an agent failure; keep the
+            // never-throws contract by still resolving the promise to `null`, but surface the panic.
+            Err(_) => (
+                RuntimeCommand::ToolResponse {
+                    id,
+                    result: JsonValue::Null,
+                },
+                Some("code mode agent spawn task panicked".to_string()),
+            ),
+        };
+        let _ = runtime_tx.send(command);
+        if let Some(failure_reason) = failure_reason {
+            report_task_failure(task_failure_handler.as_ref(), failure_reason);
+        }
+    });
+}
+
+/// Route a workflow `workflow(nameOrRef, args)` nested-run request to the host and settle the
+/// isolate promise by id, mirroring [`spawn_agent`].
+///
+/// Each `workflow()` call gets its own independent task in `tasks` (the shared tool JoinSet). The
+/// host's [`CellHost::spawn_workflow`] returns an [`AgentSpawnOutcome`], mapped to the same
+/// resolve/reject runtime commands the tool and `agent()` callbacks use:
+/// - `Completed(value)` -> [`RuntimeCommand::ToolResponse`] carrying the nested run's top-level
+///   result, forwarded verbatim to `json_to_v8`.
+/// - `Failed` -> [`RuntimeCommand::ToolResponse`] with JS `null` (a nested run that produced no
+///   result).
+/// - `Rejected(message)` -> [`RuntimeCommand::ToolError`], so the isolate *rejects* (throws) the
+///   `workflow()` promise (e.g. a name that does not resolve in the registry, or a nested error).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_workflow<H: CellHost>(
+    tasks: &mut JoinSet<()>,
+    host: Arc<H>,
+    id: String,
+    name: String,
+    args: Option<JsonValue>,
+    runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
+    cancellation_token: CancellationToken,
+    task_failure_handler: Option<TaskFailureHandler>,
+) {
+    tasks.spawn(async move {
+        let outcome =
+            AssertUnwindSafe(
+                async move { host.spawn_workflow(name, args, cancellation_token).await },
+            )
+            .catch_unwind()
+            .await;
+        let (command, failure_reason) = match outcome {
+            Ok(AgentSpawnOutcome::Completed(value)) => {
+                (RuntimeCommand::ToolResponse { id, result: value }, None)
+            }
+            Ok(AgentSpawnOutcome::Failed) => (
+                RuntimeCommand::ToolResponse {
+                    id,
+                    result: JsonValue::Null,
+                },
+                None,
+            ),
+            Ok(AgentSpawnOutcome::Rejected(message)) => (
+                RuntimeCommand::ToolError {
+                    id,
+                    error_text: message,
+                },
+                None,
+            ),
+            // A panicked host task keeps the isolate from hanging: resolve the promise to `null` and
+            // surface the panic to the task-failure handler.
+            Err(_) => (
+                RuntimeCommand::ToolResponse {
+                    id,
+                    result: JsonValue::Null,
+                },
+                Some("code mode workflow spawn task panicked".to_string()),
+            ),
         };
         let _ = runtime_tx.send(command);
         if let Some(failure_reason) = failure_reason {

@@ -2,6 +2,11 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+use std::sync::Arc;
+
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnOutcome;
+use codex_code_mode_protocol::WorkflowBudgetHandle;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -79,6 +84,17 @@ pub(crate) struct CreateCellRequest {
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: Vec<ToolDefinition>,
     pub(crate) source: String,
+    /// Explicit workflow invocation mode threaded from the workflow handler
+    /// through the protocol `ExecuteRequest`. Gates the workflow-only narrator
+    /// globals; see [`codex_code_mode_protocol::ExecuteRequest::workflow`].
+    pub(crate) workflow: bool,
+    /// Invocation JSON threaded from the workflow handler; installed read-only as
+    /// the `args` global for workflow runs. See
+    /// [`codex_code_mode_protocol::ExecuteRequest::args`].
+    pub(crate) args: Option<JsonValue>,
+    /// Host-minted uuid v7 run identifier; exposed read-only as `workflow.runId`.
+    /// See [`codex_code_mode_protocol::ExecuteRequest::run_id`].
+    pub(crate) run_id: Option<String>,
 }
 
 /// Tool metadata exposed to code running inside a cell.
@@ -130,6 +146,79 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         text: String,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Spawn a workflow subagent for an `agent(prompt, opts?)` call, resolving to an
+    /// [`AgentSpawnOutcome`]: `Completed` (a JSON string when schemaless, or the validated
+    /// `opts.schema` object), `Failed` (JS `null`), or `Rejected` (throw). The default resolves to
+    /// `Failed` so delegates that do not support workflow spawning need no changes.
+    fn spawn_agent(
+        &self,
+        cell_id: CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
+
+    /// Run a saved workflow inline for a `workflow(nameOrRef, args)` call, resolving to an
+    /// [`AgentSpawnOutcome`] (`Completed` with the nested run's result, `Failed` -> JS `null`, or
+    /// `Rejected` -> throw). The default resolves to `Failed` so delegates without nested-workflow
+    /// support need no changes.
+    fn spawn_workflow(
+        &self,
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (cell_id, name, args, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
+
+    /// The live shared token-budget handle backing the workflow `budget` global, or `None` when this
+    /// delegate runs no budgeted workflow. The default returns `None` so delegates without a budget
+    /// need no changes.
+    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
+        None
+    }
+
+    /// Prior-run journal `agent_call` lines seeding prefix-replay for a resumed run
+    /// (spec §7 "Resume algorithm", `P3-resume-entry`). The default returns an empty
+    /// vec so a fresh (non-resume) run seeds no replay state. See
+    /// [`codex_code_mode_protocol::CodeModeSessionDelegate::replay_entries`].
+    fn replay_entries(&self, cell_id: CellId) -> Vec<codex_workflow_journal::AgentCallLine> {
+        let _ = cell_id;
+        Vec::new()
+    }
+
+    /// Journal a workflow `phase(title)` marker for `cell_id` (§7 `phase` line). The default is a
+    /// no-op so delegates that do not journal need no changes.
+    fn journal_phase(&self, cell_id: CellId, title: String) -> impl Future<Output = ()> + Send {
+        let _ = (cell_id, title);
+        async {}
+    }
+
+    /// Journal a workflow `log(message)` marker for `cell_id` (§7 `log` line). The default is a
+    /// no-op so delegates that do not journal need no changes.
+    fn journal_log(&self, cell_id: CellId, message: String) -> impl Future<Output = ()> + Send {
+        let _ = (cell_id, message);
+        async {}
+    }
+
+    /// Handle a prefix-replay cache hit for `cell_id` (§7 resume step 3): re-append `entry` to the
+    /// run's journal and re-add its `tokens_spent` to the shared budget, WITHOUT spawning. The
+    /// default is a no-op so delegates that neither journal nor meter need no changes.
+    fn replay_agent(
+        &self,
+        cell_id: CellId,
+        entry: codex_workflow_journal::AgentCallLine,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (cell_id, entry);
+        async {}
+    }
 
     fn cell_closed(&self, cell_id: &CellId);
 }

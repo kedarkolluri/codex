@@ -88,6 +88,9 @@ async fn provider_falls_back_to_in_process_session_when_host_is_missing() {
             source: "text('fallback')".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            workflow: false,
+            args: None,
+            run_id: None,
         })
         .await
         .expect("execute fallback session")
@@ -119,6 +122,9 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
             source: "text('unreachable')".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            workflow: false,
+            args: None,
+            run_id: None,
         })
         .await
         .err()

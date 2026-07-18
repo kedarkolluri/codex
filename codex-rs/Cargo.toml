@@ -40,6 +40,7 @@ members = [
     "core-api",
     "core-plugins",
     "core-skills",
+    "core-workflows",
     "hooks",
     "http-client",
     "secrets",
@@ -90,6 +91,7 @@ members = [
     "tools",
     "v8-poc",
     "websocket-client",
+    "workflow-journal",
     "utils/absolute-path",
     "utils/path-uri",
     "utils/cargo-bin",
@@ -176,6 +178,7 @@ codex-core = { path = "core" }
 codex-core-api = { path = "core-api" }
 codex-core-plugins = { path = "core-plugins" }
 codex-core-skills = { path = "core-skills" }
+codex-core-workflows = { path = "core-workflows" }
 codex-exec = { path = "exec" }
 codex-file-system = { path = "file-system" }
 codex-exec-server-protocol = { path = "exec-server-protocol" }
@@ -261,6 +264,7 @@ codex-utils-string = { path = "utils/string" }
 codex-utils-template = { path = "utils/template" }
 codex-v8-poc = { path = "v8-poc" }
 codex-windows-sandbox = { path = "windows-sandbox-rs" }
+codex-workflow-journal = { path = "workflow-journal" }
 core_test_support = { path = "core/tests/common" }
 mcp_test_support = { path = "mcp-server/tests/common" }
 
@@ -334,6 +338,7 @@ insta = "1.46.3"
 inventory = "0.3.19"
 itertools = "0.14.0"
 jsonptr = { version = "0.7.1", default-features = false }
+jsonschema = { version = "0.48.1", default-features = false }
 jsonwebtoken = "9.3.1"
 keyring = { version = "3.6", default-features = false }
 landlock = "0.4.4"

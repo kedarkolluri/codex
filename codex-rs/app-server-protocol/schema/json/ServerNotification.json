@@ -5735,6 +5735,10 @@
         "samplePaths"
       ],
       "type": "object"
+    },
+    "WorkflowsChangedNotification": {
+      "description": "Notification emitted when watched saved-workflow files change.\n\nTreat this as an invalidation signal and re-discover saved workflows when refreshed workflow metadata is needed. Mirrors [`v2::SkillsChangedNotification`].",
+      "type": "object"
     }
   },
   "description": "Notification sent from the server to the client.",
@@ -5898,6 +5902,26 @@
         "params"
       ],
       "title": "Skills/changedNotification",
+      "type": "object"
+    },
+    {
+      "properties": {
+        "method": {
+          "enum": [
+            "workflows/changed"
+          ],
+          "title": "Workflows/changedNotificationMethod",
+          "type": "string"
+        },
+        "params": {
+          "$ref": "#/definitions/WorkflowsChangedNotification"
+        }
+      },
+      "required": [
+        "method",
+        "params"
+      ],
+      "title": "Workflows/changedNotification",
       "type": "object"
     },
     {

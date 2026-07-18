@@ -60,6 +60,32 @@ fn thread_spawn_depth_increments_and_enforces_limit() {
     ));
 }
 
+/// `P2-test-workflow-nesting-uat10` registry depth-guard gate: the one-level
+/// `workflow()` nesting policy is exactly the thread-spawn depth gate mapped onto
+/// `agent_max_depth = 1`. A depth-0 (top-level, model-callable) run's child nests
+/// to depth 1 and is admitted; a depth-1 (already-nested) run's child nests to
+/// depth 2 and is rejected — proving deeper `workflow()` nesting is refused at the
+/// shared `next_spawn_depth` / `exceeds_thread_spawn_depth_limit` primitives the
+/// host guard (`admit_nested_workflow_depth`) is built on.
+#[test]
+fn workflow_one_level_nesting_admits_depth_one_rejects_depth_two() {
+    // The one-level policy maps directly onto agent_max_depth = 1.
+    let agent_max_depth = 1;
+
+    // Depth-0 parent → child at depth 1: admitted (first nesting level).
+    let depth_one = next_spawn_depth(/*parent_depth*/ 0);
+    assert_eq!(depth_one, 1);
+    assert!(!exceeds_thread_spawn_depth_limit(
+        depth_one,
+        agent_max_depth
+    ));
+
+    // Depth-1 parent → child at depth 2: rejected (second nesting level).
+    let depth_two = next_spawn_depth(/*parent_depth*/ 1);
+    assert_eq!(depth_two, 2);
+    assert!(exceeds_thread_spawn_depth_limit(depth_two, agent_max_depth));
+}
+
 #[test]
 fn non_thread_spawn_subagents_default_to_depth_zero() {
     let session_source = SessionSource::SubAgent(SubAgentSource::Review);

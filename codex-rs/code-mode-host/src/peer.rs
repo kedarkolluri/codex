@@ -143,7 +143,9 @@ impl HostPeer {
         let mut pending = PendingDelegateRequest::new(Arc::clone(self), id);
         let cell_id = match &request {
             DelegateRequest::InvokeTool { invocation } => invocation.cell_id.clone().into(),
-            DelegateRequest::Notify { cell_id, .. } => cell_id.clone().into(),
+            DelegateRequest::Notify { cell_id, .. }
+            | DelegateRequest::SpawnAgent { cell_id, .. }
+            | DelegateRequest::SpawnWorkflow { cell_id, .. } => cell_id.clone().into(),
         };
         let (dispatched_tx, dispatched_rx) = oneshot::channel();
         if let Err(err) = self.route_cell_message(

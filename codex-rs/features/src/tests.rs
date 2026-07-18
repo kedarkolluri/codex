@@ -124,6 +124,27 @@ fn code_mode_only_requires_code_mode() {
 }
 
 #[test]
+fn workflow_requires_code_mode_and_multi_agent_v2() {
+    let mut features = Features::with_defaults();
+    features.enable(Feature::Workflow);
+    features.normalize_dependencies();
+
+    assert_eq!(features.enabled(Feature::Workflow), true);
+    assert_eq!(features.enabled(Feature::CodeMode), true);
+    assert_eq!(features.enabled(Feature::MultiAgentV2), true);
+}
+
+#[test]
+fn workflow_off_does_not_enable_dependencies() {
+    let mut features = Features::with_defaults();
+    features.normalize_dependencies();
+
+    assert_eq!(features.enabled(Feature::Workflow), false);
+    assert_eq!(features.enabled(Feature::CodeMode), false);
+    assert_eq!(features.enabled(Feature::MultiAgentV2), false);
+}
+
+#[test]
 fn code_mode_host_is_stable_and_enabled_by_default() {
     assert_eq!(Feature::CodeModeHost.stage(), Stage::Stable);
     assert_eq!(Feature::CodeModeHost.default_enabled(), true);
@@ -206,6 +227,89 @@ fn network_proxy_is_experimental_and_disabled_by_default() {
         Stage::Experimental { .. }
     ));
     assert_eq!(Feature::NetworkProxy.default_enabled(), false);
+}
+
+#[test]
+fn workflow_is_experimental_and_disabled_by_default() {
+    assert_eq!(feature_for_key("workflow"), Some(Feature::Workflow));
+    assert!(matches!(
+        Feature::Workflow.stage(),
+        Stage::Experimental { .. }
+    ));
+    assert_eq!(Feature::Workflow.default_enabled(), false);
+}
+
+#[test]
+fn workflow_is_off_by_default_and_can_be_enabled() {
+    let features = Features::with_defaults();
+    assert_eq!(features.enabled(Feature::Workflow), false);
+
+    let mut features = features;
+    features.enable(Feature::Workflow);
+    assert_eq!(features.enabled(Feature::Workflow), true);
+}
+
+#[test]
+fn workflow_feature_config_deserializes_boolean_toggle() {
+    let features: FeaturesToml = toml::from_str(
+        r#"
+workflow = true
+"#,
+    )
+    .expect("features table should deserialize");
+
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("workflow".to_string(), true)])
+    );
+    assert_eq!(features.workflow, Some(FeatureToml::Enabled(true)));
+}
+
+#[test]
+fn workflow_feature_config_deserializes_table_and_flips_flag() {
+    let features: FeaturesToml = toml::from_str(
+        r#"
+[workflow]
+enabled = true
+"#,
+    )
+    .expect("features table should deserialize");
+
+    assert_eq!(
+        features.entries(),
+        BTreeMap::from([("workflow".to_string(), true)])
+    );
+    assert_eq!(
+        features.workflow,
+        Some(FeatureToml::Config(crate::WorkflowConfigToml {
+            enabled: Some(true),
+        }))
+    );
+
+    let resolved = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&features),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    assert_eq!(resolved.enabled(Feature::Workflow), true);
+}
+
+#[test]
+fn workflow_feature_config_rejects_unknown_fields() {
+    // `deny_unknown_fields` on `WorkflowConfigToml` makes the table variant fail;
+    // because `FeatureToml` is untagged, the surfaced error is the enum mismatch
+    // rather than the specific field, but the block is still rejected.
+    toml::from_str::<FeaturesToml>(
+        r#"
+[workflow]
+enabled = true
+bogus_field = "nope"
+"#,
+    )
+    .expect_err("unknown fields under [workflow] should be rejected");
 }
 
 #[test]

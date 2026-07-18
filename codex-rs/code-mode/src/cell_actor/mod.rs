@@ -15,8 +15,10 @@ use tokio_util::sync::CancellationToken;
 use self::callbacks::CallbackCompletion;
 use self::callbacks::finish_callbacks;
 use self::callbacks::report_task_result;
+use self::callbacks::spawn_agent;
 use self::callbacks::spawn_notification;
 use self::callbacks::spawn_tool;
+use self::callbacks::spawn_workflow;
 use self::conversions::cell_tool_kind;
 use self::conversions::output_item;
 use self::conversions::runtime_request;
@@ -35,7 +37,7 @@ use crate::runtime::PendingRuntimeMode;
 use crate::runtime::RuntimeCommand;
 use crate::runtime::RuntimeControlCommand;
 use crate::runtime::RuntimeEvent;
-use crate::runtime::spawn_runtime;
+use crate::runtime::spawn_runtime_with_budget;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::ObserveMode;
@@ -63,12 +65,32 @@ impl CellActor {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
-        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
+        // Thread the host's live budget handle (SEAM #1) into the isolate so a real
+        // workflow cell forwards `budget.spent()` / `budget.remaining()` to the shared
+        // `RolloutBudget` instead of the static `budget: None` defaults. Non-workflow
+        // hosts (and the process-owned host, which cannot forward an `Arc` over IPC)
+        // return `None` and are unaffected.
+        let budget = host.budget_handle();
+        // Prefix-replay seed (SEAM, `P3-resume-entry`, spec §7 steps 1-3). The resume
+        // entrypoint stashes the prior run's loaded journal `agent_call` lines on the
+        // host; the host hands them to the FIRST cell it spawns (the top-level resumed
+        // run) and returns empty for every later nested `workflow()` cell. An empty vec
+        // maps to `None` so a fresh run installs `ReplayState::fresh` and dispatches
+        // every `agent()` live, exactly as before.
+        let replay_entries = host.replay_entries();
+        let replay_entries = if replay_entries.is_empty() {
+            None
+        } else {
+            Some(replay_entries)
+        };
+        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime_with_budget(
             stored_values,
             runtime_request(request),
             event_tx,
             PendingRuntimeMode::PauseUntilResumed,
             task_failure_handler.clone(),
+            budget,
+            replay_entries,
         )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
         let task = run_cell(
@@ -385,6 +407,85 @@ async fn run_cell<H: CellHost>(
                                 &mut content_items,
                             );
                         }
+                    }
+                    // Workflow narrator events. The protocol `Workflow*` event
+                    // cluster + app-server mapping are a later ticket, but the
+                    // markers are journaled now (§7 `phase`/`log` lines) so the
+                    // run tree reconstructs from `journal.jsonl` on resume. The
+                    // host routes these to the run's recorder (a no-op for a
+                    // non-journaled cell). Awaited inline so the line is durable
+                    // and ordered relative to the surrounding agent-call lines.
+                    RuntimeEvent::Phase { title } => {
+                        host.journal_phase(title).await;
+                    }
+                    RuntimeEvent::WorkflowLog { message } => {
+                        host.journal_log(message).await;
+                    }
+                    // Workflow `agent()` spawn requests. Mirrors the `ToolCall`
+                    // path: spawn one independent task into the shared tool
+                    // JoinSet that routes the call through the host to the spawn
+                    // helper and settles the isolate promise by id via the same
+                    // resolve/reject commands a nested tool uses. The host's
+                    // `AgentSpawnOutcome` maps to `ToolResponse` (`Completed` -> JS
+                    // value, `Failed` -> JS null; `agent()` never throws for agent
+                    // failure) or `ToolError` (`Rejected` -> the isolate throws the
+                    // cap/budget message). The tasks do not touch the consume loop's
+                    // state, so N concurrent `agent()` calls resolve independently
+                    // and out-of-order.
+                    RuntimeEvent::AgentCall {
+                        id,
+                        ordinal,
+                        prompt,
+                        opts,
+                    } => {
+                        spawn_agent(
+                            &mut tool_tasks,
+                            Arc::clone(&host),
+                            id,
+                            prompt,
+                            ordinal,
+                            opts,
+                            runtime_tx.clone(),
+                            callback_cancellation_token.child_token(),
+                            task_failure_handler.clone(),
+                        );
+                    }
+                    // Prefix-replay cache hit (§7 resume step 3): the isolate
+                    // matched this ordinal's recomputed key against the journaled
+                    // entry, so NO subagent is spawned. Route the entry to the host
+                    // inline (awaited before the next event is drained) so its
+                    // `tokens_spent` is re-added to the shared budget and it is
+                    // re-appended to the NEW run's journal BEFORE any later
+                    // divergent live `agent()` runs its pre-admission budget check —
+                    // that is what makes the ceiling throw land at the identical
+                    // ordinal as the original run. Then settle the isolate promise
+                    // by id via the SAME `ToolResponse` resolve path a live agent
+                    // uses, reusing `module_loader::resolve_tool_response`.
+                    RuntimeEvent::AgentReplay { id, entry } => {
+                        let result = entry.ret.clone();
+                        host.replay_agent(*entry).await;
+                        let _ = runtime_tx.send(RuntimeCommand::ToolResponse { id, result });
+                    }
+                    // Workflow `workflow(nameOrRef, args)` nested-run requests.
+                    // Mirrors the `AgentCall` path: spawn one independent task that
+                    // routes the call through the host, which resolves the named
+                    // saved workflow from the registry, re-enters the runtime one
+                    // level deep, and settles the isolate promise by id via the
+                    // same resolve/reject commands a nested tool uses. The host's
+                    // `AgentSpawnOutcome` maps to `ToolResponse` (`Completed` -> the
+                    // nested run's result, `Failed` -> JS null) or `ToolError`
+                    // (`Rejected` -> the isolate throws, e.g. an unresolved name).
+                    RuntimeEvent::WorkflowCall { id, name, args } => {
+                        spawn_workflow(
+                            &mut tool_tasks,
+                            Arc::clone(&host),
+                            id,
+                            name,
+                            args,
+                            runtime_tx.clone(),
+                            callback_cancellation_token.child_token(),
+                            task_failure_handler.clone(),
+                        );
                     }
                     RuntimeEvent::Notify { call_id, text } => {
                         spawn_notification(

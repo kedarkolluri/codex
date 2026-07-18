@@ -2,7 +2,9 @@ use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::tools::code_mode::CodeModeWorkflowHandler;
 use crate::tools::code_mode::execute_spec::create_code_mode_tool;
+use crate::tools::code_mode::workflow_spec::create_workflow_tool;
 use crate::tools::context::ToolInvocation;
 use crate::tools::effective_tool_mode;
 use crate::tools::handlers::ApplyPatchHandler;
@@ -497,7 +499,7 @@ fn build_code_mode_executors(
     let deferred_tools =
         collect_code_mode_exec_prompt_tool_definitions(deferred_exec_prompt_tool_specs.iter());
 
-    vec![
+    let mut executors: Vec<Arc<dyn CoreToolRuntime>> = vec![
         Arc::new(CodeModeExecuteHandler::new(
             create_code_mode_tool(
                 &enabled_tools,
@@ -505,10 +507,21 @@ fn build_code_mode_executors(
                 &namespace_descriptions,
                 tool_mode == ToolMode::CodeModeOnly,
             ),
-            code_mode_nested_tool_specs,
+            code_mode_nested_tool_specs.clone(),
         )),
         Arc::new(CodeModeWaitHandler),
-    ]
+    ];
+
+    // The workflow host tool (P0-host-tool-skeleton) is only registered — and
+    // therefore only reachable — when `Feature::Workflow` is enabled.
+    if turn_context.config.features.enabled(Feature::Workflow) {
+        executors.push(Arc::new(CodeModeWorkflowHandler::new(
+            create_workflow_tool(),
+            code_mode_nested_tool_specs,
+        )));
+    }
+
+    executors
 }
 
 #[instrument(level = "trace", skip_all, fields(tool_spec_count = specs.len()))]

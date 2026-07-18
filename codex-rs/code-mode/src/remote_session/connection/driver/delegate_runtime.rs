@@ -63,6 +63,17 @@ enum DelegateTask {
         cell_id: codex_code_mode_protocol::CellId,
         text: String,
     },
+    SpawnAgent {
+        cell_id: codex_code_mode_protocol::CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: codex_code_mode_protocol::AgentCallOpts,
+    },
+    SpawnWorkflow {
+        cell_id: codex_code_mode_protocol::CellId,
+        name: String,
+        args: Option<serde_json::Value>,
+    },
 }
 
 pub(super) struct DelegateEffects {
@@ -128,6 +139,26 @@ impl DelegateRuntime {
                 cell_id: target.cell_id.clone(),
                 text,
             },
+            DelegateRequest::SpawnAgent {
+                cell_id: _,
+                prompt,
+                ordinal,
+                opts,
+            } => DelegateTask::SpawnAgent {
+                cell_id: target.cell_id.clone(),
+                prompt,
+                ordinal,
+                opts: *opts,
+            },
+            DelegateRequest::SpawnWorkflow {
+                cell_id: _,
+                name,
+                args,
+            } => DelegateTask::SpawnWorkflow {
+                cell_id: target.cell_id.clone(),
+                name,
+                args,
+            },
         };
         let delegate = target.delegate;
         let task_cancellation = cancellation.clone();
@@ -145,6 +176,33 @@ impl DelegateRuntime {
                     .notify(call_id, cell_id, text, task_cancellation)
                     .await
                     .map(|()| DelegateResponse::NotificationDelivered),
+                // `agent()` never surfaces a transport error: the delegate resolves to an
+                // `AgentSpawnOutcome` (never `Err`), which round-trips as `AgentSpawned` so the
+                // host isolate settles the promise (value / null / throw).
+                DelegateTask::SpawnAgent {
+                    cell_id,
+                    prompt,
+                    ordinal,
+                    opts,
+                } => Ok(DelegateResponse::AgentSpawned {
+                    outcome: delegate
+                        .spawn_agent(cell_id, prompt, ordinal, opts, task_cancellation)
+                        .await
+                        .into(),
+                }),
+                // `workflow()` never surfaces a transport error either: the delegate resolves to an
+                // `AgentSpawnOutcome` (never `Err`), round-tripped as `WorkflowSpawned` so the host
+                // isolate settles the promise (value / null / throw).
+                DelegateTask::SpawnWorkflow {
+                    cell_id,
+                    name,
+                    args,
+                } => Ok(DelegateResponse::WorkflowSpawned {
+                    outcome: delegate
+                        .spawn_workflow(cell_id, name, args, task_cancellation)
+                        .await
+                        .into(),
+                }),
             }
         });
         let completion_stop = CancellationToken::new();
@@ -248,7 +306,9 @@ impl ConnectionDriver {
     ) -> bool {
         let wire_cell_id = match &request {
             DelegateRequest::InvokeTool { invocation } => &invocation.cell_id,
-            DelegateRequest::Notify { cell_id, .. } => cell_id,
+            DelegateRequest::Notify { cell_id, .. }
+            | DelegateRequest::SpawnAgent { cell_id, .. }
+            | DelegateRequest::SpawnWorkflow { cell_id, .. } => cell_id,
         };
         let target = match self.sessions.delegate_target(&session_id, wire_cell_id) {
             Ok(target) => target,

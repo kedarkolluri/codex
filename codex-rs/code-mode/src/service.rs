@@ -295,6 +295,90 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
             .await
     }
 
+    async fn spawn_agent(
+        &self,
+        cell_id: runtime::CellId,
+        prompt: String,
+        ordinal: u64,
+        opts: codex_code_mode_protocol::AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.delegate
+            .spawn_agent(
+                protocol_cell_id(&cell_id),
+                prompt,
+                ordinal,
+                opts,
+                cancellation_token,
+            )
+            .await
+    }
+
+    async fn spawn_workflow(
+        &self,
+        cell_id: runtime::CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.delegate
+            .spawn_workflow(protocol_cell_id(&cell_id), name, args, cancellation_token)
+            .await
+    }
+
+    fn budget_handle(&self) -> Option<Arc<dyn codex_code_mode_protocol::WorkflowBudgetHandle>> {
+        self.delegate.budget_handle()
+    }
+
+    fn replay_entries(
+        &self,
+        cell_id: runtime::CellId,
+    ) -> Vec<codex_workflow_journal::AgentCallLine> {
+        // The protocol delegate hands back raw JSON `agent_call` records so the
+        // protocol trait stays free of a journal-crate dependency; deserialize them
+        // into typed lines here (code-mode already depends on the journal crate).
+        // A record that fails to parse is skipped defensively — a corrupt seed line
+        // degrades to a live dispatch at that ordinal rather than aborting the run.
+        self.delegate
+            .replay_entries(protocol_cell_id(&cell_id))
+            .into_iter()
+            .filter_map(|value| serde_json::from_value(value).ok())
+            .collect()
+    }
+
+    async fn journal_phase(&self, cell_id: runtime::CellId, title: String) {
+        // Result is discarded: a journal-write failure is best-effort and must not disturb the run.
+        let _ = self
+            .delegate
+            .journal_phase(protocol_cell_id(&cell_id), title)
+            .await;
+    }
+
+    async fn journal_log(&self, cell_id: runtime::CellId, message: String) {
+        let _ = self
+            .delegate
+            .journal_log(protocol_cell_id(&cell_id), message)
+            .await;
+    }
+
+    async fn replay_agent(
+        &self,
+        cell_id: runtime::CellId,
+        entry: codex_workflow_journal::AgentCallLine,
+    ) {
+        // The `CodeModeSessionDelegate` seam is wire-shaped (it also backs the remote host), so the
+        // journal entry crosses it as JSON rather than pulling the `workflow-journal` type into the
+        // protocol crate. A serialization failure is best-effort — it must not disturb the run — so
+        // it is dropped, matching the discard-on-failure policy of the journal markers above.
+        if let Ok(entry) = serde_json::to_value(&entry) {
+            // Result is discarded: a journal-write failure is best-effort and must not disturb the run.
+            let _ = self
+                .delegate
+                .replay_agent(protocol_cell_id(&cell_id), entry)
+                .await;
+        }
+    }
+
     fn cell_closed(&self, cell_id: &runtime::CellId) {
         self.delegate.cell_closed(&protocol_cell_id(cell_id));
     }
@@ -320,6 +404,9 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             })
             .collect(),
         source: request.source,
+        workflow: request.workflow,
+        args: request.args,
+        run_id: request.run_id,
     }
 }
 

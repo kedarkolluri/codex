@@ -1,0 +1,23 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-core-workflows"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_core_workflows"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-code-mode-protocol = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt", "rt-multi-thread"] }

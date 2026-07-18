@@ -22,6 +22,7 @@ use super::ProtocolVersion;
 use super::RequestId;
 use super::SessionId;
 use super::SupportedProtocolVersions;
+use super::WireAgentSpawnOutcome;
 use super::WireCellId;
 use super::WireContentItem;
 use super::WireExecuteRequest;
@@ -34,6 +35,8 @@ use super::WireToolKind;
 use super::WireToolName;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use crate::AgentCallOpts;
+use crate::AgentSpawnOutcome;
 use crate::ExecuteRequest;
 
 fn session_id() -> SessionId {
@@ -102,6 +105,9 @@ fn execute_request() -> WireExecuteRequest {
         source: "text('hello');".to_string(),
         yield_time_ms: Some(25),
         max_output_tokens: Some(100),
+        workflow: false,
+        args: None,
+        run_id: None,
     }
 }
 
@@ -604,6 +610,290 @@ fn execute_request_integer_bounds_are_enforced() {
         ..wire_request
     };
     assert!(ExecuteRequest::try_from(negative).is_err());
+}
+
+#[test]
+fn workflow_flag_survives_wire_round_trip() {
+    // The explicit workflow invocation mode must round-trip through the wire
+    // request in both directions so a remote code-mode host installs the
+    // workflow-only narrator globals for (and only for) workflow runs.
+    let workflow_wire = WireExecuteRequest {
+        workflow: true,
+        ..execute_request()
+    };
+    let workflow_domain = ExecuteRequest::try_from(workflow_wire.clone())
+        .expect("valid wire request converts to the domain");
+    assert!(workflow_domain.workflow, "workflow flag must decode");
+    assert_eq!(
+        WireExecuteRequest::try_from(workflow_domain).expect("domain converts back to the wire"),
+        workflow_wire,
+        "workflow flag must re-encode identically",
+    );
+}
+
+#[test]
+fn plain_exec_omits_workflow_key_on_the_wire() {
+    // A new client always constructs `workflow: false` for plain code-mode exec.
+    // The field MUST be skipped on serialization so the wire bytes are identical
+    // to the pre-`workflow` format; otherwise an older V1 host that pins
+    // `deny_unknown_fields` would reject every ordinary exec after a successful
+    // handshake.
+    let plain = execute_request();
+    assert!(!plain.workflow, "fixture is a plain exec request");
+    let encoded = serde_json::to_value(&plain).expect("serialize plain exec");
+    assert!(
+        encoded.get("workflow").is_none(),
+        "plain exec must not carry a `workflow` key, got: {encoded}"
+    );
+
+    // `workflow: true` (a new capability an old host is never asked for) is the
+    // only case that carries the field.
+    let workflow = WireExecuteRequest {
+        workflow: true,
+        ..execute_request()
+    };
+    let encoded = serde_json::to_value(&workflow).expect("serialize workflow exec");
+    assert_eq!(encoded.get("workflow"), Some(&json!(true)));
+}
+
+#[test]
+fn workflow_flag_defaults_to_false_for_legacy_payloads() {
+    // Peers that predate the `workflow` field never emit it; serde must default
+    // it to `false` so a legacy payload decodes as plain code-mode exec.
+    let legacy = json!({
+        "tool_call_id": "call-1",
+        "enabled_tools": [],
+        "source": "text('hi');",
+        "yield_time_ms": null,
+        "max_output_tokens": null,
+    });
+    let wire: WireExecuteRequest =
+        serde_json::from_value(legacy).expect("legacy payload without `workflow` decodes");
+    assert!(
+        !wire.workflow,
+        "missing `workflow` must default to plain exec"
+    );
+}
+
+#[test]
+fn workflow_args_and_run_id_survive_wire_round_trip() {
+    // The invocation `args` JSON and host-minted `run_id` must round-trip through
+    // the wire request in both directions so a remote code-mode host installs the
+    // read-only `args` / `workflow.runId` globals for the workflow isolate.
+    let workflow_wire = WireExecuteRequest {
+        workflow: true,
+        args: Some(json!({ "foo": 1, "nested": { "bar": true } })),
+        run_id: Some("0192f000-0000-7000-8000-000000000000".to_string()),
+        ..execute_request()
+    };
+    let workflow_domain = ExecuteRequest::try_from(workflow_wire.clone())
+        .expect("valid wire request converts to the domain");
+    assert_eq!(
+        workflow_domain.args,
+        Some(json!({ "foo": 1, "nested": { "bar": true } })),
+        "args must decode"
+    );
+    assert_eq!(
+        workflow_domain.run_id.as_deref(),
+        Some("0192f000-0000-7000-8000-000000000000"),
+        "run_id must decode"
+    );
+    assert_eq!(
+        WireExecuteRequest::try_from(workflow_domain).expect("domain converts back to the wire"),
+        workflow_wire,
+        "args + run_id must re-encode identically",
+    );
+}
+
+#[test]
+fn plain_exec_omits_args_and_run_id_on_the_wire() {
+    // A plain code-mode exec (and any workflow run that carries no args/run id)
+    // must skip both keys so the wire bytes stay byte-identical to the pre-`args`
+    // format an older `deny_unknown_fields` host accepts.
+    let plain = execute_request();
+    assert!(plain.args.is_none() && plain.run_id.is_none());
+    let encoded = serde_json::to_value(&plain).expect("serialize plain exec");
+    assert!(
+        encoded.get("args").is_none() && encoded.get("run_id").is_none(),
+        "plain exec must not carry `args`/`run_id` keys, got: {encoded}"
+    );
+}
+
+#[test]
+fn spawn_agent_delegate_request_survives_wire_round_trip() {
+    // A workflow `agent(prompt, { schema })` spawn must round-trip its cell id, prompt, ordinal, and
+    // the full `opts` (including `schema`) so a process-owned host can reach the client's real spawn
+    // broker with everything intact.
+    assert_wire_round_trip(
+        HostToClient::DelegateRequest {
+            id: delegate_request_id(/*value*/ 12),
+            session_id: session_id(),
+            request: DelegateRequest::SpawnAgent {
+                cell_id: cell_id("cell-1"),
+                prompt: "summarize the repo".to_string(),
+                ordinal: 7,
+                opts: Box::new(AgentCallOpts {
+                    schema: Some(json!({ "type": "object" })),
+                    model: Some("gpt-5".to_string()),
+                    ..AgentCallOpts::default()
+                }),
+            },
+        },
+        json!({
+            "type": "delegate/request",
+            "id": 12,
+            "sessionId": "session-1",
+            "request": {
+                "type": "agent/spawn",
+                "cellId": "cell-1",
+                "prompt": "summarize the repo",
+                "ordinal": 7,
+                "opts": { "schema": { "type": "object" }, "model": "gpt-5" },
+            },
+        }),
+    );
+}
+
+#[test]
+fn agent_spawned_delegate_response_round_trips_all_three_outcomes() {
+    // Each `AgentSpawnOutcome` variant must survive the wire so the host isolate resolves the
+    // `agent()` promise with a value, resolves it to `null`, or rejects (throws) it — faithfully.
+    for (id, outcome, encoded_outcome) in [
+        (
+            delegate_request_id(/*value*/ 13),
+            WireAgentSpawnOutcome::Completed {
+                value: json!({ "answer": 42 }),
+            },
+            json!({ "outcome": "completed", "value": { "answer": 42 } }),
+        ),
+        (
+            delegate_request_id(/*value*/ 14),
+            WireAgentSpawnOutcome::Failed,
+            json!({ "outcome": "failed" }),
+        ),
+        (
+            delegate_request_id(/*value*/ 15),
+            WireAgentSpawnOutcome::Rejected {
+                message: "AgentCapReached".to_string(),
+            },
+            json!({ "outcome": "rejected", "message": "AgentCapReached" }),
+        ),
+    ] {
+        assert_wire_round_trip(
+            ClientToHost::DelegateResponse {
+                id,
+                result: WireResult::Ok {
+                    value: DelegateResponse::AgentSpawned {
+                        outcome: outcome.clone(),
+                    },
+                },
+            },
+            json!({
+                "type": "delegate/response",
+                "id": id,
+                "result": {
+                    "status": "ok",
+                    "value": { "type": "agent/spawned", "outcome": encoded_outcome },
+                },
+            }),
+        );
+    }
+}
+
+#[test]
+fn spawn_workflow_delegate_request_survives_wire_round_trip() {
+    // A nested `workflow(nameOrRef, args)` spawn must round-trip its cell id, the caller-supplied
+    // name, and the invocation `args` JSON so a process-owned host reaches the client's real workflow
+    // handler with everything intact.
+    assert_wire_round_trip(
+        HostToClient::DelegateRequest {
+            id: delegate_request_id(/*value*/ 16),
+            session_id: session_id(),
+            request: DelegateRequest::SpawnWorkflow {
+                cell_id: cell_id("cell-1"),
+                name: "triage".to_string(),
+                args: Some(json!({ "tag": "hello" })),
+            },
+        },
+        json!({
+            "type": "delegate/request",
+            "id": 16,
+            "sessionId": "session-1",
+            "request": {
+                "type": "workflow/spawn",
+                "cellId": "cell-1",
+                "name": "triage",
+                "args": { "tag": "hello" },
+            },
+        }),
+    );
+}
+
+#[test]
+fn workflow_spawned_delegate_response_round_trips_all_three_outcomes() {
+    // The nested `workflow()` settlement reuses `WireAgentSpawnOutcome`; each variant must survive
+    // the wire so the host isolate resolves the promise with a value, resolves it to `null`, or
+    // rejects (throws) it — faithfully.
+    for (id, outcome, encoded_outcome) in [
+        (
+            delegate_request_id(/*value*/ 17),
+            WireAgentSpawnOutcome::Completed {
+                value: json!("child:hello"),
+            },
+            json!({ "outcome": "completed", "value": "child:hello" }),
+        ),
+        (
+            delegate_request_id(/*value*/ 18),
+            WireAgentSpawnOutcome::Failed,
+            json!({ "outcome": "failed" }),
+        ),
+        (
+            delegate_request_id(/*value*/ 19),
+            WireAgentSpawnOutcome::Rejected {
+                message: "WorkflowNotFound".to_string(),
+            },
+            json!({ "outcome": "rejected", "message": "WorkflowNotFound" }),
+        ),
+    ] {
+        assert_wire_round_trip(
+            ClientToHost::DelegateResponse {
+                id,
+                result: WireResult::Ok {
+                    value: DelegateResponse::WorkflowSpawned {
+                        outcome: outcome.clone(),
+                    },
+                },
+            },
+            json!({
+                "type": "delegate/response",
+                "id": id,
+                "result": {
+                    "status": "ok",
+                    "value": { "type": "workflow/spawned", "outcome": encoded_outcome },
+                },
+            }),
+        );
+    }
+}
+
+#[test]
+fn agent_spawn_outcome_converts_to_and_from_its_wire_form() {
+    // The domain <-> wire conversion the bridge relies on must be lossless in both directions.
+    for outcome in [
+        AgentSpawnOutcome::Completed(json!({ "k": [1, 2, 3] })),
+        AgentSpawnOutcome::Completed(json!("plain string")),
+        AgentSpawnOutcome::Failed,
+        AgentSpawnOutcome::Rejected("BudgetExceeded".to_string()),
+    ] {
+        let wire: WireAgentSpawnOutcome = outcome.clone().into();
+        let round_tripped: AgentSpawnOutcome = wire.into();
+        // AgentSpawnOutcome has no PartialEq (it carries an arbitrary JsonValue), so compare through
+        // the wire form which does.
+        assert_eq!(
+            WireAgentSpawnOutcome::from(round_tripped),
+            WireAgentSpawnOutcome::from(outcome),
+        );
+    }
 }
 
 #[test]

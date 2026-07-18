@@ -4,6 +4,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnOutcome;
+use codex_code_mode_protocol::WorkflowBudgetHandle;
+use codex_workflow_journal::AgentCallLine;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -50,6 +54,76 @@ pub(crate) trait CellHost: Send + Sync + 'static {
         text: String,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Spawn a workflow subagent for an `agent(prompt, opts?)` call, resolving to an
+    /// [`AgentSpawnOutcome`]: `Completed` (a JSON string when schemaless, or the validated
+    /// `opts.schema` object), `Failed` (JS `null`; `agent()` never throws for agent failure), or
+    /// `Rejected` (throw an admission-time cap/budget rejection). The default resolves to `Failed`
+    /// so hosts without workflow spawning need no changes.
+    fn spawn_agent(
+        &self,
+        prompt: String,
+        ordinal: u64,
+        opts: AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (prompt, ordinal, opts, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
+
+    /// Run a saved workflow inline for a `workflow(nameOrRef, args)` call, resolving to an
+    /// [`AgentSpawnOutcome`] (`Completed` with the nested run's result, `Failed` -> JS `null`, or
+    /// `Rejected` -> throw). The default resolves to `Failed` so hosts without nested-workflow
+    /// support need no changes.
+    fn spawn_workflow(
+        &self,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (name, args, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
+
+    /// The live shared token-budget handle backing the workflow `budget` global, or `None` when this
+    /// cell runs no budgeted workflow. The cell actor threads the returned handle into the isolate
+    /// so `budget.spent()` / `budget.remaining()` forward to the shared budget rather than reporting
+    /// static values. The default returns `None` so hosts without a budget need no changes.
+    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
+        None
+    }
+
+    /// Prior-run journal `agent_call` lines seeding this cell's prefix-replay for a
+    /// resumed run (spec §7, `P3-resume-entry`). The cell actor seeds the isolate's
+    /// `ReplayState` with these before evaluating the body. The default returns an
+    /// empty vec so a fresh (non-resume) cell seeds no replay state.
+    fn replay_entries(&self) -> Vec<codex_workflow_journal::AgentCallLine> {
+        Vec::new()
+    }
+
+    /// Journal a workflow `phase(title)` marker for this cell's run (§7 `phase` line). The default is
+    /// a no-op so hosts that do not journal need no changes.
+    fn journal_phase(&self, title: String) -> impl Future<Output = ()> + Send {
+        let _ = title;
+        async {}
+    }
+
+    /// Journal a workflow `log(message)` marker for this cell's run (§7 `log` line). The default is a
+    /// no-op so hosts that do not journal need no changes.
+    fn journal_log(&self, message: String) -> impl Future<Output = ()> + Send {
+        let _ = message;
+        async {}
+    }
+
+    /// Handle a prefix-replay cache hit (§7 resume step 3): re-append `entry` to the NEW run's
+    /// journal and re-add its `tokens_spent` to the shared budget, WITHOUT spawning a subagent. The
+    /// cell actor awaits this before draining the next runtime event, so the budget re-add is ordered
+    /// ahead of any later divergent live `agent()` call's pre-admission ceiling check. The default is
+    /// a no-op so hosts that do not journal/meter need no changes.
+    fn replay_agent(&self, entry: AgentCallLine) -> impl Future<Output = ()> + Send {
+        let _ = entry;
+        async {}
+    }
 
     fn commit_completion(
         &self,

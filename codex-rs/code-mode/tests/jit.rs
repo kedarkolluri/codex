@@ -17,6 +17,9 @@ async fn code_mode_runs_with_jit_disabled() {
             source: "21 * 2;".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            workflow: false,
+            args: None,
+            run_id: None,
         })
         .await
         .expect("start code-mode cell");

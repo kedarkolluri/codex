@@ -34,6 +34,9 @@ pub(super) fn runtime_request(request: CellRequest) -> ExecuteRequest {
         source: request.source,
         yield_time_ms: None,
         max_output_tokens: None,
+        workflow: request.workflow,
+        args: request.args,
+        run_id: request.run_id,
     }
 }
 

@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::runtime::spawn_runtime;
 use crate::session_runtime::OutputItem;
 
 struct TestHost;
@@ -127,6 +128,9 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             source: "await new Promise(() => {});".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            workflow: false,
+            args: None,
+            run_id: None,
         },
         runtime_event_tx,
         PendingRuntimeMode::PauseUntilResumed,

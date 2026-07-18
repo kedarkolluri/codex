@@ -48,6 +48,9 @@ use crate::thread_state::ConnectionCapabilities;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
+use crate::workflows_service::WorkflowsService;
+use crate::workflows_watcher::WorkflowsWatcher;
+use crate::workflows_watcher::workflow_static_roots_from_config;
 use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::AppServerRpcTransport;
 use codex_app_server_protocol::ClientNotification;
@@ -66,6 +69,7 @@ use codex_chatgpt::workspace_settings;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_exec_server::EnvironmentManager;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_goal_extension::GoalService;
 use codex_home::CodexHomeUserInstructionsProvider;
@@ -103,6 +107,9 @@ pub(crate) struct MessageProcessor {
     outgoing: Arc<OutgoingMessageSender>,
     models_refresh_worker: ModelsRefreshWorker,
     skills_watcher: Arc<SkillsWatcher>,
+    // `None` when `Feature::Workflow` is disabled: no watcher is constructed, so
+    // there is zero filesystem activity and no `workflows/changed` traffic.
+    workflows_watcher: Option<Arc<WorkflowsWatcher>>,
     account_processor: AccountRequestProcessor,
     apps_processor: AppsRequestProcessor,
     catalog_processor: CatalogRequestProcessor,
@@ -305,6 +312,19 @@ impl MessageProcessor {
             .plugins_manager()
             .set_analytics_events_client(analytics_events_client.clone());
         let skills_watcher = SkillsWatcher::new(thread_manager.skills_service(), outgoing.clone());
+        // Gate the workflows watcher on the experimental feature: when disabled,
+        // no watcher is constructed, so no repo is watched and no untrusted
+        // workflow files are parsed.
+        let workflows_watcher = if config.features.enabled(Feature::Workflow) {
+            let workflows_service = Arc::new(WorkflowsService::new());
+            Some(WorkflowsWatcher::new(
+                workflows_service,
+                workflow_static_roots_from_config(&config),
+                outgoing.clone(),
+            ))
+        } else {
+            None
+        };
 
         let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
         let thread_watch_manager =
@@ -425,6 +445,7 @@ impl MessageProcessor {
             state_db.clone(),
             log_db,
             Arc::clone(&skills_watcher),
+            workflows_watcher.clone(),
             config_warnings,
         );
         let turn_processor = TurnRequestProcessor::new(
@@ -440,6 +461,7 @@ impl MessageProcessor {
             thread_watch_manager,
             thread_list_state_permit,
             Arc::clone(&skills_watcher),
+            workflows_watcher.clone(),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
             // Keep plugin startup warmups aligned at app-server startup.
@@ -481,6 +503,7 @@ impl MessageProcessor {
             outgoing,
             models_refresh_worker,
             skills_watcher,
+            workflows_watcher,
             account_processor,
             apps_processor,
             catalog_processor,
@@ -511,6 +534,9 @@ impl MessageProcessor {
         self.apps_processor.shutdown();
         self.models_refresh_worker.shutdown();
         self.skills_watcher.shutdown();
+        if let Some(workflows_watcher) = &self.workflows_watcher {
+            workflows_watcher.shutdown();
+        }
     }
 
     pub(crate) async fn process_request(

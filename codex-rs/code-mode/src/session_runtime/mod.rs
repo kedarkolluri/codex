@@ -270,6 +270,66 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
+    async fn spawn_agent(
+        &self,
+        prompt: String,
+        ordinal: u64,
+        opts: codex_code_mode_protocol::AgentCallOpts,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.inner
+            .delegate
+            .spawn_agent(
+                self.cell_id.clone(),
+                prompt,
+                ordinal,
+                opts,
+                cancellation_token,
+            )
+            .await
+    }
+
+    async fn spawn_workflow(
+        &self,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.inner
+            .delegate
+            .spawn_workflow(self.cell_id.clone(), name, args, cancellation_token)
+            .await
+    }
+
+    fn budget_handle(&self) -> Option<Arc<dyn codex_code_mode_protocol::WorkflowBudgetHandle>> {
+        self.inner.delegate.budget_handle()
+    }
+
+    fn replay_entries(&self) -> Vec<codex_workflow_journal::AgentCallLine> {
+        self.inner.delegate.replay_entries(self.cell_id.clone())
+    }
+
+    async fn journal_phase(&self, title: String) {
+        self.inner
+            .delegate
+            .journal_phase(self.cell_id.clone(), title)
+            .await;
+    }
+
+    async fn journal_log(&self, message: String) {
+        self.inner
+            .delegate
+            .journal_log(self.cell_id.clone(), message)
+            .await;
+    }
+
+    async fn replay_agent(&self, entry: codex_workflow_journal::AgentCallLine) {
+        self.inner
+            .delegate
+            .replay_agent(self.cell_id.clone(), entry)
+            .await;
+    }
+
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, JsonValue>,

@@ -421,6 +421,14 @@ impl CodexThread {
         self.codex.next_event().await
     }
 
+    /// Subscribe to a non-competing, lag-tolerant tap of this thread's delivered events.
+    ///
+    /// Unlike [`CodexThread::next_event`], observing through this tap does not steal events from
+    /// the app-server's single `rx_event` consumer.
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.codex.subscribe_events()
+    }
+
     pub async fn agent_status(&self) -> AgentStatus {
         self.codex.agent_status().await
     }
