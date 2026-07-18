@@ -88,8 +88,16 @@ fn session_depth(session_source: &SessionSource) -> i32 {
     }
 }
 
+/// Depth of a spawn made one level below a parent already at `parent_depth`
+/// (saturating). This is the shared depth-increment used by both the thread-spawn
+/// gate ([`next_thread_spawn_depth`]) and the `workflow()` one-level nesting guard,
+/// so both count nesting the same way.
+pub(crate) fn next_spawn_depth(parent_depth: i32) -> i32 {
+    parent_depth.saturating_add(1)
+}
+
 pub(crate) fn next_thread_spawn_depth(session_source: &SessionSource) -> i32 {
-    session_depth(session_source).saturating_add(1)
+    next_spawn_depth(session_depth(session_source))
 }
 
 pub(crate) fn exceeds_thread_spawn_depth_limit(depth: i32, max_depth: i32) -> bool {
