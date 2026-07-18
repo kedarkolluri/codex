@@ -115,6 +115,8 @@ mod skills_watcher;
 mod thread_state;
 mod thread_status;
 mod transport;
+mod workflows_service;
+mod workflows_watcher;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;

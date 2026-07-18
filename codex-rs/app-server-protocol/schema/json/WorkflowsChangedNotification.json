@@ -1,0 +1,6 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Notification emitted when watched saved-workflow files change.\n\nTreat this as an invalidation signal and re-discover saved workflows when refreshed workflow metadata is needed. Mirrors [`v2::SkillsChangedNotification`].",
+  "title": "WorkflowsChangedNotification",
+  "type": "object"
+}

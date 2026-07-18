@@ -14,6 +14,9 @@ pub(super) struct ListenerTaskContext {
     pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
+    // `None` when `Feature::Workflow` is disabled; per-thread workflow root
+    // registration is then a no-op.
+    pub(super) workflows_watcher: Option<Arc<WorkflowsWatcher>>,
 }
 
 struct UnloadingState {
@@ -238,6 +241,19 @@ pub(super) async fn ensure_listener_task_running(
             &environments,
         )
         .await;
+    // Mirror the skills watcher: register this thread's project workflow root
+    // (`<cwd>/.codex/workflows`) so the watcher observes repo-local workflow
+    // changes for whichever directory the thread was opened in. The returned
+    // registration is held for the listener task's lifetime below and
+    // unregisters on drop.
+    let workflows_watch_registration = match listener_task_context.workflows_watcher.as_ref() {
+        Some(workflows_watcher) => workflows_watcher.register_thread_config(
+            config.as_ref(),
+            listener_task_context.thread_manager.as_ref(),
+            &environments,
+        ),
+        None => codex_file_watcher::WatchRegistration::default(),
+    };
     let thread_settings_baseline =
         thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
     let (mut listener_command_rx, listener_generation) = {
@@ -275,6 +291,11 @@ pub(super) async fn ensure_listener_task_running(
     } = listener_task_context;
     let outgoing_for_task = Arc::clone(&outgoing);
     tokio::spawn(async move {
+        // Hold the per-thread workflow root registration for the listener task's
+        // lifetime; it unregisters on drop when the listener is superseded or the
+        // thread is torn down. (The skills registration rides in `thread_state`
+        // via `set_listener`; workflows have no such slot, so the task owns it.)
+        let _workflows_watch_registration = workflows_watch_registration;
         loop {
             tokio::select! {
                 biased;

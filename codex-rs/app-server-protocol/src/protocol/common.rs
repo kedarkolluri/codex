@@ -1610,6 +1610,13 @@ pub struct FuzzyFileSearchSessionCompletedNotification {
     pub session_id: String,
 }
 
+/// Notification emitted when watched saved-workflow files change.
+///
+/// Treat this as an invalidation signal and re-discover saved workflows when
+/// refreshed workflow metadata is needed. Mirrors [`v2::SkillsChangedNotification`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
+pub struct WorkflowsChangedNotification {}
+
 server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
@@ -1620,6 +1627,7 @@ server_notification_definitions! {
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
+    WorkflowsChanged => "workflows/changed" (WorkflowsChangedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),

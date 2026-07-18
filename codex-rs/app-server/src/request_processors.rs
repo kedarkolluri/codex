@@ -13,6 +13,7 @@ use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_status::ThreadWatchManager;
 use crate::thread_status::resolve_thread_status;
+use crate::workflows_watcher::WorkflowsWatcher;
 use chrono::Duration as ChronoDuration;
 use chrono::SecondsFormat;
 use codex_analytics::AnalyticsEventsClient;
