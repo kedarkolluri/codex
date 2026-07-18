@@ -146,6 +146,14 @@ impl AgentControl {
         self.rollout_budget.as_ref()
     }
 
+    /// Clone of the shared, tree-wide budget `Arc`, so a live budget handle can be
+    /// constructed over the same accounting state the root thread and every cloned
+    /// sub-agent control handle share (backs the in-process code-mode `budget`
+    /// global via [`crate::rollout_budget::RolloutBudgetHandle`]).
+    pub(crate) fn rollout_budget_arc(&self) -> Arc<RolloutBudget> {
+        Arc::clone(&self.rollout_budget)
+    }
+
     /// Send rich user input items to an existing agent thread.
     pub(crate) async fn send_input(
         &self,

@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use super::workflow_handler::WorkflowRunLedger;
+use super::workflow_handler::run_workflow_by_name;
 use codex_code_mode::AgentCallOpts;
 use codex_code_mode::AgentSpawnFuture;
 use codex_code_mode::AgentSpawnOutcome;
@@ -10,8 +12,15 @@ use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSessionDelegate;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ToolInvocationFuture;
+use codex_code_mode::WorkflowBudgetHandle;
+use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ThreadGoal;
+use codex_protocol::protocol::ThreadGoalStatus;
+use codex_protocol::protocol::ThreadGoalUpdatedEvent;
 use codex_protocol::user_input::UserInput;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
@@ -28,6 +37,8 @@ use super::scheduler::WorkflowScheduler;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::spawn_await::workflow_agent_nickname_preference;
 use crate::agent::control::spawn_await_opts::SpawnAgentConfigOverrides;
+use crate::rollout_budget::RolloutBudget;
+use crate::rollout_budget::RolloutBudgetHandle;
 use crate::session::step_context::StepContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -37,15 +48,28 @@ pub(super) struct CodeModeDispatchBroker {
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
     dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    /// Shared run→parent ledger, forgotten per closed cell (see [`WorkflowRunLedger`]).
+    workflow_run_ledger: Arc<WorkflowRunLedger>,
+    /// The workflow session's shared, tree-wide [`RolloutBudget`], captured from the
+    /// session the first time a turn worker starts (SEAM #1). The broker is 1:1 with
+    /// one `CodeModeService` on one `Session`, and that session's `AgentControl` holds
+    /// a single budget `Arc` for its whole lifetime (reconfigured per-run through the
+    /// resettable cell, never swapped), so a single captured `Arc` is always the
+    /// correct run's budget and its getters read live — never a stale/other session's
+    /// counter. Backs the in-process `budget_handle()` (§4/§8) so `budget.spent()` /
+    /// `budget.remaining()` forward to live spend instead of static defaults.
+    workflow_budget: std::sync::OnceLock<Arc<RolloutBudget>>,
 }
 
 impl CodeModeDispatchBroker {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(workflow_run_ledger: Arc<WorkflowRunLedger>) -> Self {
         let (dispatch_tx, dispatch_rx) = async_channel::unbounded();
         Self {
             dispatch_tx,
             dispatch_rx,
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            workflow_run_ledger,
+            workflow_budget: std::sync::OnceLock::new(),
         }
     }
 
@@ -55,6 +79,9 @@ impl CodeModeDispatchBroker {
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {
         remove_dispatch_gate(&self.dispatch_gates, cell_id);
+        // Drop the cell→run_id entry once its cell is gone so the ledger map does
+        // not grow across a long session; the append-only run→parent links stay.
+        self.workflow_run_ledger.forget_cell(cell_id);
     }
 
     pub(super) fn start_turn_worker(
@@ -64,6 +91,13 @@ impl CodeModeDispatchBroker {
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
     ) -> CodeModeDispatchWorker {
+        // Capture this session's shared budget `Arc` (SEAM #1) before `exec` is moved
+        // into the host. `set` is idempotent: every turn worker on this session shares
+        // the same budget `Arc`, so a repeat call is a no-op and never installs a
+        // different (stale) session's counter.
+        let _ = self
+            .workflow_budget
+            .set(exec.session.services.agent_control.rollout_budget_arc());
         let tool_runtime =
             ToolCallRuntime::new(router, Arc::clone(&exec.session), step_context, tracker);
         // One `WorkflowScheduler` per turn worker (i.e. per workflow run): every `agent()` call in
@@ -168,6 +202,36 @@ impl CodeModeDispatchBroker {
                         tokio::spawn(async move {
                             let result = tokio::select! {
                                 result = host.spawn_agent(prompt, ordinal, opts) => result,
+                                _ = cancellation_token.cancelled() => return,
+                            };
+                            let _ = response_tx.send(result);
+                        });
+                    }
+                    DispatchMessage::SpawnWorkflow {
+                        cell_id,
+                        name,
+                        args,
+                        cancellation_token,
+                        response_tx,
+                    } => {
+                        if !wait_until_cell_ready_for_dispatch(
+                            &dispatch_gates,
+                            &cell_id,
+                            &cancellation_token,
+                        )
+                        .await
+                        {
+                            remove_dispatch_gate(&dispatch_gates, &cell_id);
+                            continue;
+                        }
+                        // One independent task per `workflow()` call: the nested run
+                        // re-enters the runtime through this same host, and its own
+                        // agents dispatch back into this loop, so nothing here may
+                        // block the loop while it runs.
+                        let host = Arc::clone(&host);
+                        tokio::spawn(async move {
+                            let result = tokio::select! {
+                                result = host.spawn_workflow(cell_id, name, args) => result,
                                 _ = cancellation_token.cancelled() => return,
                             };
                             let _ = response_tx.send(result);
@@ -330,6 +394,56 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
         })
     }
 
+    fn spawn_workflow<'a>(
+        &'a self,
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        Box::pin(async move {
+            // A cancelled call or an unavailable/stopped dispatcher resolves the isolate promise to
+            // JS `null` (death-is-null) rather than throwing; only an unresolved name / nested error
+            // (surfaced by the host as `Rejected`) throws.
+            if cancellation_token.is_cancelled() {
+                return AgentSpawnOutcome::Failed;
+            }
+            let (response_tx, response_rx) = oneshot::channel();
+            if self
+                .dispatch_tx
+                .send(DispatchMessage::SpawnWorkflow {
+                    cell_id,
+                    name,
+                    args,
+                    cancellation_token: cancellation_token.clone(),
+                    response_tx,
+                })
+                .await
+                .is_err()
+            {
+                return AgentSpawnOutcome::Failed;
+            }
+            tokio::select! {
+                result = response_rx => result.unwrap_or(AgentSpawnOutcome::Failed),
+                _ = cancellation_token.cancelled() => AgentSpawnOutcome::Failed,
+            }
+        })
+    }
+
+    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
+        // Return a LIVE handle over this session's shared, tree-wide budget so the
+        // in-process code-mode isolate's `budget.spent()` / `budget.remaining()`
+        // globals forward to the real counter (§4/§8) rather than the static
+        // `spent 0 / remaining total` defaults. The handle reads the budget live at
+        // call time, so a workflow that awaits subagents observes accrued spend. This
+        // does NOT touch the hard-ceiling enforcement, which reads the `RolloutBudget`
+        // directly in `CoreTurnHost::spawn_agent`. `None` before the first turn worker
+        // starts falls back to the prior (static) behavior.
+        self.workflow_budget.get().map(|budget| {
+            Arc::new(RolloutBudgetHandle::new(Arc::clone(budget))) as Arc<dyn WorkflowBudgetHandle>
+        })
+    }
+
     fn cell_closed(&self, cell_id: &CellId) {
         self.close_cell(cell_id);
     }
@@ -358,6 +472,15 @@ enum DispatchMessage {
         // string when schemaless, or the validated `opts.schema` object), `Failed` on agent
         // death/abort/parse-fail (JS null), and `Rejected(msg)` when a scheduler admission cap or a
         // bounds check refuses the spawn (a JS throw once the seam lands).
+        response_tx: oneshot::Sender<AgentSpawnOutcome>,
+    },
+    SpawnWorkflow {
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+        // Reuses the [`AgentSpawnOutcome`] seam: `Completed(value)` -> the nested run's top-level
+        // result, `Failed` -> JS null, `Rejected(msg)` -> a JS throw (unresolved name / nested error).
         response_tx: oneshot::Sender<AgentSpawnOutcome>,
     },
 }
@@ -390,6 +513,16 @@ const WORKFLOW_SCHEMA_MAX_SERIALIZED_BYTES: usize = 32 * 1024;
 /// but the schema is re-walked/compiled on every return, so an adversarially deep schema is bounded
 /// here before use. 64 levels is far beyond any real JSON Schema.
 const WORKFLOW_SCHEMA_MAX_DEPTH: usize = 64;
+
+/// Conservative per-turn weighted-output estimate reserved against the budget when a workflow
+/// `agent()` child is admitted (see [`crate::rollout_budget::RolloutBudget::reserve`]).
+///
+/// The reservation's job is to make concurrent admissions SERIALIZE against the ceiling; because a
+/// reservation is scoped to a concurrency-permit holder, the "at most one in-flight turn per
+/// concurrency slot" overshoot bound holds for any positive estimate. A modest per-turn floor keeps
+/// budgeted parallelism unrestricted until the shared budget is nearly exhausted, at which point new
+/// admissions are refused.
+const WORKFLOW_AGENT_TURN_TOKEN_ESTIMATE: i64 = 1_024;
 
 struct CoreTurnHost {
     exec: ExecContext,
@@ -468,10 +601,39 @@ impl CoreTurnHost {
         // oversized prompt degrades gracefully rather than failing the whole call).
         let prompt = cap_prompt_bytes(prompt);
 
-        // TODO(M2, spec §5 admission-order step 1): budget pre-admission hook goes here, ahead of
-        // the lifetime CAS + concurrency permit below. M2 owns budget; do not implement it here.
-
         let session = &self.exec.session;
+
+        // Budget governance (spec §5 admission, §8). The shared, tree-wide `RolloutBudget` is shared
+        // by the root thread and every cloned sub-agent control handle, so a workflow `budget.total`
+        // ceiling meters output-token spend across the whole `parallel()`/`pipeline()` fan-out.
+        //
+        // Enforcement has two parts:
+        //  1. A CHEAP, best-effort pre-check here that fast-rejects the steady-state exhausted case
+        //     WITHOUT consuming a lifetime slot. `limit().is_some()` — not the old
+        //     `spent()+remaining()>0` heuristic — is the authoritative metered signal: it treats an
+        //     explicit zero ceiling (`Some(0)`) as metered while leaving an unconfigured budget
+        //     (`None`) ungated. This read is racy under concurrency, so it is NOT the ceiling
+        //     enforcer.
+        //  2. The AUTHORITATIVE, race-free gate is an atomic reservation taken inside the
+        //     concurrency-permit region below (`budget.reserve`): N concurrent admissions serialize
+        //     on the shared lock, so they can no longer each observe headroom before any child
+        //     records usage. See the reservation call site for the overshoot bound.
+        //
+        // A budget rejection is the one case `agent()` THROWS (surfaced as `Rejected` → a JS throw);
+        // the death-is-null contract still governs agent death/abort.
+        let budget = session.services.agent_control.rollout_budget();
+        let turn_sub_id = self.exec.turn.sub_id.clone();
+        // Reporting half of §8 governance: surface the current budget state on the EXISTING
+        // ThreadGoal channel (no new protocol types). On an unmetered run this emits nothing.
+        emit_budget_thread_goal(session, &turn_sub_id, budget).await;
+        // Single source of truth for the pre-admission ceiling predicate (spec §5 step 1): the same
+        // `RolloutBudget::pre_admission_rejects` the unit tests assert against, so the host gate and
+        // its coverage can never drift.
+        if budget.pre_admission_rejects() {
+            warn!("workflow agent() rejected: BudgetExceeded (budget ceiling reached)");
+            return AgentSpawnOutcome::Rejected("BudgetExceeded".to_string());
+        }
+
         let turn = self.exec.turn.as_ref();
         let scheduler = &self.scheduler;
         let schema = opts.schema;
@@ -496,7 +658,27 @@ impl CoreTurnHost {
                 let schema = schema.clone();
                 let overrides = overrides.clone();
                 let preferred_agent_nickname = preferred_agent_nickname.clone();
+                let turn_sub_id = turn_sub_id.clone();
                 async move {
+                    // Authoritative, race-free budget gate (finding #1, spec §5/§8). Reserve one
+                    // per-turn estimate under the shared lock so N concurrent admissions SERIALIZE
+                    // against the ceiling instead of each reading headroom before any child records
+                    // usage. The reservation is held only across THIS concurrency-permit region and
+                    // released on finalize below, so at most `C` (the run's concurrency cap)
+                    // reservations exist at once: the ceiling overshoots by at most one in-flight
+                    // turn per concurrency slot — never by "up to N" for an N-wide fan-out.
+                    let admission = budget.reserve(WORKFLOW_AGENT_TURN_TOKEN_ESTIMATE);
+                    if matches!(admission, crate::rollout_budget::BudgetAdmission::Rejected) {
+                        // Emit `BudgetLimited` on the crossing so a run that exhausts mid-fan-out is
+                        // reported even without a further `agent()` attempt.
+                        emit_budget_thread_goal(session, &turn_sub_id, budget).await;
+                        warn!("workflow agent() rejected: BudgetExceeded (budget ceiling reached)");
+                        return SpawnAttempt::Finalized(AgentSpawnOutcome::Rejected(
+                            "BudgetExceeded".to_string(),
+                        ));
+                    }
+                    let reserved =
+                        matches!(admission, crate::rollout_budget::BudgetAdmission::Reserved);
                     let base_instructions = session.get_base_instructions().await;
                     let parent_thread_id = session.thread_id;
                     let options = SpawnAgentOptions {
@@ -529,6 +711,16 @@ impl CoreTurnHost {
                         Some(value) => AgentSpawnOutcome::Completed(value),
                         None => AgentSpawnOutcome::Failed,
                     };
+                    // Release the reservation on finalize (success AND failure alike). The child's
+                    // real usage is already recorded via `record_usage`, so dropping the estimate
+                    // reconciles the reservation against actual spend.
+                    if reserved {
+                        budget.release_reservation(WORKFLOW_AGENT_TURN_TOKEN_ESTIMATE);
+                    }
+                    // Emit the post-finalize budget state so the crossing turn — even the final
+                    // over-ceiling child that ends the run — surfaces `BudgetLimited` (finding #9),
+                    // not only when the NEXT `agent()` is attempted.
+                    emit_budget_thread_goal(session, &turn_sub_id, budget).await;
                     SpawnAttempt::Finalized(outcome)
                 }
             })
@@ -541,6 +733,19 @@ impl CoreTurnHost {
                 AgentSpawnOutcome::Rejected("AgentCapReached".to_string())
             }
         }
+    }
+
+    /// Route a workflow `workflow(nameOrRef, args)` call to the registry-load + nested re-enter
+    /// handler ([`run_workflow_by_name`]), resolving to an [`AgentSpawnOutcome`] the isolate settles
+    /// the `workflow()` promise with. `cell_id` is the PARENT cell that made the call, used to
+    /// recover the parent run id for the nested run's `parent_run_id`.
+    async fn spawn_workflow(
+        &self,
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+    ) -> AgentSpawnOutcome {
+        run_workflow_by_name(&self.exec, &cell_id, &name, args).await
     }
 
     async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String> {
@@ -599,6 +804,74 @@ fn finalize_agent_output(
         warn!("workflow agent() structured output failed JSON Schema validation");
         None
     }
+}
+
+/// Objective carried on the workflow budget-reporting [`ThreadGoal`]. The ThreadGoal channel requires
+/// a non-empty objective; a workflow run reports budget *state* (not a user-authored goal), so a
+/// fixed, non-empty label is used.
+const WORKFLOW_BUDGET_GOAL_OBJECTIVE: &str = "workflow budget";
+
+/// Emit the workflow budget-reporting [`ThreadGoal`] on the EXISTING ThreadGoal channel (spec §8),
+/// carrying the current turn id so the update is scoped to the workflow turn (not a `turn_id: None`
+/// session-global overwrite). Emits nothing for an unmetered run.
+///
+/// NOTE (finding #9, partial): this reuses the user-facing ThreadGoal channel as the §8 reporting
+/// surface, so a budget update still visually replaces the client's rendered goal for the thread.
+/// Fully scoping/restoring the user's authored goal needs session goal-state plumbing outside this
+/// module; the in-scope hardening here is (a) reporting the CONFIGURED ceiling as `token_budget`
+/// (not `spent + remaining`), (b) tagging the real `turn_id`, and (c) emitting on the spend crossing
+/// so a final over-ceiling child still surfaces `BudgetLimited`.
+async fn emit_budget_thread_goal(
+    session: &crate::session::session::Session,
+    turn_sub_id: &str,
+    budget: &RolloutBudget,
+) {
+    let Some(goal) = build_budget_thread_goal(session.thread_id(), budget) else {
+        return;
+    };
+    let event = Event {
+        id: turn_sub_id.to_string(),
+        msg: EventMsg::ThreadGoalUpdated(ThreadGoalUpdatedEvent {
+            thread_id: goal.thread_id,
+            turn_id: Some(turn_sub_id.to_string()),
+            goal,
+        }),
+    };
+    session.send_event_raw(event).await;
+}
+
+/// Build the budget-reporting [`ThreadGoal`] for a workflow run from the shared, tree-wide
+/// [`RolloutBudget`], reusing the EXISTING ThreadGoal channel (spec §8 reporting) so no new protocol
+/// types are needed. Returns `None` for an UNMETERED run (`limit()` is `None`), where there is no
+/// ceiling to report.
+///
+/// For a metered run: `token_budget` is the CONFIGURED ceiling (`budget.limit()`), NOT
+/// `spent + remaining` — so an overshot 1000-token ceiling with 1500 spent still reports the 1000
+/// limit rather than 1500 (finding #9). `tokens_used` is `budget.spent()`, and the status is
+/// [`ThreadGoalStatus::BudgetLimited`] once the ceiling is reached (`remaining <= 0`), else
+/// [`ThreadGoalStatus::Active`]. Pure and deterministic — the timestamp fields are zeroed so nothing
+/// on the workflow path reads a wall clock (no `Date`).
+fn build_budget_thread_goal(thread_id: ThreadId, budget: &RolloutBudget) -> Option<ThreadGoal> {
+    // `limit()` is the authoritative metered signal: `None` unconfigured (no ceiling to report),
+    // `Some(_)` (including `Some(0)`) a real ceiling.
+    let limit = budget.limit()?;
+    let spent = budget.spent();
+    let remaining = budget.remaining();
+    let status = if remaining <= 0 {
+        ThreadGoalStatus::BudgetLimited
+    } else {
+        ThreadGoalStatus::Active
+    };
+    Some(ThreadGoal {
+        thread_id,
+        objective: WORKFLOW_BUDGET_GOAL_OBJECTIVE.to_string(),
+        status,
+        token_budget: Some(limit),
+        tokens_used: spent,
+        time_used_seconds: 0,
+        created_at: 0,
+        updated_at: 0,
+    })
 }
 
 /// Enforce the [`WORKFLOW_PROMPT_MAX_BYTES`] ceiling on an `agent()` prompt before it becomes child
@@ -852,6 +1125,95 @@ mod finalize_agent_output_tests {
 }
 
 #[cfg(test)]
+mod budget_thread_goal_tests {
+    use super::*;
+    use crate::rollout_budget::RolloutBudget;
+    use crate::rollout_budget::workflow_output_weight_config;
+    use codex_protocol::protocol::TokenUsage;
+
+    fn output_usage(output_tokens: i64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            output_tokens,
+            reasoning_output_tokens: 0,
+            total_tokens: output_tokens,
+        }
+    }
+
+    /// An UNMETERED run leaves the budget unconfigured (both getters read 0); there is no ceiling to
+    /// report, so no ThreadGoal is produced (nothing is emitted for an unmetered workflow).
+    #[test]
+    fn no_thread_goal_for_unmetered_run() {
+        let budget = RolloutBudget::default();
+        assert!(build_budget_thread_goal(ThreadId::new(), &budget).is_none());
+    }
+
+    /// Below the ceiling a metered run reports `Active` carrying `token_budget = budget.total` and
+    /// `tokens_used = budget.spent()` on the existing ThreadGoal channel.
+    #[test]
+    fn thread_goal_reports_active_below_ceiling() {
+        let budget = RolloutBudget::default();
+        budget.configure(workflow_output_weight_config(1_000));
+        budget.record_usage(&output_usage(100));
+
+        let thread_id = ThreadId::new();
+        let goal =
+            build_budget_thread_goal(thread_id, &budget).expect("metered run reports a goal");
+        assert_eq!(goal.thread_id, thread_id);
+        assert_eq!(goal.status, ThreadGoalStatus::Active);
+        assert_eq!(goal.token_budget, Some(1_000));
+        assert_eq!(goal.tokens_used, 100);
+    }
+
+    /// At the ceiling (`remaining <= 0`) the run reports [`ThreadGoalStatus::BudgetLimited`] — the
+    /// budget-limited condition surfaced through the existing ThreadGoal channel (no new protocol
+    /// types), with `tokens_used` at the exhausted total.
+    #[test]
+    fn thread_goal_reports_budget_limited_at_ceiling() {
+        let budget = RolloutBudget::default();
+        budget.configure(workflow_output_weight_config(1_000));
+        budget.record_usage(&output_usage(1_000));
+
+        let goal =
+            build_budget_thread_goal(ThreadId::new(), &budget).expect("metered run reports a goal");
+        assert_eq!(goal.status, ThreadGoalStatus::BudgetLimited);
+        assert_eq!(goal.token_budget, Some(1_000));
+        assert_eq!(goal.tokens_used, 1_000);
+    }
+
+    /// Overshoot (an in-flight turn pushing spend past the limit) still reports `BudgetLimited`,
+    /// and `token_budget` reports the CONFIGURED ceiling (1000), NOT the overshot spend (1500) —
+    /// finding #9: an overshot 1000-limit with 1500 spent must report 1000, not 1500.
+    #[test]
+    fn thread_goal_budget_limited_on_overshoot() {
+        let budget = RolloutBudget::default();
+        budget.configure(workflow_output_weight_config(1_000));
+        budget.record_usage(&output_usage(1_500));
+
+        let goal =
+            build_budget_thread_goal(ThreadId::new(), &budget).expect("metered run reports a goal");
+        assert_eq!(goal.status, ThreadGoalStatus::BudgetLimited);
+        assert_eq!(goal.tokens_used, 1_500);
+        // token_budget is the configured ceiling, not spent+remaining.
+        assert_eq!(goal.token_budget, Some(1_000));
+    }
+
+    /// An explicit zero ceiling is metered: it reports a goal with `token_budget: Some(0)` and
+    /// `BudgetLimited` immediately (there is no headroom).
+    #[test]
+    fn thread_goal_reports_zero_ceiling_as_budget_limited() {
+        let budget = RolloutBudget::default();
+        budget.configure(workflow_output_weight_config(0));
+        let goal =
+            build_budget_thread_goal(ThreadId::new(), &budget).expect("zero ceiling is metered");
+        assert_eq!(goal.status, ThreadGoalStatus::BudgetLimited);
+        assert_eq!(goal.token_budget, Some(0));
+        assert_eq!(goal.tokens_used, 0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
@@ -861,7 +1223,9 @@ mod tests {
     /// more.
     #[tokio::test]
     async fn spawn_agent_enqueues_one_spawn_agent_dispatch() {
-        let broker = Arc::new(CodeModeDispatchBroker::new());
+        let broker = Arc::new(CodeModeDispatchBroker::new(Arc::new(
+            WorkflowRunLedger::default(),
+        )));
 
         // `spawn_agent` blocks awaiting a response the (absent) worker never sends, so drive it on a
         // task and inspect the message it enqueued on the shared dispatch channel.
@@ -910,7 +1274,7 @@ mod tests {
     /// A cancelled `agent()` call resolves to `Failed` (JS null) without ever throwing.
     #[tokio::test]
     async fn spawn_agent_resolves_to_failed_when_cancelled_before_dispatch() {
-        let broker = CodeModeDispatchBroker::new();
+        let broker = CodeModeDispatchBroker::new(Arc::new(WorkflowRunLedger::default()));
         let cancellation_token = CancellationToken::new();
         cancellation_token.cancel();
 

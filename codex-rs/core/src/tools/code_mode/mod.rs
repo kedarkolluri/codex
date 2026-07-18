@@ -51,6 +51,7 @@ pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
 pub(crate) use workflow_handler::CodeModeWorkflowHandler;
+use workflow_handler::WorkflowRunLedger;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
@@ -78,18 +79,31 @@ pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
+    /// Run→parent ledger shared with the dispatch broker so a nested `workflow()`
+    /// call can recover its parent run id (and the broker can forget a closed
+    /// cell). See [`WorkflowRunLedger`].
+    workflow_run_ledger: Arc<WorkflowRunLedger>,
     shutting_down: AtomicBool,
 }
 
 impl CodeModeService {
     pub(crate) fn new(session_provider: Arc<dyn CodeModeSessionProvider>) -> Self {
-        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new());
+        let workflow_run_ledger = Arc::new(WorkflowRunLedger::default());
+        let dispatch_broker = Arc::new(CodeModeDispatchBroker::new(Arc::clone(
+            &workflow_run_ledger,
+        )));
         Self {
             session: OnceCell::new(),
             session_provider,
             dispatch_broker,
+            workflow_run_ledger,
             shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// The workflow run→parent ledger for this service.
+    pub(crate) fn workflow_run_ledger(&self) -> &WorkflowRunLedger {
+        &self.workflow_run_ledger
     }
 
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
@@ -494,6 +508,10 @@ mod tests {
             Vec::new(),
             source,
             serde_json::Value::Null,
+            super::workflow_handler::WorkflowRunLineage {
+                parent_run_id: None,
+                depth: 0,
+            },
         )
         .await
         .expect("valid workflow runs its body once");
@@ -542,6 +560,10 @@ mod tests {
             Vec::new(),
             source,
             serde_json::json!({ "foo": "from-invocation" }),
+            super::workflow_handler::WorkflowRunLineage {
+                parent_run_id: None,
+                depth: 0,
+            },
         )
         .await
         .expect("workflow with args runs its body once");
@@ -596,6 +618,10 @@ mod tests {
             Vec::new(),
             source,
             serde_json::Value::Null,
+            super::workflow_handler::WorkflowRunLineage {
+                parent_run_id: None,
+                depth: 0,
+            },
         )
         .await
         .expect("phase/log workflow runs its body once");
@@ -637,6 +663,10 @@ mod tests {
             Vec::new(),
             "text('should-not-run');",
             serde_json::Value::Null,
+            super::workflow_handler::WorkflowRunLineage {
+                parent_run_id: None,
+                depth: 0,
+            },
         )
         .await
         .expect_err("invalid meta must be rejected");
@@ -675,6 +705,10 @@ mod tests {
             Vec::new(),
             source,
             serde_json::Value::Null,
+            super::workflow_handler::WorkflowRunLineage {
+                parent_run_id: None,
+                depth: 0,
+            },
         )
         .await
         .expect_err("workflow is unreachable when the feature is disabled");
