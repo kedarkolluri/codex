@@ -124,6 +124,9 @@ async fn handle_spawn_agent(
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
                     environments: Some(turn.environments.to_selections()),
+                    // The V2 `spawn_agent` tool keeps the registry's random nickname pool pick; only
+                    // deterministic-replay workflows supply an ordinal-derived preference.
+                    preferred_agent_nickname: None,
                 },
             ),
     )

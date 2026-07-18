@@ -60,6 +60,26 @@ fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
     }
 }
 
+/// Deterministically resolve a workflow-**preferred** nickname against the set of names already in
+/// use: return `preferred` verbatim when free, otherwise append `-2`, `-3`, … until an unused name
+/// is found. Pure function of `(used, preferred)` — never consults `rand`, so a workflow's
+/// ordinal-derived preference stays replay-stable even when it collides with an in-use name.
+fn resolve_preferred_nickname(used: &HashSet<String>, preferred: &str) -> String {
+    if !used.contains(preferred) {
+        return preferred.to_string();
+    }
+    // Start at `-2` (the un-suffixed name is the "first"), matching the human-friendly ordinal feel
+    // of `format_agent_nickname`'s `the 2nd`. The loop terminates because `used` is finite.
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{preferred}-{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
 fn session_depth(session_source: &SessionSource) -> i32 {
     match session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn { depth, .. }) => *depth,
@@ -219,7 +239,13 @@ impl AgentRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let agent_nickname = if let Some(preferred) = preferred {
-            preferred.to_string()
+            // A workflow-preferred (ordinal-derived) nickname must never fall back to `rand`, but it
+            // still has to avoid colliding with an already-used name (e.g. a non-workflow agent, or a
+            // preference that happens to match a pool name). Resolve collisions DETERMINISTICALLY by
+            // appending `-2`, `-3`, … so the assignment stays a pure function of the taken set + the
+            // requested name. The trailing `used_agent_nicknames.insert` below then actually reserves
+            // the resolved name.
+            resolve_preferred_nickname(&active_agents.used_agent_nicknames, preferred)
         } else {
             if names.is_empty() {
                 return None;
@@ -313,6 +339,12 @@ pub(crate) struct SpawnReservation {
 }
 
 impl SpawnReservation {
+    /// Reserve a nickname for the spawning agent. With `preferred = Some(name)` (a workflow
+    /// ordinal-derived preference) the name is reserved verbatim when free, or with a deterministic
+    /// `-2`/`-3`/… suffix when it collides with an in-use name — never a `rand` pool pick. With
+    /// `preferred = None` an unused pool name is chosen at random (the non-workflow default). The
+    /// resolved name is inserted into `used_agent_nicknames` before returning, so it cannot be handed
+    /// to a second concurrent reservation.
     pub(crate) fn reserve_agent_nickname_with_preference(
         &mut self,
         names: &[&str],
