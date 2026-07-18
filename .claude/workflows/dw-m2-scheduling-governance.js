@@ -93,7 +93,7 @@ const CHAINS = [
 ]
 
 const buildPrompt = (t, priorInChain) => `You are implementing one ticket of Dynamic Workflows milestone M2 (Scheduling & governance, GitHub epic #22) in the codex repo at ${REPO} (branch claude/dynamic-workflows-impl; workspace ${REPO}/codex-rs). M0 + M1 are committed. GROUND TRUTH to build on (read to confirm; do not re-derive):
-- Workflow globals gate on an explicit RuntimeState.workflow bool (threaded ExecuteRequest->RuntimeConfig); phase()/log()/agent()/parallel()/args/workflow.runId already install in the `if workflow {` block of code-mode/src/runtime/globals.rs.
+- Workflow globals gate on an explicit RuntimeState.workflow bool (threaded ExecuteRequest->RuntimeConfig); phase()/log()/agent()/parallel()/args/workflow.runId already install in the "if workflow" gated block of code-mode/src/runtime/globals.rs.
 - agent() flows RuntimeEvent::AgentCall -> cell_actor -> host delegate -> AgentControl::spawn_and_await_final_message, resolved by id; the bridge carries AgentSpawnOutcome{Completed(Value),Failed,Rejected(String)} where Rejected -> a JS throw (used already for AgentCapReached in CoreTurnHost::spawn_agent, core/src/tools/code_mode/delegate.rs).
 - WorkflowScheduler (core/src/tools/code_mode/scheduler.rs) is live in the spawn path (concurrency permit + lifetime CAP). RolloutBudget (core/src/rollout_budget.rs) already has pub spent()/remaining() and a resettable configure cell (committed wave 1).
 - The hermetic UAT harness lives in core/tests/suite/workflow_uat.rs (from #21) — reuse its mock-model + in-process-host pattern (disable Feature::CodeModeHost for the in-process lane).
