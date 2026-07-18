@@ -68,6 +68,7 @@ fn execute_request(source: &str) -> ExecuteRequest {
         source: source.to_string(),
         yield_time_ms: Some(1),
         max_output_tokens: None,
+        workflow: false,
     }
 }
 
@@ -961,5 +962,68 @@ async fn wait_reports_missing_cell_separately_from_runtime_results() {
             content_items: Vec::new(),
             error_text: Some("exec cell missing not found".to_string()),
         })
+    );
+}
+
+/// Source that opens with a valid workflow `meta` manifest and immediately calls
+/// the workflow-only `phase()` narrator global. Whether `phase` exists depends
+/// solely on the request's explicit `workflow` flag, never on this source shape.
+const META_SHAPED_PHASE_CALL: &str = concat!(
+    "export const meta = { name: 'demo', description: 'demo', phases: ['plan'] };\n",
+    "phase('plan');\n",
+);
+
+#[tokio::test]
+async fn workflow_mode_installs_narrator_globals_end_to_end() {
+    // With the explicit workflow flag set, the flag survives the full in-process
+    // service round-trip (ExecuteRequest -> CreateCellRequest -> ExecuteRequest ->
+    // runtime) and `phase()` is installed, so the body runs cleanly.
+    let service = InProcessCodeModeSession::new();
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: META_SHAPED_PHASE_CALL.to_string(),
+            yield_time_ms: None,
+            workflow: true,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    let RuntimeResponse::Result { error_text, .. } = response else {
+        panic!("expected terminal result, got {response:?}");
+    };
+    assert_eq!(
+        error_text, None,
+        "workflow mode must install `phase`; body should run cleanly"
+    );
+}
+
+#[tokio::test]
+async fn plain_exec_mode_omits_narrator_globals_end_to_end() {
+    // The identical meta-shaped source in plain-exec mode (workflow flag unset)
+    // must NOT gain `phase` — proving workflow-ness is the explicit invocation
+    // mode, not a property sniffed from the source.
+    let service = InProcessCodeModeSession::new();
+
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: META_SHAPED_PHASE_CALL.to_string(),
+            yield_time_ms: None,
+            workflow: false,
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    let RuntimeResponse::Result { error_text, .. } = response else {
+        panic!("expected terminal result, got {response:?}");
+    };
+    let error_text = error_text.unwrap_or_default();
+    assert!(
+        error_text.contains("phase is not defined"),
+        "plain exec must not install `phase`; got: {error_text}"
     );
 }

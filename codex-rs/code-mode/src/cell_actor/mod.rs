@@ -386,6 +386,11 @@ async fn run_cell<H: CellHost>(
                             );
                         }
                     }
+                    // Workflow narrator events. The protocol `Workflow*` event
+                    // cluster + app-server mapping are a later ticket, so the
+                    // cell actor deliberately ignores these for now (they are
+                    // still observable at the raw `RuntimeEvent` boundary).
+                    RuntimeEvent::Phase { .. } | RuntimeEvent::WorkflowLog { .. } => {}
                     RuntimeEvent::Notify { call_id, text } => {
                         spawn_notification(
                             &mut notification_tasks,

@@ -102,6 +102,7 @@ fn execute_request() -> WireExecuteRequest {
         source: "text('hello');".to_string(),
         yield_time_ms: Some(25),
         max_output_tokens: Some(100),
+        workflow: false,
     }
 }
 
@@ -604,6 +605,69 @@ fn execute_request_integer_bounds_are_enforced() {
         ..wire_request
     };
     assert!(ExecuteRequest::try_from(negative).is_err());
+}
+
+#[test]
+fn workflow_flag_survives_wire_round_trip() {
+    // The explicit workflow invocation mode must round-trip through the wire
+    // request in both directions so a remote code-mode host installs the
+    // workflow-only narrator globals for (and only for) workflow runs.
+    let workflow_wire = WireExecuteRequest {
+        workflow: true,
+        ..execute_request()
+    };
+    let workflow_domain = ExecuteRequest::try_from(workflow_wire.clone())
+        .expect("valid wire request converts to the domain");
+    assert!(workflow_domain.workflow, "workflow flag must decode");
+    assert_eq!(
+        WireExecuteRequest::try_from(workflow_domain).expect("domain converts back to the wire"),
+        workflow_wire,
+        "workflow flag must re-encode identically",
+    );
+}
+
+#[test]
+fn plain_exec_omits_workflow_key_on_the_wire() {
+    // A new client always constructs `workflow: false` for plain code-mode exec.
+    // The field MUST be skipped on serialization so the wire bytes are identical
+    // to the pre-`workflow` format; otherwise an older V1 host that pins
+    // `deny_unknown_fields` would reject every ordinary exec after a successful
+    // handshake.
+    let plain = execute_request();
+    assert!(!plain.workflow, "fixture is a plain exec request");
+    let encoded = serde_json::to_value(&plain).expect("serialize plain exec");
+    assert!(
+        encoded.get("workflow").is_none(),
+        "plain exec must not carry a `workflow` key, got: {encoded}"
+    );
+
+    // `workflow: true` (a new capability an old host is never asked for) is the
+    // only case that carries the field.
+    let workflow = WireExecuteRequest {
+        workflow: true,
+        ..execute_request()
+    };
+    let encoded = serde_json::to_value(&workflow).expect("serialize workflow exec");
+    assert_eq!(encoded.get("workflow"), Some(&json!(true)));
+}
+
+#[test]
+fn workflow_flag_defaults_to_false_for_legacy_payloads() {
+    // Peers that predate the `workflow` field never emit it; serde must default
+    // it to `false` so a legacy payload decodes as plain code-mode exec.
+    let legacy = json!({
+        "tool_call_id": "call-1",
+        "enabled_tools": [],
+        "source": "text('hi');",
+        "yield_time_ms": null,
+        "max_output_tokens": null,
+    });
+    let wire: WireExecuteRequest =
+        serde_json::from_value(legacy).expect("legacy payload without `workflow` decodes");
+    assert!(
+        !wire.workflow,
+        "missing `workflow` must default to plain exec"
+    );
 }
 
 #[test]

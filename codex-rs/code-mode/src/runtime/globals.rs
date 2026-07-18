@@ -4,7 +4,9 @@ use super::callbacks::exit_callback;
 use super::callbacks::generated_image_callback;
 use super::callbacks::image_callback;
 use super::callbacks::load_callback;
+use super::callbacks::log_callback;
 use super::callbacks::notify_callback;
+use super::callbacks::phase_callback;
 use super::callbacks::set_timeout_callback;
 use super::callbacks::store_callback;
 use super::callbacks::text_callback;
@@ -43,6 +45,20 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "notify", notify.into())?;
     set_global(scope, global, "yield_control", yield_control.into())?;
     set_global(scope, global, "exit", exit.into())?;
+
+    // Workflow-only narrator/grouping globals. These are gated on the cell being
+    // a workflow run so `phase`/`log` never leak into plain code-mode exec
+    // sessions (which have no `meta` manifest and must not see these names).
+    let workflow = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.workflow)
+        .unwrap_or(false);
+    if workflow {
+        let phase = helper_function(scope, "phase", phase_callback)?;
+        let log = helper_function(scope, "log", log_callback)?;
+        set_global(scope, global, "phase", phase.into())?;
+        set_global(scope, global, "log", log.into())?;
+    }
     Ok(())
 }
 

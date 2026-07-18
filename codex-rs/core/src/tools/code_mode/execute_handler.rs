@@ -49,6 +49,9 @@ impl CodeModeExecuteHandler {
                 source: args.code.clone(),
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
+                // Plain code-mode exec is never workflow mode: the workflow-only
+                // narrator globals stay uninstalled for model-authored programs.
+                workflow: false,
             })
             .await
             .map_err(FunctionCallError::RespondToModel)?;

@@ -19,6 +19,25 @@ pub struct ExecuteRequest {
     pub source: String,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
+    /// Explicit invocation mode: `true` only when the request originates from the
+    /// workflow handler, which authorizes the workflow-only narrator globals
+    /// (`phase`/`log`, and future `agent`/`args`/`budget`). Plain code-mode
+    /// `exec` never sets this, so a program whose source merely *looks* like a
+    /// workflow (e.g. contains `export const meta = { ... }`) does not gain the
+    /// workflow globals. Serde-defaulted to `false` for backward compatibility
+    /// with older wire payloads that predate the field. Additionally skipped when
+    /// `false` so a plain code-mode exec serializes byte-identically to the
+    /// pre-`workflow` wire format — critical for new-client -> old-host V1 hosts
+    /// that use `deny_unknown_fields` and would otherwise reject an unknown key.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub workflow: bool,
+}
+
+/// Serde predicate: skip a `bool` field when it is `false`. Takes `&bool`
+/// because `skip_serializing_if` requires a `fn(&T) -> bool` signature.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

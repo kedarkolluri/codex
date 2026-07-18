@@ -241,11 +241,16 @@ pub(super) fn load_callback(
     retval.set(value);
 }
 
-pub(super) fn notify_callback(
+/// Shared text extraction for the narrator-style globals (`notify`, `log`,
+/// `phase`). Serializes the first argument to text, rejecting empty input with
+/// an actionable, per-helper error. Returns `None` after throwing so callers can
+/// simply `return`. Centralizing this keeps `log()`/`phase()` as thin aliases
+/// over the existing `notify` plumbing rather than duplicating it.
+fn narrator_text(
     scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments,
-    mut retval: v8::ReturnValue<v8::Value>,
-) {
+    args: &v8::FunctionCallbackArguments,
+    helper: &str,
+) -> Option<String> {
     let value = if args.length() == 0 {
         v8::undefined(scope).into()
     } else {
@@ -255,18 +260,62 @@ pub(super) fn notify_callback(
         Ok(text) => text,
         Err(error_text) => {
             throw_type_error(scope, &error_text);
-            return;
+            return None;
         }
     };
     if text.trim().is_empty() {
-        throw_type_error(scope, "notify expects non-empty text");
-        return;
+        throw_type_error(scope, &format!("{helper} expects non-empty text"));
+        return None;
     }
+    Some(text)
+}
+
+pub(super) fn notify_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let Some(text) = narrator_text(scope, &args, "notify") else {
+        return;
+    };
     if let Some(state) = scope.get_slot::<RuntimeState>() {
         let _ = state.event_tx.send(RuntimeEvent::Notify {
             call_id: state.tool_call_id.clone(),
             text,
         });
+    }
+    retval.set(v8::undefined(scope).into());
+}
+
+/// Workflow `log(msg)` global — a thin alias over the `notify` text path that
+/// emits a distinct [`RuntimeEvent::WorkflowLog`]. Installed only for workflow
+/// runs (see `globals::install_globals`).
+pub(super) fn log_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let Some(message) = narrator_text(scope, &args, "log") else {
+        return;
+    };
+    if let Some(state) = scope.get_slot::<RuntimeState>() {
+        let _ = state.event_tx.send(RuntimeEvent::WorkflowLog { message });
+    }
+    retval.set(v8::undefined(scope).into());
+}
+
+/// Workflow `phase(title)` global — emits a [`RuntimeEvent::Phase`] progress
+/// marker. Installed only for workflow runs (see `globals::install_globals`).
+pub(super) fn phase_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let Some(title) = narrator_text(scope, &args, "phase") else {
+        return;
+    };
+    if let Some(state) = scope.get_slot::<RuntimeState>() {
+        let _ = state.event_tx.send(RuntimeEvent::Phase { title });
     }
     retval.set(v8::undefined(scope).into());
 }

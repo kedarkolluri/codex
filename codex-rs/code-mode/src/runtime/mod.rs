@@ -63,6 +63,22 @@ pub(crate) enum RuntimeEvent {
         call_id: String,
         text: String,
     },
+    /// A workflow `phase(title)` narrator/grouping marker. Emitted only for
+    /// workflow runs; the protocol `WorkflowPhaseBegin/End` mapping + journaling
+    /// that read `title` are later tickets, so the field is not yet consumed by
+    /// non-test code.
+    Phase {
+        #[allow(dead_code, reason = "consumed by the later protocol/journal tickets")]
+        title: String,
+    },
+    /// A workflow `log(msg)` narrator line. Thin alias over the `Notify` path
+    /// (same text plumbing, distinct event). Emitted only for workflow runs; the
+    /// protocol `WorkflowLog` mapping + journaling that read `message` are later
+    /// tickets, so the field is not yet consumed by non-test code.
+    WorkflowLog {
+        #[allow(dead_code, reason = "consumed by the later protocol/journal tickets")]
+        message: String,
+    },
     Result {
         stored_value_writes: HashMap<String, JsonValue>,
         error_text: Option<String>,
@@ -100,6 +116,7 @@ pub(crate) fn spawn_runtime(
         enabled_tools,
         source: request.source,
         stored_values,
+        workflow: request.workflow,
     };
 
     spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
@@ -141,6 +158,8 @@ struct RuntimeConfig {
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
     stored_values: HashMap<String, JsonValue>,
+    /// Explicit workflow invocation mode carried from the `ExecuteRequest`.
+    workflow: bool,
 }
 
 pub(super) struct RuntimeState {
@@ -155,6 +174,12 @@ pub(super) struct RuntimeState {
     tool_call_id: String,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
     exit_requested: bool,
+    /// True when this cell is running a workflow script. Set from the explicit
+    /// `ExecuteRequest::workflow` invocation mode (never inferred from source),
+    /// so it is `true` only for the workflow handler path. Gates the workflow
+    /// narrator globals (`phase`/`log`) so they never leak into plain code-mode
+    /// exec sessions.
+    workflow: bool,
 }
 
 pub(super) enum CompletionState {
@@ -185,6 +210,13 @@ fn run_runtime(
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
+    // Workflow-ness is an explicit invocation mode threaded from the workflow
+    // handler through `ExecuteRequest::workflow` (§3), never inferred from the
+    // source. A plain code-mode `exec` whose source merely resembles a workflow
+    // (e.g. it contains `export const meta = { ... }`) therefore never gains the
+    // workflow-only narrator globals; only the workflow handler sets this flag.
+    let workflow = config.workflow;
+
     scope.set_slot(RuntimeState {
         event_tx: event_tx.clone(),
         pending_tool_calls: HashMap::new(),
@@ -197,6 +229,7 @@ fn run_runtime(
         tool_call_id: config.tool_call_id,
         runtime_command_tx,
         exit_requested: false,
+        workflow,
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
@@ -351,6 +384,17 @@ mod tests {
             source: source.to_string(),
             yield_time_ms: Some(1),
             max_output_tokens: None,
+            workflow: false,
+        }
+    }
+
+    /// A workflow-mode request: identical plumbing to [`execute_request`] but with
+    /// the explicit `workflow` invocation flag set, which is the only thing that
+    /// authorizes the `phase`/`log` narrator globals.
+    fn workflow_execute_request(source: &str) -> ExecuteRequest {
+        ExecuteRequest {
+            workflow: true,
+            ..execute_request(source)
         }
     }
 
@@ -497,5 +541,138 @@ await new Promise(() => {});
         runtime_control_tx
             .send(RuntimeControlCommand::Terminate)
             .unwrap();
+    }
+
+    /// Drain events until the runtime reports its terminal `Result`, returning
+    /// the ordered events observed (including the final `Result`).
+    async fn drain_to_result(
+        event_rx: &mut mpsc::UnboundedReceiver<RuntimeEvent>,
+    ) -> Vec<RuntimeEvent> {
+        let mut events = Vec::new();
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("runtime event timeout")
+                .expect("runtime event channel closed");
+            let is_result = matches!(event, RuntimeEvent::Result { .. });
+            events.push(event);
+            if is_result {
+                return events;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_phase_and_log_emit_events_in_call_order() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo', phases: ['plan'] };\n",
+            "phase('plan');\n",
+            "log('hello');\n",
+            "phase('build');\n",
+        );
+        let (_runtime_tx, _runtime_control_tx, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        let narrator: Vec<&RuntimeEvent> = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    RuntimeEvent::Phase { .. } | RuntimeEvent::WorkflowLog { .. }
+                )
+            })
+            .collect();
+
+        assert_eq!(narrator.len(), 3, "expected phase/log events: {events:?}");
+        assert!(matches!(narrator[0], RuntimeEvent::Phase { title } if title == "plan"));
+        assert!(matches!(narrator[1], RuntimeEvent::WorkflowLog { message } if message == "hello"));
+        assert!(matches!(narrator[2], RuntimeEvent::Phase { title } if title == "build"));
+
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        assert!(error_text.is_none(), "workflow body must run cleanly");
+    }
+
+    #[tokio::test]
+    async fn plain_exec_does_not_install_workflow_globals() {
+        // A plain code-mode program must NOT see `phase`/`log` — calling them
+        // throws a `ReferenceError`, surfaced as a runtime error. Crucially the
+        // source here is *meta-shaped* (it opens with a valid `export const meta`
+        // manifest), yet because the request is NOT in workflow mode the narrator
+        // globals stay uninstalled: workflow-ness is the explicit invocation flag,
+        // never the source shape.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo', phases: ['plan'] };\n",
+            "phase('x');\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_runtime_tx, _runtime_control_tx, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::Phase { .. })),
+            "plain exec must not emit workflow phase events: {events:?}"
+        );
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("phase is not defined"),
+            "expected ReferenceError for missing `phase` global, got: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_log_reuses_notify_text_validation() {
+        // `log()` shares `notify`'s text plumbing: empty input is rejected with a
+        // `log`-specific message rather than emitting an event.
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "log('   ');\n",
+        );
+        let (_runtime_tx, _runtime_control_tx, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::WorkflowLog { .. })),
+            "empty log must not emit an event: {events:?}"
+        );
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("log expects non-empty text"),
+            "expected the shared narrator validation error, got: {error_text}"
+        );
     }
 }

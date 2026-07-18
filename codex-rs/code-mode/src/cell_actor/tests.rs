@@ -127,6 +127,7 @@ fn spawn_cell_actor_harness_with_host_and_failure_handler<H: CellHost>(
             source: "await new Promise(() => {});".to_string(),
             yield_time_ms: None,
             max_output_tokens: None,
+            workflow: false,
         },
         runtime_event_tx,
         PendingRuntimeMode::PauseUntilResumed,

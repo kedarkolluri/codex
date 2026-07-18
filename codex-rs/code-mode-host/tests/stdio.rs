@@ -211,6 +211,7 @@ fn execute_request(source: &str) -> ExecuteRequest {
         source: source.to_string(),
         yield_time_ms: None,
         max_output_tokens: None,
+        workflow: false,
     }
 }
 

@@ -79,6 +79,10 @@ pub(crate) struct CreateCellRequest {
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: Vec<ToolDefinition>,
     pub(crate) source: String,
+    /// Explicit workflow invocation mode threaded from the workflow handler
+    /// through the protocol `ExecuteRequest`. Gates the workflow-only narrator
+    /// globals; see [`codex_code_mode_protocol::ExecuteRequest::workflow`].
+    pub(crate) workflow: bool,
 }
 
 /// Tool metadata exposed to code running inside a cell.

@@ -320,6 +320,7 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             })
             .collect(),
         source: request.source,
+        workflow: request.workflow,
     }
 }
 
