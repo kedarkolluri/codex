@@ -3,6 +3,7 @@ pub mod host;
 mod response;
 mod runtime;
 mod session;
+mod workflow_meta;
 
 pub use description::CODE_MODE_PRAGMA_PREFIX;
 pub use description::CodeModeToolKind;
@@ -41,6 +42,8 @@ pub use session::CodeModeSessionResultFuture;
 pub use session::NotificationFuture;
 pub use session::StartedCell;
 pub use session::ToolInvocationFuture;
+pub use workflow_meta::ParsedWorkflowMeta;
+pub use workflow_meta::parse_workflow_meta;
 
 pub const PUBLIC_TOOL_NAME: &str = "exec";
 pub const WAIT_TOOL_NAME: &str = "wait";
