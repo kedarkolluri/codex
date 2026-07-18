@@ -18,6 +18,11 @@ struct SpawnAgentThreadInheritance {
 enum SpawnInitialInput {
     UserInput(Vec<UserInput>),
     InterAgentCommunication(InterAgentCommunication, AgentCommunicationContext),
+    /// Register the thread through the full spawn path (registration, `notify_thread_created`,
+    /// spawn-edge persistence) but submit **no** initial turn. The caller drives the first turn
+    /// itself — e.g. a spawn-and-await supervisor subscribes to the child's event tap and *then*
+    /// submits the prompt, so the turn's terminal event cannot fire before it is observing.
+    Deferred,
 }
 
 fn default_agent_nickname_list() -> Vec<&'static str> {
@@ -124,6 +129,27 @@ impl AgentControl {
         Box::pin(self.spawn_agent_internal(
             config,
             SpawnInitialInput::UserInput(initial_input),
+            session_source,
+            options,
+        ))
+        .await
+    }
+
+    /// Spawn an agent thread through the **registering** path but defer the first turn.
+    ///
+    /// Fires the same side effects as [`AgentControl::spawn_agent_with_metadata`]
+    /// (`notify_thread_created`, spawn-edge persistence, registration in `thread_manager.threads`)
+    /// yet submits no `Op::UserInput`, so the caller can subscribe to the child's event tap before
+    /// driving the first turn without racing its terminal event.
+    pub(crate) async fn spawn_agent_deferred_input(
+        &self,
+        config: Config,
+        session_source: Option<SessionSource>,
+        options: SpawnAgentOptions,
+    ) -> CodexResult<LiveAgent> {
+        Box::pin(self.spawn_agent_internal(
+            config,
+            SpawnInitialInput::Deferred,
             session_source,
             options,
         ))
@@ -403,6 +429,8 @@ impl AgentControl {
                 )
                 .await?;
             }
+            // Caller drives the first turn; nothing to submit here.
+            SpawnInitialInput::Deferred => {}
         }
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata

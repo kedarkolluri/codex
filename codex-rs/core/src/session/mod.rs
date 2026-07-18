@@ -161,6 +161,7 @@ use rmcp::model::RequestId;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -823,6 +824,15 @@ impl Codex {
             .await
             .map_err(|_| CodexErr::InternalAgentDied)?;
         Ok(event)
+    }
+
+    /// Subscribe to a non-competing, lag-tolerant tap of this thread's delivered events.
+    ///
+    /// Prefer this over [`Codex::next_event`] when you need to *observe* events without consuming
+    /// them from the single MPMC `rx_event` receiver the app-server owns. See
+    /// [`Session::subscribe_events`].
+    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.session.subscribe_events()
     }
 
     pub async fn steer_input(
@@ -1979,9 +1989,30 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        // Fan the event out to non-competing observers (e.g. a subagent spawn-and-await
+        // supervisor) *before* handing ownership to the MPMC `tx_event` receiver. Each observer
+        // gets its own clone, so this cannot steal events from `tx_event`'s single consumer.
+        //
+        // The common case is zero observers (nothing is spawn-and-awaiting this session), so guard
+        // on `receiver_count()` before cloning: cloning every event into a tap no one reads would
+        // be a per-event allocation on *every* session. When observers do exist the behavior is
+        // identical to an unconditional `send` (a send with no receivers is a no-op error anyway).
+        if self.event_observers.receiver_count() > 0 {
+            let _ = self.event_observers.send(event.clone());
+        }
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }
+    }
+
+    /// Subscribe to a lag-tolerant, non-competing tap of every event delivered on this session.
+    ///
+    /// Unlike [`Codex::next_event`] (which draws from the MPMC `tx_event` channel and therefore
+    /// competes with the app-server listener for each event), every subscriber here observes a
+    /// clone of each event. Subscribe *before* triggering the turn whose terminal event you need,
+    /// since a `broadcast::Receiver` only sees events sent after `subscribe()`.
+    pub(crate) fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+        self.event_observers.subscribe()
     }
 
     pub(crate) async fn emit_turn_item_started(&self, turn_context: &TurnContext, item: &TurnItem) {
