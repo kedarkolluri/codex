@@ -18,6 +18,7 @@ use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::enabled_tool_metadata;
 use codex_protocol::ToolName;
+use codex_workflow_journal::AgentCallLine;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
@@ -83,6 +84,21 @@ pub(crate) enum RuntimeEvent {
         ordinal: u64,
         prompt: String,
         opts: AgentCallOpts,
+    },
+    /// A prefix-replay cache hit for a resumed run (§7 resume algorithm step 3).
+    /// `agent_callback` stamped the same source-order `ordinal` as a live call,
+    /// but the recomputed `(prompt, opts)` key matched the journaled entry and
+    /// its `status` was `completed`, so the promise is served from the journaled
+    /// `return` WITHOUT spawning a subagent. The isolate keeps a resolver in
+    /// `pending_tool_calls` under `id`; the cell actor re-appends `entry` to the
+    /// NEW run's journal and re-adds `entry.tokens_spent` to the shared budget
+    /// (`CellHost::replay_agent`) so `spent()`/`remaining()` and the ceiling throw
+    /// track the original run, then resolves the promise via the same
+    /// `RuntimeCommand::ToolResponse` resolve path a live agent settles through.
+    /// Emitted only for workflow runs, and only while replay is active.
+    AgentReplay {
+        id: String,
+        entry: Box<AgentCallLine>,
     },
     /// A workflow `phase(title)` narrator/grouping marker. Emitted only for
     /// workflow runs; the protocol `WorkflowPhaseBegin/End` mapping + journaling
@@ -169,6 +185,7 @@ pub(crate) fn spawn_runtime(
         pending_mode,
         task_failure_handler,
         None,
+        None,
     )
 }
 
@@ -186,6 +203,7 @@ pub(crate) fn spawn_runtime_with_budget(
     pending_mode: PendingRuntimeMode,
     task_failure_handler: Option<TaskFailureHandler>,
     budget: Option<Arc<dyn WorkflowBudgetHandle>>,
+    replay_entries: Option<Vec<AgentCallLine>>,
 ) -> Result<
     (
         std_mpsc::Sender<RuntimeCommand>,
@@ -214,6 +232,7 @@ pub(crate) fn spawn_runtime_with_budget(
         args: request.args,
         run_id: request.run_id,
         budget,
+        replay_entries,
     };
 
     spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
@@ -267,6 +286,164 @@ struct RuntimeConfig {
     /// Threaded in-process (never over the `ExecuteRequest` wire); `None` for
     /// plain code-mode exec and for workflow runs with no budget configured.
     budget: Option<Arc<dyn WorkflowBudgetHandle>>,
+    /// Prior-run journal `agent_call` entries seeding prefix-replay on a resumed
+    /// run (§7 resume algorithm step 2). `None` for a fresh run — the common
+    /// case — which leaves [`ReplayState::fresh`] installed so fan-out behaves
+    /// exactly as before. `Some(entries)` arms replay with those entries (an
+    /// empty vec is a valid resume of a run that made no `agent()` calls). The
+    /// loader/validator that produces the entries is `P3-resume-entry`; this
+    /// field is the seam it drives.
+    replay_entries: Option<Vec<AgentCallLine>>,
+}
+
+/// Prefix-replay scaffolding for a resumed workflow run (§7 "Resume algorithm").
+///
+/// On `resumeFromRunId`, the prior run's `journal.jsonl` is loaded tail-first
+/// into `entries[0..M]` (the `agent_call` lines, keyed by their invocation
+/// ordinal) and this state is seeded [`ReplayState::seed`] with `active = true`.
+/// During the deterministic prefix, `agent_callback` (via `P3-resume-prefix-loop`)
+/// consults [`ReplayState::entry`] at each issued ordinal: on a matching
+/// `(prompt, opts)` key it resolves the promise from the journaled `return` and
+/// re-adds the journaled `tokens_spent` through [`ReplayState::add_replay_spent`]
+/// so `spent()`/`remaining()` and the ceiling throw land at the identical
+/// ordinal. At the first divergence (missing entry, key mismatch, or a
+/// non-`completed` status) it calls [`ReplayState::disable`], after which replay
+/// is off **permanently** for the run — there is deliberately no re-enable path,
+/// which is the "first divergence goes live and never returns to replay"
+/// guarantee. A fresh (non-resume) run uses [`ReplayState::fresh`]: no entries,
+/// `active = false`, so it never diverts from live dispatch.
+///
+/// This ticket (`P3-runtime-replay-state`) provides only the state + init +
+/// accessors; the replay decision logic that drives them is `P3-resume-prefix-loop`.
+#[derive(Debug, Default)]
+pub(super) struct ReplayState {
+    /// Prior journal `agent_call` entries indexed by their invocation ordinal
+    /// (§7 "invocation ordinal / cache key"). Empty for a fresh run.
+    entries: HashMap<u64, AgentCallLine>,
+    /// Prefix length `M` — the count of journaled `agent_call` entries the
+    /// resume loop may replay before it must go live. `0` for a fresh run.
+    prefix_len: u64,
+    /// Replay-only budget accumulator: the sum of journaled `tokens_spent`
+    /// re-added while serving the prefix from cache (§7 resume step 3 /
+    /// §8 "Resume determinism of budget"), so the resumed run's spend curve is
+    /// byte-identical to the original's. Never advanced on a fresh run.
+    replay_spent: i64,
+    /// `true` only while the run is still inside the unchanged prefix. Seeded
+    /// `true` on resume, latched `false` at the first divergence and never
+    /// re-enabled; always `false` for a fresh run.
+    active: bool,
+}
+
+impl ReplayState {
+    /// State for a fresh (non-resume) run: no entries, replay inactive. Fan-out
+    /// behaves exactly as before — `active = false` means the resume loop never
+    /// diverts from live dispatch.
+    pub(super) fn fresh() -> Self {
+        Self::default()
+    }
+
+    /// Seed from a loaded prior journal: index the `agent_call` `entries` by
+    /// their invocation ordinal, set the prefix length `M` to the number of
+    /// entries, and arm replay (`active = true`). The replay budget accumulator
+    /// starts at `0` and is grown per replayed entry via
+    /// [`ReplayState::add_replay_spent`].
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "seed path is driven by the later P3-resume-entry ticket"
+        )
+    )]
+    pub(super) fn seed(entries: Vec<AgentCallLine>) -> Self {
+        let prefix_len = entries.len() as u64;
+        let entries = entries
+            .into_iter()
+            .map(|entry| (entry.ordinal, entry))
+            .collect();
+        Self {
+            entries,
+            prefix_len,
+            replay_spent: 0,
+            active: true,
+        }
+    }
+
+    /// Whether prefix-replay is still active. Once [`disable`](Self::disable)
+    /// has latched this `false`, it stays `false` for the rest of the run.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the later P3-resume-prefix-loop ticket"
+        )
+    )]
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Prefix length `M` (the count of replayable journaled `agent_call`
+    /// entries). The resume loop replays only ordinals `i < M`.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the later P3-resume-prefix-loop ticket"
+        )
+    )]
+    pub(super) fn prefix_len(&self) -> u64 {
+        self.prefix_len
+    }
+
+    /// The journaled `agent_call` entry at `ordinal`, if one was recorded. The
+    /// resume loop matches its `key` against the freshly computed `(prompt,
+    /// opts)` key to decide replay-vs-divergence.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the later P3-resume-prefix-loop ticket"
+        )
+    )]
+    pub(super) fn entry(&self, ordinal: u64) -> Option<&AgentCallLine> {
+        self.entries.get(&ordinal)
+    }
+
+    /// Running total of journaled `tokens_spent` re-added during prefix replay.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "consumed by the later P3-resume-prefix-loop ticket"
+        )
+    )]
+    pub(super) fn replay_spent(&self) -> i64 {
+        self.replay_spent
+    }
+
+    /// Re-add a replayed entry's journaled `tokens_spent` to the replay-only
+    /// accumulator (§7 resume step 3). Saturating so a corrupt journal can never
+    /// panic the run. No-op once replay has been disabled — divergent (live)
+    /// calls meter through the real budget, not this accumulator.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "driven by the later P3-resume-prefix-loop ticket")
+    )]
+    pub(super) fn add_replay_spent(&mut self, tokens: i64) {
+        if self.active {
+            self.replay_spent = self.replay_spent.saturating_add(tokens);
+        }
+    }
+
+    /// Latch replay off at the first divergence. Idempotent and one-way: there
+    /// is no path back to `active = true` within a run, which is the "first
+    /// changed/new call and everything after runs live" guarantee (§7).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "driven by the later P3-resume-prefix-loop ticket")
+    )]
+    pub(super) fn disable(&mut self) {
+        self.active = false;
+    }
 }
 
 pub(super) struct RuntimeState {
@@ -318,6 +495,32 @@ pub(super) struct RuntimeState {
     /// workflow that awaits subagents observes the updated spend. Only populated
     /// (and only installed) for workflow runs.
     budget: Option<Arc<dyn WorkflowBudgetHandle>>,
+    /// Prefix-replay scaffolding for a resumed run (§7). Seeded with the prior
+    /// journal's `agent_call` entries and `active = true` on resume; left in the
+    /// [`ReplayState::fresh`] (empty, inactive) shape for a fresh run so fan-out
+    /// behaviour is unchanged. Driven by the later `P3-resume-prefix-loop` ticket
+    /// through the [`ReplayState`] accessors; unread by non-test code today, like
+    /// `next_agent_ordinal`.
+    replay: ReplayState,
+}
+
+impl RuntimeState {
+    /// Shared read view of the prefix-replay scaffolding (§7). The resume loop
+    /// (`P3-resume-prefix-loop`) consults this at each issued `agent()` ordinal.
+    #[allow(
+        dead_code,
+        reason = "consumed by the later P3-resume-prefix-loop ticket"
+    )]
+    pub(super) fn replay(&self) -> &ReplayState {
+        &self.replay
+    }
+
+    /// Mutable view of the prefix-replay scaffolding, for the resume loop to
+    /// re-add replayed `tokens_spent` and latch replay off at first divergence.
+    #[allow(dead_code, reason = "driven by the later P3-resume-prefix-loop ticket")]
+    pub(super) fn replay_mut(&mut self) -> &mut ReplayState {
+        &mut self.replay
+    }
 }
 
 pub(super) enum CompletionState {
@@ -373,6 +576,16 @@ fn run_runtime(
         args: config.args,
         run_id: config.run_id,
         budget: config.budget,
+        // Prefix-replay scaffolding (§7 resume step 2): a resumed run seeds the
+        // prior journal's `agent_call` entries and arms replay; a fresh run (the
+        // common case, `None`) installs the empty/inactive `fresh` state so
+        // fan-out behaves exactly as before. The loader that produces the entries
+        // is `P3-resume-entry`; the replay DECISION driven off this state is
+        // `agent_callback` below.
+        replay: match config.replay_entries {
+            Some(entries) => ReplayState::seed(entries),
+            None => ReplayState::fresh(),
+        },
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
@@ -1067,6 +1280,7 @@ await new Promise(() => {});
             PendingRuntimeMode::Continue,
             /*task_failure_handler*/ None,
             Some(budget as Arc<dyn WorkflowBudgetHandle>),
+            /*replay_entries*/ None,
         )
         .unwrap();
 
@@ -1101,6 +1315,7 @@ await new Promise(() => {});
             PendingRuntimeMode::Continue,
             /*task_failure_handler*/ None,
             Some(budget as Arc<dyn WorkflowBudgetHandle>),
+            /*replay_entries*/ None,
         )
         .unwrap();
 
@@ -1135,6 +1350,7 @@ await new Promise(() => {});
             PendingRuntimeMode::Continue,
             /*task_failure_handler*/ None,
             Some(Arc::clone(&budget) as Arc<dyn WorkflowBudgetHandle>),
+            /*replay_entries*/ None,
         )
         .unwrap();
 
@@ -1190,6 +1406,7 @@ await new Promise(() => {});
             PendingRuntimeMode::Continue,
             /*task_failure_handler*/ None,
             Some(budget as Arc<dyn WorkflowBudgetHandle>),
+            /*replay_entries*/ None,
         )
         .unwrap();
 
@@ -1278,6 +1495,263 @@ await new Promise(() => {});
         text_outputs(&events)
     }
 
+    /// Drive a workflow-mode source carrying invocation `args` (and a fixed
+    /// `run_id`) and return the ordered `text(...)` outputs, asserting the
+    /// terminal `Result` carried no error. Used by the determinism-prelude
+    /// seeded-PRNG tests, which opt in via `args.seed`.
+    async fn run_workflow_text_outputs_with_args(
+        source: &str,
+        args: serde_json::Value,
+    ) -> Vec<String> {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request_with_args(source, args, "run-determinism"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        text_outputs(&events)
+    }
+
+    #[tokio::test]
+    async fn workflow_isolate_deletes_weakref_and_finalization_registry() {
+        // Determinism harden (§7 / R1): `WeakRef` and `FinalizationRegistry` are
+        // default-present in bare V8 but expose GC timing, whose ordering is
+        // nondeterministic and would diverge on resume. In a workflow isolate both
+        // must be stripped so the script cannot even reference them.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text('WeakRef=' + typeof WeakRef);\n",
+            "text('FinalizationRegistry=' + typeof FinalizationRegistry);\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "WeakRef=undefined".to_string(),
+                "FinalizationRegistry=undefined".to_string(),
+            ],
+            "workflow isolate must delete GC-order-nondeterministic globals",
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_isolate_removes_wall_clock_timers() {
+        // Determinism harden (§7 / R1): wall-clock timers make the command loop
+        // interleave `TimeoutFired` with `ToolResponse` in arrival order, a
+        // nondeterminism the `Date`/`Math` shims cannot fix. The workflow isolate
+        // installs none of `setTimeout`/`setInterval`/`clearTimeout`/`clearInterval`
+        // (and therefore never spawns the OS timer thread), so all four are
+        // `undefined`; workflows orchestrate via `await agent()`/`parallel()`/
+        // `pipeline()` instead.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text('setTimeout=' + typeof setTimeout);\n",
+            "text('setInterval=' + typeof setInterval);\n",
+            "text('clearTimeout=' + typeof clearTimeout);\n",
+            "text('clearInterval=' + typeof clearInterval);\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "setTimeout=undefined".to_string(),
+                "setInterval=undefined".to_string(),
+                "clearTimeout=undefined".to_string(),
+                "clearInterval=undefined".to_string(),
+            ],
+            "workflow isolate must not install any wall-clock timer global",
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_exec_keeps_timers_and_weakref() {
+        // Regression guard: the determinism harden is gated STRICTLY to workflow
+        // runs. A plain code-mode exec is unaffected — `setTimeout`/`clearTimeout`
+        // remain installed (`function`) and `WeakRef`/`FinalizationRegistry` remain
+        // the default-present V8 constructors, exactly as before this ticket.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text('setTimeout=' + typeof setTimeout);\n",
+            "text('clearTimeout=' + typeof clearTimeout);\n",
+            "text('WeakRef=' + typeof WeakRef);\n",
+            "text('FinalizationRegistry=' + typeof FinalizationRegistry);\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec![
+                "setTimeout=function".to_string(),
+                "clearTimeout=function".to_string(),
+                "WeakRef=function".to_string(),
+                "FinalizationRegistry=function".to_string(),
+            ],
+            "plain code-mode exec must keep timers and WeakRef/FinalizationRegistry",
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_determinism_prelude_throws_on_wall_clock_and_random() {
+        // Acceptance (§7 / §2 / R1): inside a workflow isolate the frozen
+        // determinism prelude makes every wall-clock/entropy source throw —
+        // `Date.now()`, argless `new Date()`, `Date()` called as a plain
+        // function, and (with no `args.seed`) `Math.random()`.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const threw = (fn) => { try { fn(); return 'ok'; } catch (e) { return 'threw'; } };\n",
+            "text('Date.now=' + threw(() => Date.now()));\n",
+            "text('new Date()=' + threw(() => new Date()));\n",
+            "text('Date()=' + threw(() => Date()));\n",
+            "text('Math.random=' + threw(() => Math.random()));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "Date.now=threw".to_string(),
+                "new Date()=threw".to_string(),
+                "Date()=threw".to_string(),
+                "Math.random=threw".to_string(),
+            ],
+            "workflow determinism prelude must throw on Date.now/argless Date/Math.random",
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_determinism_prelude_preserves_argful_date_and_parse() {
+        // Acceptance (§7): explicit-arg construction and parsing survive so a
+        // script can still work with timestamps handed in via `args`. `new
+        // Date(x)`, `Date.parse(x)`, and `Date.UTC(...)` all behave normally, and
+        // instances remain `instanceof Date`.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text('epoch=' + new Date(0).getTime());\n",
+            "text('iso=' + new Date(0).toISOString());\n",
+            "text('parse=' + Date.parse('1970-01-01T00:00:00.000Z'));\n",
+            "text('utc=' + Date.UTC(1970, 0, 1));\n",
+            "text('isDate=' + (new Date(0) instanceof Date));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "epoch=0".to_string(),
+                "iso=1970-01-01T00:00:00.000Z".to_string(),
+                "parse=0".to_string(),
+                "utc=0".to_string(),
+                "isDate=true".to_string(),
+            ],
+            "arg'd Date construction/parse must survive the determinism prelude",
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_determinism_prelude_shims_are_frozen() {
+        // Acceptance (§7): the prelude object graph is frozen — a (strict-mode)
+        // module can neither reassign nor delete the shims, and recovering the
+        // constructor via `(new Date(0)).constructor` yields the wrapper (whose
+        // `now()` throws), never the live wall-clock `Date`.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const threw = (fn) => { try { fn(); return 'ok'; } catch (e) { return 'threw'; } };\n",
+            "text('reassignRandom=' + threw(() => { Math.random = () => 0.5; }));\n",
+            "text('deleteNow=' + threw(() => { delete Date.now; }));\n",
+            "text('reassignDate=' + threw(() => { Date = function () {}; }));\n",
+            "text('recoverCtor=' + threw(() => { (new Date(0)).constructor.now(); }));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "reassignRandom=threw".to_string(),
+                "deleteNow=threw".to_string(),
+                "reassignDate=threw".to_string(),
+                "recoverCtor=threw".to_string(),
+            ],
+            "determinism shims must be non-writable/non-deletable and unrecoverable",
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_determinism_prelude_seeded_prng_is_deterministic() {
+        // Acceptance (§7): with an explicit `args.seed`, `Math.random` is a
+        // deterministic splitmix64 PRNG — two runs with the same seed produce the
+        // identical sequence (in [0, 1)), and a different seed produces a
+        // different sequence.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const seq = [];\n",
+            "for (let i = 0; i < 4; i++) seq.push(Math.random());\n",
+            "text(JSON.stringify(seq));\n",
+            "text('inRange=' + seq.every((x) => x >= 0 && x < 1));\n",
+        );
+        let seed_42_a =
+            run_workflow_text_outputs_with_args(source, serde_json::json!({ "seed": 42 })).await;
+        let seed_42_b =
+            run_workflow_text_outputs_with_args(source, serde_json::json!({ "seed": 42 })).await;
+        let seed_43 =
+            run_workflow_text_outputs_with_args(source, serde_json::json!({ "seed": 43 })).await;
+
+        assert_eq!(
+            seed_42_a, seed_42_b,
+            "same-seed runs must produce an identical PRNG sequence",
+        );
+        assert_eq!(
+            seed_42_a.get(1).map(String::as_str),
+            Some("inRange=true"),
+            "seeded PRNG values must land in [0, 1)",
+        );
+        assert_ne!(
+            seed_42_a.first(),
+            seed_43.first(),
+            "a different seed must produce a different PRNG sequence",
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_exec_keeps_live_date_and_math_random() {
+        // Regression guard: the determinism prelude is gated STRICTLY to workflow
+        // runs. A plain code-mode exec keeps the live `Date`/`Math.random`:
+        // `Date.now()` returns a number, `new Date()` is constructible argless,
+        // and `Math.random()` returns a value in [0, 1).
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text('nowIsNumber=' + (typeof Date.now() === 'number'));\n",
+            "text('arglessDate=' + (new Date() instanceof Date));\n",
+            "const r = Math.random();\n",
+            "text('randomInRange=' + (typeof r === 'number' && r >= 0 && r < 1));\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec![
+                "nowIsNumber=true".to_string(),
+                "arglessDate=true".to_string(),
+                "randomInRange=true".to_string(),
+            ],
+            "plain code-mode exec must keep the live Date/Math.random",
+        );
+    }
+
     #[tokio::test]
     async fn parallel_returns_results_in_input_order() {
         // Acceptance: `parallel` of N thunks returns an N-length array in input
@@ -1320,16 +1794,24 @@ await new Promise(() => {});
     #[tokio::test]
     async fn parallel_awaits_all_thunks_before_resolving() {
         // Acceptance: `parallel` is a barrier — it awaits ALL thunks before
-        // resolving. The thunks complete in a different order than dispatched
-        // (descending `setTimeout` delays), yet at resolution every thunk has run
-        // (`completed === 3`) and the results stay position-preserving.
+        // resolving. The thunks complete in a different order than dispatched, yet
+        // at resolution every thunk has run (`completed === 3`) and the results
+        // stay position-preserving. Out-of-order completion is induced with
+        // differing microtask-chain depths (deterministic, FIFO microtask
+        // ordering) rather than wall-clock `setTimeout`, which the workflow
+        // isolate deliberately does not install (§7 determinism harden): a deeper
+        // chain resolves strictly later, so 'a' (depth 30) completes after 'b'
+        // (depth 5) and 'c' (depth 15).
         let source = concat!(
             "export const meta = { name: 'demo', description: 'demo' };\n",
             "let completed = 0;\n",
-            "const mk = (value, delay) => () =>\n",
-            "  new Promise((resolve) =>\n",
-            "    setTimeout(() => { completed += 1; resolve(value); }, delay)\n",
-            "  );\n",
+            "const ticks = (n) => {\n",
+            "  let p = Promise.resolve();\n",
+            "  for (let i = 0; i < n; i++) p = p.then(() => {});\n",
+            "  return p;\n",
+            "};\n",
+            "const mk = (value, depth) => () =>\n",
+            "  ticks(depth).then(() => { completed += 1; return value; });\n",
             "const results = await parallel([\n",
             "  mk('a', 30),\n",
             "  mk('b', 5),\n",
@@ -1495,16 +1977,24 @@ await new Promise(() => {});
         // per-stage *barrier* (the wrong semantics) would force every item through
         // stage 1 before any item entered stage 2, ordering `B:s1` ahead of
         // `A:s2`; the no-barrier chain instead emits every `A:*` before `B:s1`.
+        // Item B's stage 1 is delayed by a deep microtask chain (deterministic,
+        // FIFO microtask ordering) rather than wall-clock `setTimeout`, which the
+        // workflow isolate deliberately does not install (§7 determinism harden):
+        // the 50-deep chain lets item A run all three of its zero-depth stages to
+        // completion before B:s1 ever fires.
         let source = concat!(
             "export const meta = { name: 'demo', description: 'demo' };\n",
             "const events = [];\n",
+            "const ticks = (n) => {\n",
+            "  let p = Promise.resolve();\n",
+            "  for (let i = 0; i < n; i++) p = p.then(() => {});\n",
+            "  return p;\n",
+            "};\n",
             "const stage = (n) => (x) =>\n",
-            "  new Promise((resolve) =>\n",
-            "    setTimeout(() => {\n",
-            "      events.push(x + ':s' + n);\n",
-            "      resolve(x);\n",
-            "    }, x === 'B' && n === 1 ? 60 : 0)\n",
-            "  );\n",
+            "  ticks(x === 'B' && n === 1 ? 50 : 0).then(() => {\n",
+            "    events.push(x + ':s' + n);\n",
+            "    return x;\n",
+            "  });\n",
             "const results = await pipeline(['A', 'B'], stage(1), stage(2), stage(3));\n",
             "text(JSON.stringify(results));\n",
             "text(events.join(','));\n",
@@ -1663,5 +2153,140 @@ await new Promise(() => {});
             error_text.contains("pipeline is not defined"),
             "expected ReferenceError for missing `pipeline` global, got: {error_text}"
         );
+    }
+}
+
+/// Unit coverage for the [`ReplayState`] prefix-replay scaffolding
+/// (`P3-runtime-replay-state`). These exercise the state + init + accessors in
+/// isolation — the resume decision logic that drives them is
+/// `P3-resume-prefix-loop`.
+#[cfg(test)]
+mod replay_state_tests {
+    use codex_workflow_journal::AgentCallLine;
+    use codex_workflow_journal::AgentCallOpts;
+    use codex_workflow_journal::AgentStatus;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::ReplayState;
+
+    /// A journaled `agent_call` entry at `ordinal` carrying `tokens_spent`, the
+    /// value the resume loop re-adds to the replay budget accumulator.
+    fn entry(ordinal: u64, tokens_spent: u64) -> AgentCallLine {
+        AgentCallLine {
+            timestamp: None,
+            ordinal,
+            key: format!("blake3:key-{ordinal}"),
+            prompt_hash: format!("ph-{ordinal}"),
+            opts: AgentCallOpts {
+                model: Some("gpt".to_string()),
+                effort: Some("high".to_string()),
+                agent_type: Some("reviewer".to_string()),
+                isolation: None,
+                schema_hash: None,
+            },
+            phase: Some("analyze".to_string()),
+            label: Some(format!("file-{ordinal}")),
+            child_thread_id: Some(format!("th_{ordinal}")),
+            rollout_path: Some(format!("/p/rollout-{ordinal}.jsonl")),
+            status: Some(AgentStatus::Completed),
+            ret: json!({ "ordinal": ordinal }),
+            tokens_spent: Some(tokens_spent),
+            completion_seq: Some(ordinal),
+        }
+    }
+
+    #[test]
+    fn fresh_run_is_inactive_and_empty() {
+        // Acceptance: a fresh (non-resume) run initializes with replay inactive
+        // and no entries, so live fan-out is never diverted.
+        let replay = ReplayState::fresh();
+        assert!(!replay.is_active(), "fresh run must start with replay off");
+        assert_eq!(replay.prefix_len(), 0);
+        assert_eq!(replay.replay_spent(), 0);
+        assert!(replay.entry(0).is_none());
+        assert!(replay.entry(42).is_none());
+    }
+
+    #[test]
+    fn seed_indexes_entries_by_ordinal_and_arms_replay() {
+        // Acceptance: seeding from a loaded journal populates entries indexed by
+        // their invocation ordinal, sets the prefix length, and arms replay.
+        // The entries are intentionally passed out of ordinal order to prove the
+        // index keys on `ordinal`, not on position.
+        let replay = ReplayState::seed(vec![entry(2, 20), entry(0, 5), entry(1, 10)]);
+        assert!(replay.is_active(), "a seeded (resumed) run arms replay");
+        assert_eq!(replay.prefix_len(), 3, "prefix length M is the entry count");
+        assert_eq!(replay.replay_spent(), 0, "accumulator starts at zero");
+
+        for ordinal in 0..3 {
+            let found = replay.entry(ordinal).expect("entry present at ordinal");
+            assert_eq!(found.ordinal, ordinal, "entry is keyed by its ordinal");
+        }
+        assert!(
+            replay.entry(3).is_none(),
+            "ordinals at/after M have no journaled entry"
+        );
+    }
+
+    #[test]
+    fn add_replay_spent_accumulates_while_active() {
+        // Acceptance surface for §7 resume step 3: replayed `tokens_spent` is
+        // re-added to the replay-only accumulator so the resumed spend curve is
+        // byte-identical to the original.
+        let mut replay = ReplayState::seed(vec![entry(0, 5), entry(1, 10)]);
+        replay.add_replay_spent(5);
+        replay.add_replay_spent(10);
+        assert_eq!(replay.replay_spent(), 15);
+    }
+
+    #[test]
+    fn disable_latches_replay_off_permanently() {
+        // Acceptance: once `replay_active` is set false it cannot be re-enabled
+        // within a run — there is deliberately no re-enable path, and `disable`
+        // is idempotent.
+        let mut replay = ReplayState::seed(vec![entry(0, 5)]);
+        assert!(replay.is_active());
+
+        replay.disable();
+        assert!(!replay.is_active(), "first divergence latches replay off");
+
+        // Idempotent: disabling again keeps it off.
+        replay.disable();
+        assert!(!replay.is_active());
+
+        // The entries remain readable after divergence (they are inert), but
+        // replay never re-arms.
+        assert!(replay.entry(0).is_some());
+        assert!(
+            !replay.is_active(),
+            "replay stays off; no re-enable path exists"
+        );
+    }
+
+    #[test]
+    fn add_replay_spent_is_frozen_after_divergence() {
+        // Divergent (live) calls meter through the real budget, never the replay
+        // accumulator — so re-adds are a no-op once replay has been disabled.
+        let mut replay = ReplayState::seed(vec![entry(0, 5)]);
+        replay.add_replay_spent(5);
+        assert_eq!(replay.replay_spent(), 5);
+
+        replay.disable();
+        replay.add_replay_spent(100);
+        assert_eq!(
+            replay.replay_spent(),
+            5,
+            "no replay budget is accrued after going live"
+        );
+    }
+
+    #[test]
+    fn add_replay_spent_saturates_rather_than_overflows() {
+        // A corrupt journal must never panic the run: accumulation saturates.
+        let mut replay = ReplayState::seed(vec![entry(0, 1)]);
+        replay.add_replay_spent(i64::MAX);
+        replay.add_replay_spent(i64::MAX);
+        assert_eq!(replay.replay_spent(), i64::MAX);
     }
 }
