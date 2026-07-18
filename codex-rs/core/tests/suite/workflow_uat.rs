@@ -1886,3 +1886,483 @@ text(await workflow('metered', { budget: { total: 250 } }));
 
     Ok(())
 }
+
+/// Resolve the single workflow run directory `$CODEX_HOME/workflows/runs/<runId>/` created by a
+/// top-level run (each test uses its own tempdir `CODEX_HOME`, so there is exactly one).
+fn sole_run_dir(codex_home: &std::path::Path) -> std::path::PathBuf {
+    let runs_root = codex_home.join("workflows").join("runs");
+    let mut run_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&runs_root)
+        .unwrap_or_else(|err| panic!("read runs root {runs_root:?}: {err}"))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    run_dirs.sort();
+    assert_eq!(
+        run_dirs.len(),
+        1,
+        "exactly one workflow run directory expected, found {run_dirs:?}"
+    );
+    run_dirs.pop().expect("one run dir")
+}
+
+/// Parse a `journal.jsonl` into (`run_meta` line, [subsequent JournalLine]s).
+fn read_journal(journal_path: &std::path::Path) -> (Value, Vec<Value>) {
+    let contents = std::fs::read_to_string(journal_path)
+        .unwrap_or_else(|err| panic!("read journal {journal_path:?}: {err}"));
+    let mut lines = contents
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).expect("journal line is JSON"));
+    let run_meta = lines.next().expect("journal line 0 (run_meta)");
+    (run_meta, lines.collect())
+}
+
+/// P3-journal-write-integration — the run is reconstructable from `journal.jsonl` ALONE.
+///
+/// A `parallel()` fan-out (with a `phase()` + `log()` narration) drives three real subagents. The
+/// host writes the run's `journal.jsonl`: line 0 is `run_meta`, each subagent contributes exactly one
+/// `agent_call` line carrying its invocation ordinal, `(prompt, opts)` cache key, `status:completed`,
+/// return value, metered `tokens_spent`, and — the authoritative run→agent link — its
+/// `child_thread_id` PLUS the absolute `rollout_path` of its own session file; and the narration
+/// emits matching `phase`/`log` lines. The test then reconstructs the run's member-transcript set
+/// **from the journal alone** (reading each `rollout_path` the journal names, resolving each child's
+/// `session_meta` id + parent linkage) without consulting the graph store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn p3_journal_write_reconstructs_run_from_journal_alone() -> Result<()> {
+    const N: u64 = 3;
+    let server = responses::start_mock_server().await;
+
+    let mut thunks = String::new();
+    for k in 0..N {
+        thunks.push_str(&format!(
+            "  () => agent(\"{SUBAGENT_MARKER}{k} do the work\"),\n"
+        ));
+    }
+    let workflow_source = format!(
+        r#"export const meta = {{ name: 'p3journal', description: 'journal write integration', phases: ['fanout'] }};
+phase('fanout');
+log('starting fan-out');
+const results = await parallel([
+{thunks}]);
+text(JSON.stringify(results));
+"#
+    );
+
+    // Each subagent runs a single round-trip turn ending in `done-<ordinal>` with a distinct
+    // OUTPUT-token count (100 + 10*ordinal), so its journaled `tokens_spent` is assertable.
+    let subagent: SubagentScript = Box::new(|ordinal, _is_followup| {
+        sse(vec![
+            ev_response_created(&format!("resp-sub-{ordinal}")),
+            ev_assistant_message(&format!("msg-sub-{ordinal}"), &format!("done-{ordinal}")),
+            ev_completed_with_output_tokens(
+                &format!("resp-sub-{ordinal}"),
+                100 + 10 * ordinal as i64,
+            ),
+        ])
+    });
+
+    let _seen = mount_workflow_router(&server, &workflow_source, subagent).await;
+
+    let test = workflow_builder(&server.uri()).build(&server).await?;
+    let parent_thread_id = test.session_configured.thread_id;
+    let codex_home = test.config.codex_home.clone();
+
+    // Drain announced child threads so we can flush each subagent's own rollout to disk before the
+    // journal-only reconstruction reads it. Identification of the member set comes from the JOURNAL;
+    // this flush only guarantees the named files are durable.
+    let mut child_created = test.thread_manager.subscribe_thread_created();
+
+    test.submit_turn("run the p3 journal-write workflow")
+        .await?;
+
+    let mut child_ids: HashSet<ThreadId> = HashSet::new();
+    while let Ok(child_id) = child_created.try_recv() {
+        child_ids.insert(child_id);
+    }
+    for child_id in &child_ids {
+        if let Ok(child_thread) = test.thread_manager.get_thread(*child_id).await {
+            child_thread.ensure_rollout_materialized().await;
+            let _ = child_thread.flush_rollout().await;
+        }
+    }
+
+    // Line 0 is the run_meta for this run.
+    let journal_path = sole_run_dir(&codex_home).join("journal.jsonl");
+    let (run_meta, lines) = read_journal(&journal_path);
+    assert_eq!(run_meta["type"], "run_meta", "line 0 is run_meta");
+    assert_eq!(
+        run_meta["name"], "p3journal",
+        "run_meta carries the workflow name"
+    );
+    assert_eq!(
+        run_meta["key_algo_version"],
+        json!(codex_workflow_journal::KEY_ALGO_VERSION),
+        "run_meta records the cache-key algorithm version"
+    );
+
+    // Exactly one `agent_call` line per subagent.
+    let calls: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["type"] == "agent_call")
+        .collect();
+    assert_eq!(
+        calls.len() as u64,
+        N,
+        "exactly one agent_call line per subagent, got {calls:?}"
+    );
+
+    // The narration markers were journaled (§7 phase/log lines, ordinal null).
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["type"] == "phase" && line["title"] == "fanout"),
+        "phase('fanout') emitted a journal phase line"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["type"] == "log" && line["message"] == "starting fan-out"),
+        "log(...) emitted a journal log line"
+    );
+
+    // Reconstruct every member transcript FROM THE JOURNAL ALONE: for each ordinal, the agent_call
+    // line names the child thread + the absolute path to its own rollout session file, whose
+    // session_meta id/parent linkage recover the run→agent grouping without the graph store.
+    let mut reconstructed_children: HashSet<String> = HashSet::new();
+    for k in 0..N {
+        let call = calls
+            .iter()
+            .find(|call| call["ordinal"] == json!(k))
+            .unwrap_or_else(|| panic!("agent_call for ordinal {k} present"));
+
+        assert_eq!(call["status"], "completed", "ordinal {k} completed");
+        assert_eq!(
+            call["return"],
+            json!(format!("done-{k}")),
+            "ordinal {k} return round-trips the child's final message"
+        );
+        assert_eq!(
+            call["tokens_spent"],
+            json!(100 + 10 * k),
+            "ordinal {k} tokens_spent equals the child's metered output-token spend"
+        );
+
+        let child_thread_id = call["child_thread_id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| panic!("ordinal {k} carries a non-empty child_thread_id"));
+
+        let rollout_path = call["rollout_path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("ordinal {k} carries a rollout_path"));
+        let rollout_path = std::path::Path::new(rollout_path);
+        assert!(
+            rollout_path.is_absolute(),
+            "ordinal {k} rollout_path is absolute: {rollout_path:?}"
+        );
+        assert!(
+            rollout_path.exists(),
+            "ordinal {k} rollout_path points at an existing subagent rollout file: {rollout_path:?}"
+        );
+
+        // The journal-named file IS this child's own transcript: its session_meta id matches the
+        // journaled child_thread_id and its parent linkage points back at the workflow root thread.
+        let rollout_contents = std::fs::read_to_string(rollout_path)?;
+        let rollout_lines: Vec<Value> = rollout_contents
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).expect("rollout line is JSON"))
+            .collect();
+        let meta = rollout_session_meta(&rollout_lines);
+        assert_eq!(
+            meta["id"].as_str(),
+            Some(child_thread_id),
+            "the journal's rollout_path resolves to the child's own session file"
+        );
+        assert_eq!(
+            meta["parent_thread_id"].as_str(),
+            Some(parent_thread_id.to_string().as_str()),
+            "each reconstructed member links back to the workflow root thread"
+        );
+
+        assert!(
+            reconstructed_children.insert(child_thread_id.to_string()),
+            "each subagent contributes a distinct child_thread_id (dup: {child_thread_id})"
+        );
+    }
+    assert_eq!(
+        reconstructed_children.len() as u64,
+        N,
+        "the full member set is reconstructable from journal.jsonl alone"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// UAT-6 — resume by prefix / journal-replay determinism gate (Phase-3 exit gate;
+// spec §14.2 UAT-6, §14.3 Phase-3 exit gates, §7 "Resume algorithm", §13 R1).
+//
+// The model-callable `--resume`/`workflow_run` entrypoint that re-drives the
+// isolate from a seed is P4 (not wired to the model tool call yet), so on THIS
+// hermetic model lane UAT-6 asserts the resume behaviour on the two ENGINE
+// ARTIFACTS it CAN observe without that entrypoint:
+//   1. the run's real `journal.jsonl` (the deterministic replay source), and
+//   2. the resume DECISION the real, public `codex_workflow_journal::ReplayJournal`
+//      makes over it — the exact code `resume_workflow_source`/`load_resume_seed`
+//      run — proving an unchanged script is a full-prefix cache hit (every ordinal
+//      served from cache → zero re-spawn) and a changed script diverges at the
+//      first ordinal.
+// The RUNTIME honouring that decision (an `AgentReplay` cache hit with NO
+// `AgentCall` spawn for cached ordinals, first-divergence-onward live, and the
+// journaled `tokens_spent` re-add making `spent()`/`remaining()` and the ceiling
+// throw byte-identical) is exhaustively unit-tested against the real V8 isolate in
+// `code-mode` `runtime::callbacks::replay_tests`; UAT-6 is the integration bookend
+// proving the real hermetic run emits a journal that decision accepts. Fixed
+// per-ordinal fixture token counts (`ev_completed_with_output_tokens`) make the
+// journaled spend curve — and therefore any resumed run's budget — deterministic.
+// No live model, no wall-clock (honours the §7 determinism contract).
+// ---------------------------------------------------------------------------
+
+/// UAT-6 (a)/(b)/(c) — the hermetic run's `journal.jsonl` is a deterministic, full-prefix-replayable
+/// cache spine.
+///
+/// A real `parallel()` fan-out of N subagents with FIXED per-ordinal output-token counts drives the
+/// engine end-to-end, producing the run's `journal.jsonl`. The test then loads that journal through
+/// the SAME public `ReplayJournal` the resume entrypoint uses and asserts the resume decision on
+/// engine artifacts:
+///   - the SOURCE run dispatched exactly N subagent model requests (the arrival-log baseline a
+///     resume eliminates);
+///   - the journal carries N ordinal-indexed `completed` `agent_call` entries, each with its
+///     `(prompt, opts)` cache key, journaled return, and fixed `tokens_spent`;
+///   - for the UNCHANGED script/args, `check_compatibility` reports NO divergence, so every one of
+///     the N ordinals is a full-prefix cache hit (`lookup(i)` is `completed` with a stable key) —
+///     `k = N` cached, `N - k = 0` live, i.e. zero re-spawn on resume;
+///   - a changed `script_hash` / `args_hash` / `key_algo_version` each diverge (at ordinal 0 → the
+///     whole body runs live), which is UAT-6's "changed prefix diverges live" case at the
+///     run-structural granularity;
+///   - the sum of journaled `tokens_spent` re-added on replay equals the fixed fixture total, so the
+///     resumed `spent()`/`remaining()` curve is byte-identical to the uninterrupted run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uat6_unchanged_script_journal_is_a_full_prefix_cache_hit() -> Result<()> {
+    const N: u64 = 3;
+    // Fixed per-ordinal output-token spend (100, 110, 120): distinct so each ordinal's journaled
+    // `tokens_spent` is individually assertable, and deterministic so the resumed budget curve is
+    // byte-identical.
+    let tokens_for = |ordinal: u64| 100 + 10 * ordinal as i64;
+    let server = responses::start_mock_server().await;
+
+    let mut thunks = String::new();
+    for k in 0..N {
+        thunks.push_str(&format!(
+            "  () => agent(\"{SUBAGENT_MARKER}{k} do the work\"),\n"
+        ));
+    }
+    let workflow_source = format!(
+        r#"export const meta = {{ name: 'uat6', description: 'resume prefix replay gate' }};
+const results = await parallel([
+{thunks}]);
+text(JSON.stringify(results));
+"#
+    );
+
+    // Each subagent is a single round-trip ending in `done-<ordinal>` with a fixed output-token
+    // count, so its journaled return and `tokens_spent` are deterministic.
+    let subagent: SubagentScript = Box::new(move |ordinal, _is_followup| {
+        sse(vec![
+            ev_response_created(&format!("resp-sub-{ordinal}")),
+            ev_assistant_message(&format!("msg-sub-{ordinal}"), &format!("done-{ordinal}")),
+            ev_completed_with_output_tokens(&format!("resp-sub-{ordinal}"), tokens_for(ordinal)),
+        ])
+    });
+
+    let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
+
+    let test = workflow_builder(&server.uri()).build(&server).await?;
+    let codex_home = test.config.codex_home.clone();
+
+    test.submit_turn("run the uat6 resume-gate workflow")
+        .await?;
+
+    // The source run's own return is the deterministic fixture fan-out.
+    let results = workflow_return_array(&seen);
+    assert_eq!(
+        results,
+        vec![json!("done-0"), json!("done-1"), json!("done-2")],
+        "the source run returns the position-preserving fixture fan-out"
+    );
+
+    // Arrival-log baseline: the SOURCE run dispatched a model request for EVERY ordinal. A resume
+    // over the unchanged journal is exactly what eliminates these N spawns.
+    for ordinal in 0..N {
+        assert!(
+            subagent_arrival_index(&seen, ordinal).is_some(),
+            "source run must dispatch a subagent request for ordinal {ordinal}"
+        );
+    }
+
+    // Load the run's real journal through the SAME public replay reader the resume entrypoint uses.
+    let journal_path = sole_run_dir(&codex_home).join("journal.jsonl");
+    let journal = codex_workflow_journal::ReplayJournal::load(&journal_path)
+        .unwrap_or_else(|err| panic!("load journal {journal_path:?}: {err}"));
+
+    // The journal is a contiguous ordinal-indexed prefix of N completed entries.
+    assert_eq!(
+        journal.entries().len() as u64,
+        N,
+        "journal records exactly one agent_call per fan-out subagent"
+    );
+    let recorded_meta = journal.run_meta();
+    assert_eq!(
+        recorded_meta.key_algo_version,
+        codex_workflow_journal::KEY_ALGO_VERSION,
+        "run_meta pins the cache-key algorithm version"
+    );
+
+    // Resume decision — UNCHANGED script/args: no divergence, so the whole prefix replays.
+    assert_eq!(
+        journal.check_compatibility(
+            &recorded_meta.script_hash,
+            &recorded_meta.args_hash,
+            codex_workflow_journal::KEY_ALGO_VERSION,
+        ),
+        None,
+        "an unchanged script/args must be structurally compatible (full-prefix replay)"
+    );
+
+    // Per-ordinal full-prefix cache hit: every ordinal is `completed` with a stable `blake3:` key
+    // and its fixed `tokens_spent` — the exact inputs that make the isolate serve it from cache
+    // WITHOUT spawning (`AgentReplay`, zero `AgentCall`; proven in code-mode replay_tests).
+    let mut cached = 0u64;
+    let mut replay_budget_readd = 0i64;
+    for ordinal in 0..N {
+        let entry = journal
+            .lookup(ordinal)
+            .unwrap_or_else(|| panic!("ordinal {ordinal} within the recorded prefix"));
+        assert_eq!(
+            entry.status,
+            Some(codex_workflow_journal::AgentStatus::Completed),
+            "ordinal {ordinal} completed, so it is served from cache on resume"
+        );
+        assert!(
+            entry.key.starts_with("blake3:"),
+            "ordinal {ordinal} carries a content-addressed cache key: {}",
+            entry.key
+        );
+        assert_eq!(
+            entry.ret,
+            &json!(format!("done-{ordinal}")),
+            "ordinal {ordinal} return round-trips the child's final message"
+        );
+        assert_eq!(
+            entry.tokens_spent,
+            Some(tokens_for(ordinal) as u64),
+            "ordinal {ordinal} journals its fixed fixture output-token spend"
+        );
+        cached += 1;
+        replay_budget_readd += entry.tokens_spent.unwrap_or(0) as i64;
+    }
+    // k cached, N - k live: an unchanged resume caches every ordinal (zero re-spawn).
+    assert_eq!(cached, N, "k = N ordinals cached");
+    assert_eq!(N - cached, 0, "N - k = 0 ordinals run live");
+
+    // Budget byte-identical: the `tokens_spent` re-added on replay equals the fixed fixture total, so
+    // `spent()`/`remaining()` at each ordinal (and the ceiling-throw ordinal) reproduce exactly.
+    let expected_total: i64 = (0..N).map(tokens_for).sum();
+    assert_eq!(
+        replay_budget_readd, expected_total,
+        "replayed prefix re-adds the identical journaled spend (budget byte-identical)"
+    );
+
+    // Resume decision — CHANGED prefix: any structural change diverges (at ordinal 0 → live tail),
+    // never a hard error.
+    assert_eq!(
+        journal.check_compatibility(
+            "blake3:edited-script",
+            &recorded_meta.args_hash,
+            codex_workflow_journal::KEY_ALGO_VERSION,
+        ),
+        Some(codex_workflow_journal::Divergence::ScriptHash),
+        "a changed script diverges at ordinal 0 and runs the whole body live"
+    );
+    assert_eq!(
+        journal.check_compatibility(
+            &recorded_meta.script_hash,
+            "blake3:edited-args",
+            codex_workflow_journal::KEY_ALGO_VERSION,
+        ),
+        Some(codex_workflow_journal::Divergence::ArgsHash),
+        "changed args diverge at ordinal 0"
+    );
+    assert_eq!(
+        journal.check_compatibility(
+            &recorded_meta.script_hash,
+            &recorded_meta.args_hash,
+            codex_workflow_journal::KEY_ALGO_VERSION + 1,
+        ),
+        Some(codex_workflow_journal::Divergence::KeyAlgoVersion),
+        "a cache-key algorithm bump diverges at ordinal 0"
+    );
+
+    Ok(())
+}
+
+/// UAT-6 (d) — the §7 / R1 determinism harden holds in the REAL in-process workflow isolate the UAT
+/// lane runs (not just the `code-mode` unit harness).
+///
+/// A workflow body probes each shimmed determinism source and returns the probe results as its own
+/// value (the engine artifact, surfaced in the workflow tool output): `Date.now()`, argless
+/// `new Date()`, and `Math.random()` all THROW, while `WeakRef`, `FinalizationRegistry`, and
+/// `setTimeout` are absent (`undefined`). This is the integration bookend to the in-isolate unit
+/// assertions in `code-mode` (`workflow_determinism_prelude_*`, `workflow_isolate_*`): it proves the
+/// harden is active on the actual product path a resumed run replays against, which is what makes
+/// prefix replay sound (R1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uat6_determinism_shims_hold_in_workflow_isolate() -> Result<()> {
+    let server = responses::start_mock_server().await;
+
+    // No subagents: the body only probes the determinism globals and returns the results.
+    let workflow_source = r#"export const meta = { name: 'uat6shims', description: 'determinism shims hold' };
+const threw = (fn) => { try { fn(); return 'ok'; } catch (e) { return 'threw'; } };
+const probes = [
+  'Date.now=' + threw(() => Date.now()),
+  'newDate=' + threw(() => new Date()),
+  'random=' + threw(() => Math.random()),
+  'WeakRef=' + typeof WeakRef,
+  'FinalizationRegistry=' + typeof FinalizationRegistry,
+  'setTimeout=' + typeof setTimeout,
+];
+text(JSON.stringify(probes));
+"#;
+
+    // A stub subagent keeps the router shape; no subagent turn is expected.
+    let subagent: SubagentScript = Box::new(|ordinal, _is_followup| {
+        sse(vec![
+            ev_response_created(&format!("resp-sub-{ordinal}")),
+            ev_completed(&format!("resp-sub-{ordinal}")),
+        ])
+    });
+    let seen = mount_workflow_router(&server, workflow_source, subagent).await;
+
+    let test = workflow_builder(&server.uri()).build(&server).await?;
+    test.submit_turn("run the uat6 determinism-shim workflow")
+        .await?;
+
+    let probes = workflow_return_array(&seen);
+    assert_eq!(
+        probes,
+        vec![
+            json!("Date.now=threw"),
+            json!("newDate=threw"),
+            json!("random=threw"),
+            json!("WeakRef=undefined"),
+            json!("FinalizationRegistry=undefined"),
+            json!("setTimeout=undefined"),
+        ],
+        "the workflow isolate must throw on wall-clock/entropy sources and strip GC-order/timer \
+         globals so prefix replay is deterministic (R1)"
+    );
+
+    Ok(())
+}
