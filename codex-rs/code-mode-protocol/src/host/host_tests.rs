@@ -801,6 +801,82 @@ fn agent_spawned_delegate_response_round_trips_all_three_outcomes() {
 }
 
 #[test]
+fn spawn_workflow_delegate_request_survives_wire_round_trip() {
+    // A nested `workflow(nameOrRef, args)` spawn must round-trip its cell id, the caller-supplied
+    // name, and the invocation `args` JSON so a process-owned host reaches the client's real workflow
+    // handler with everything intact.
+    assert_wire_round_trip(
+        HostToClient::DelegateRequest {
+            id: delegate_request_id(/*value*/ 16),
+            session_id: session_id(),
+            request: DelegateRequest::SpawnWorkflow {
+                cell_id: cell_id("cell-1"),
+                name: "triage".to_string(),
+                args: Some(json!({ "tag": "hello" })),
+            },
+        },
+        json!({
+            "type": "delegate/request",
+            "id": 16,
+            "sessionId": "session-1",
+            "request": {
+                "type": "workflow/spawn",
+                "cellId": "cell-1",
+                "name": "triage",
+                "args": { "tag": "hello" },
+            },
+        }),
+    );
+}
+
+#[test]
+fn workflow_spawned_delegate_response_round_trips_all_three_outcomes() {
+    // The nested `workflow()` settlement reuses `WireAgentSpawnOutcome`; each variant must survive
+    // the wire so the host isolate resolves the promise with a value, resolves it to `null`, or
+    // rejects (throws) it — faithfully.
+    for (id, outcome, encoded_outcome) in [
+        (
+            delegate_request_id(/*value*/ 17),
+            WireAgentSpawnOutcome::Completed {
+                value: json!("child:hello"),
+            },
+            json!({ "outcome": "completed", "value": "child:hello" }),
+        ),
+        (
+            delegate_request_id(/*value*/ 18),
+            WireAgentSpawnOutcome::Failed,
+            json!({ "outcome": "failed" }),
+        ),
+        (
+            delegate_request_id(/*value*/ 19),
+            WireAgentSpawnOutcome::Rejected {
+                message: "WorkflowNotFound".to_string(),
+            },
+            json!({ "outcome": "rejected", "message": "WorkflowNotFound" }),
+        ),
+    ] {
+        assert_wire_round_trip(
+            ClientToHost::DelegateResponse {
+                id,
+                result: WireResult::Ok {
+                    value: DelegateResponse::WorkflowSpawned {
+                        outcome: outcome.clone(),
+                    },
+                },
+            },
+            json!({
+                "type": "delegate/response",
+                "id": id,
+                "result": {
+                    "status": "ok",
+                    "value": { "type": "workflow/spawned", "outcome": encoded_outcome },
+                },
+            }),
+        );
+    }
+}
+
+#[test]
 fn agent_spawn_outcome_converts_to_and_from_its_wire_form() {
     // The domain <-> wire conversion the bridge relies on must be lossless in both directions.
     for outcome in [

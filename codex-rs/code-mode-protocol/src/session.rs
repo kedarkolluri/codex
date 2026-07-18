@@ -48,6 +48,25 @@ pub enum AgentSpawnOutcome {
 /// `null`, or throw).
 pub type AgentSpawnFuture<'a> = Pin<Box<dyn Future<Output = AgentSpawnOutcome> + Send + 'a>>;
 
+/// Live, thread-safe view of a workflow run's shared token budget, backing the native
+/// `budget.spent()` / `budget.remaining()` isolate globals (§4 `budget`; §8).
+///
+/// This is the shared seam type between core's budget accounting and the code-mode runtime. The
+/// implementor is core's `RolloutBudget` (via an adapter), whose getters read the tree-wide weighted
+/// counter under the existing lock, so the isolate observes spend accrued by subagents that
+/// completed turns *after* install — the values are read live at call time, never snapshotted. It is
+/// threaded into the isolate as an in-process `Arc` (it cannot ride the serializable
+/// `ExecuteRequest` wire), exactly like the other host handles, and is installed only for workflow
+/// runs.
+pub trait WorkflowBudgetHandle: Send + Sync {
+    /// Configured `budget.total` ceiling (pure output-token spend, §8).
+    fn total(&self) -> i64;
+    /// Live weighted output-token spend so far (`RolloutBudget::spent`).
+    fn spent(&self) -> i64;
+    /// Live remaining budget, clamped at 0 (`RolloutBudget::remaining`).
+    fn remaining(&self) -> i64;
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CellId(String);
 
@@ -147,6 +166,41 @@ pub trait CodeModeSessionDelegate: Send + Sync {
     ) -> AgentSpawnFuture<'a> {
         let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
         Box::pin(async { AgentSpawnOutcome::Failed })
+    }
+
+    /// Run a saved workflow inline for a `workflow(nameOrRef, args)` call and resolve to the nested
+    /// run's top-level result.
+    ///
+    /// `name` is the caller-supplied `nameOrRef`; the host resolves it against the core-workflows
+    /// registry, loads the named script, and re-enters the runtime one level deep with `args`
+    /// injected as the nested run's read-only `args` global. The returned future resolves to an
+    /// [`AgentSpawnOutcome`]: `Completed(value)` with the nested run's top-level result,
+    /// `Failed` (JS `null`) when the nested run produces no result, or `Rejected(msg)` to throw in
+    /// the isolate (e.g. a name that does not resolve in the registry, or a nested script error).
+    /// The default implementation resolves to `Failed` so non-workflow hosts need no changes.
+    fn spawn_workflow<'a>(
+        &'a self,
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        let _ = (cell_id, name, args, cancellation_token);
+        Box::pin(async { AgentSpawnOutcome::Failed })
+    }
+
+    /// The live shared token-budget handle backing the workflow `budget` global's `spent()` /
+    /// `remaining()` native functions (§4/§8), or `None` when this session runs no budgeted
+    /// workflow.
+    ///
+    /// The code-mode runtime threads the returned handle into every cell it spawns so a real
+    /// workflow observes live tree-wide spend rather than a static snapshot. It is an in-process
+    /// `Arc` (never serialized over the `ExecuteRequest` wire). The default implementation returns
+    /// `None` so non-workflow hosts — and the process-owned host, which cannot forward an `Arc`
+    /// across the IPC boundary — need no changes; the budget global then reports `0` spent and
+    /// `budget.total` remaining.
+    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
+        None
     }
 
     /// Releases delegate state associated with a cell after it reaches a terminal state.

@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use codex_code_mode_protocol::AgentCallOpts;
 use codex_code_mode_protocol::AgentSpawnOutcome;
+use codex_code_mode_protocol::WorkflowBudgetHandle;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -67,6 +68,28 @@ pub(crate) trait CellHost: Send + Sync + 'static {
     ) -> impl Future<Output = AgentSpawnOutcome> + Send {
         let _ = (prompt, ordinal, opts, cancellation_token);
         async { AgentSpawnOutcome::Failed }
+    }
+
+    /// Run a saved workflow inline for a `workflow(nameOrRef, args)` call, resolving to an
+    /// [`AgentSpawnOutcome`] (`Completed` with the nested run's result, `Failed` -> JS `null`, or
+    /// `Rejected` -> throw). The default resolves to `Failed` so hosts without nested-workflow
+    /// support need no changes.
+    fn spawn_workflow(
+        &self,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (name, args, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
+
+    /// The live shared token-budget handle backing the workflow `budget` global, or `None` when this
+    /// cell runs no budgeted workflow. The cell actor threads the returned handle into the isolate
+    /// so `budget.spent()` / `budget.remaining()` forward to the shared budget rather than reporting
+    /// static values. The default returns `None` so hosts without a budget need no changes.
+    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
+        None
     }
 
     fn commit_completion(

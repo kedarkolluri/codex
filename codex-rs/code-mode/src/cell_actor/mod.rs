@@ -18,6 +18,7 @@ use self::callbacks::report_task_result;
 use self::callbacks::spawn_agent;
 use self::callbacks::spawn_notification;
 use self::callbacks::spawn_tool;
+use self::callbacks::spawn_workflow;
 use self::conversions::cell_tool_kind;
 use self::conversions::output_item;
 use self::conversions::runtime_request;
@@ -36,7 +37,7 @@ use crate::runtime::PendingRuntimeMode;
 use crate::runtime::RuntimeCommand;
 use crate::runtime::RuntimeControlCommand;
 use crate::runtime::RuntimeEvent;
-use crate::runtime::spawn_runtime;
+use crate::runtime::spawn_runtime_with_budget;
 use crate::session_runtime::CellEvent;
 use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::ObserveMode;
@@ -64,12 +65,19 @@ impl CellActor {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
-        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime(
+        // Thread the host's live budget handle (SEAM #1) into the isolate so a real
+        // workflow cell forwards `budget.spent()` / `budget.remaining()` to the shared
+        // `RolloutBudget` instead of the static `budget: None` defaults. Non-workflow
+        // hosts (and the process-owned host, which cannot forward an `Arc` over IPC)
+        // return `None` and are unaffected.
+        let budget = host.budget_handle();
+        let (runtime_tx, runtime_control_tx, runtime_terminate_handle) = spawn_runtime_with_budget(
             stored_values,
             runtime_request(request),
             event_tx,
             PendingRuntimeMode::PauseUntilResumed,
             task_failure_handler.clone(),
+            budget,
         )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
         let task = run_cell(
@@ -416,6 +424,27 @@ async fn run_cell<H: CellHost>(
                             prompt,
                             ordinal,
                             opts,
+                            runtime_tx.clone(),
+                            callback_cancellation_token.child_token(),
+                            task_failure_handler.clone(),
+                        );
+                    }
+                    // Workflow `workflow(nameOrRef, args)` nested-run requests.
+                    // Mirrors the `AgentCall` path: spawn one independent task that
+                    // routes the call through the host, which resolves the named
+                    // saved workflow from the registry, re-enters the runtime one
+                    // level deep, and settles the isolate promise by id via the
+                    // same resolve/reject commands a nested tool uses. The host's
+                    // `AgentSpawnOutcome` maps to `ToolResponse` (`Completed` -> the
+                    // nested run's result, `Failed` -> JS null) or `ToolError`
+                    // (`Rejected` -> the isolate throws, e.g. an unresolved name).
+                    RuntimeEvent::WorkflowCall { id, name, args } => {
+                        spawn_workflow(
+                            &mut tool_tasks,
+                            Arc::clone(&host),
+                            id,
+                            name,
+                            args,
                             runtime_tx.clone(),
                             callback_cancellation_token.child_token(),
                             task_failure_handler.clone(),

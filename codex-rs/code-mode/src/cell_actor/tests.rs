@@ -14,6 +14,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::runtime::spawn_runtime;
 use crate::session_runtime::OutputItem;
 
 struct TestHost;

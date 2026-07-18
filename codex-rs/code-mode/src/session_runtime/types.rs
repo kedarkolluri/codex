@@ -2,8 +2,11 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use codex_code_mode_protocol::AgentCallOpts;
 use codex_code_mode_protocol::AgentSpawnOutcome;
+use codex_code_mode_protocol::WorkflowBudgetHandle;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -158,6 +161,28 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
     ) -> impl Future<Output = AgentSpawnOutcome> + Send {
         let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
         async { AgentSpawnOutcome::Failed }
+    }
+
+    /// Run a saved workflow inline for a `workflow(nameOrRef, args)` call, resolving to an
+    /// [`AgentSpawnOutcome`] (`Completed` with the nested run's result, `Failed` -> JS `null`, or
+    /// `Rejected` -> throw). The default resolves to `Failed` so delegates without nested-workflow
+    /// support need no changes.
+    fn spawn_workflow(
+        &self,
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> impl Future<Output = AgentSpawnOutcome> + Send {
+        let _ = (cell_id, name, args, cancellation_token);
+        async { AgentSpawnOutcome::Failed }
+    }
+
+    /// The live shared token-budget handle backing the workflow `budget` global, or `None` when this
+    /// delegate runs no budgeted workflow. The default returns `None` so delegates without a budget
+    /// need no changes.
+    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
+        None
     }
 
     fn cell_closed(&self, cell_id: &CellId);

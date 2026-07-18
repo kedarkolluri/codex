@@ -7,6 +7,7 @@ mod value;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::panic::catch_unwind;
+use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -99,6 +100,32 @@ pub(crate) enum RuntimeEvent {
         #[allow(dead_code, reason = "consumed by the later protocol/journal tickets")]
         message: String,
     },
+    /// A workflow `workflow(nameOrRef, args)` nested-run request (§4 `workflow()`;
+    /// §3 async bridge op). Structurally mirrors [`RuntimeEvent::AgentCall`]: the
+    /// `workflow_callback` mints a resolver stored in `pending_tool_calls` under
+    /// `id`, stamps `id` synchronously from `RuntimeState.next_workflow_call_id`,
+    /// and emits this event for the cell actor to route to the nested-run host
+    /// handler. Emitted only for workflow runs. This is the pure bridge half that
+    /// `P2-workflow-global-callback` emits; the host handler that consumes it
+    /// (registry load + nested re-enter) is `P2-workflow-registry-reenter`, so no
+    /// non-test code reads `name`/`args` yet.
+    WorkflowCall {
+        #[allow(
+            dead_code,
+            reason = "consumed by the later workflow host handler ticket (P2-workflow-registry-reenter)"
+        )]
+        id: String,
+        #[allow(
+            dead_code,
+            reason = "consumed by the later workflow host handler ticket (P2-workflow-registry-reenter)"
+        )]
+        name: String,
+        #[allow(
+            dead_code,
+            reason = "consumed by the later workflow host handler ticket (P2-workflow-registry-reenter)"
+        )]
+        args: Option<JsonValue>,
+    },
     Result {
         stored_value_writes: HashMap<String, JsonValue>,
         error_text: Option<String>,
@@ -106,12 +133,59 @@ pub(crate) enum RuntimeEvent {
     ThreadPanicked,
 }
 
+/// Live, thread-safe view of a workflow run's shared token budget, backing the
+/// native `budget.spent()` / `budget.remaining()` isolate globals (§4 `budget`;
+/// §8). Defined in `codex-code-mode-protocol` so it is the shared seam type
+/// between core's budget accounting (which implements it over `RolloutBudget`)
+/// and this runtime (which reads it live at call time). Threaded into the isolate
+/// as an in-process `Arc` (it cannot ride the serializable `ExecuteRequest`
+/// wire), exactly like the `event_tx` host handle; installed only for workflow
+/// runs.
+pub(crate) use codex_code_mode_protocol::WorkflowBudgetHandle;
+
+/// Budget-less [`spawn_runtime_with_budget`] shim retained for tests that exercise
+/// the runtime without a workflow budget handle. Production spawns go through
+/// [`spawn_runtime_with_budget`] so they can thread the host's live budget handle
+/// (SEAM #1).
+#[cfg(test)]
 pub(crate) fn spawn_runtime(
     stored_values: HashMap<String, JsonValue>,
     request: ExecuteRequest,
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     pending_mode: PendingRuntimeMode,
     task_failure_handler: Option<TaskFailureHandler>,
+) -> Result<
+    (
+        std_mpsc::Sender<RuntimeCommand>,
+        std_mpsc::Sender<RuntimeControlCommand>,
+        v8::IsolateHandle,
+    ),
+    String,
+> {
+    spawn_runtime_with_budget(
+        stored_values,
+        request,
+        event_tx,
+        pending_mode,
+        task_failure_handler,
+        None,
+    )
+}
+
+/// [`spawn_runtime`] variant that also threads a live [`WorkflowBudgetHandle`]
+/// into the isolate so the workflow's `budget` global forwards `spent()` /
+/// `remaining()` to the shared `RolloutBudget`. The handle is an in-process
+/// `Arc` (not part of the serializable `ExecuteRequest`), threaded the same way
+/// as the other host handles. Plain code-mode `exec` and workflow runs without a
+/// budget pass `None`, in which case `budget.spent()` reports `0` and
+/// `budget.remaining()` reports `budget.total`.
+pub(crate) fn spawn_runtime_with_budget(
+    stored_values: HashMap<String, JsonValue>,
+    request: ExecuteRequest,
+    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
+    pending_mode: PendingRuntimeMode,
+    task_failure_handler: Option<TaskFailureHandler>,
+    budget: Option<Arc<dyn WorkflowBudgetHandle>>,
 ) -> Result<
     (
         std_mpsc::Sender<RuntimeCommand>,
@@ -139,6 +213,7 @@ pub(crate) fn spawn_runtime(
         workflow: request.workflow,
         args: request.args,
         run_id: request.run_id,
+        budget,
     };
 
     spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
@@ -188,6 +263,10 @@ struct RuntimeConfig {
     /// Host-minted uuid v7 run identifier from `ExecuteRequest::run_id`; exposed
     /// read-only as `workflow.runId` for workflow runs.
     run_id: Option<String>,
+    /// Live shared token-budget handle backing the workflow `budget` global.
+    /// Threaded in-process (never over the `ExecuteRequest` wire); `None` for
+    /// plain code-mode exec and for workflow runs with no budget configured.
+    budget: Option<Arc<dyn WorkflowBudgetHandle>>,
 }
 
 pub(super) struct RuntimeState {
@@ -210,6 +289,13 @@ pub(super) struct RuntimeState {
         reason = "stamped by the later agent_callback ticket (P1-agent-callback)"
     )]
     next_agent_ordinal: u64,
+    /// Monotonic counter for `workflow(nameOrRef, args)` nested-run invocations.
+    /// Stamped into each [`RuntimeEvent::WorkflowCall`]'s `id` (as
+    /// `workflow-{n}`), bumped synchronously in `workflow_callback` before the
+    /// promise returns so the id is unique and the resolver is retrievable from
+    /// `pending_tool_calls` out-of-order. Initialized to `0`. Only advanced on
+    /// workflow runs (the `workflow` global is gated behind `RuntimeState.workflow`).
+    next_workflow_call_id: u64,
     tool_call_id: String,
     runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
     exit_requested: bool,
@@ -227,6 +313,11 @@ pub(super) struct RuntimeState {
     /// Only populated (and only installed) for workflow runs; see
     /// [`codex_code_mode_protocol::ExecuteRequest::run_id`].
     run_id: Option<String>,
+    /// Live shared token-budget handle backing the `budget` global's `spent()` /
+    /// `remaining()` native functions (§4/§8). Read live at call time so a
+    /// workflow that awaits subagents observes the updated spend. Only populated
+    /// (and only installed) for workflow runs.
+    budget: Option<Arc<dyn WorkflowBudgetHandle>>,
 }
 
 pub(super) enum CompletionState {
@@ -274,12 +365,14 @@ fn run_runtime(
         next_tool_call_id: 1,
         next_timeout_id: 1,
         next_agent_ordinal: 0,
+        next_workflow_call_id: 0,
         tool_call_id: config.tool_call_id,
         runtime_command_tx,
         exit_requested: false,
         workflow,
         args: config.args,
         run_id: config.run_id,
+        budget: config.budget,
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
@@ -413,6 +506,9 @@ fn send_result(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicI64;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use pretty_assertions::assert_eq;
@@ -423,9 +519,52 @@ mod tests {
     use super::RuntimeCommand;
     use super::RuntimeControlCommand;
     use super::RuntimeEvent;
+    use super::WorkflowBudgetHandle;
     use super::spawn_runtime;
+    use super::spawn_runtime_with_budget;
     use super::spawn_supervised_runtime_thread;
     use crate::FunctionCallOutputContentItem;
+
+    /// Test [`WorkflowBudgetHandle`] with a fixed `total` and a mutable `spent`
+    /// counter the test bumps to simulate subagents consuming tokens mid-run.
+    /// `remaining()` mirrors `RolloutBudget::remaining` (clamped at 0).
+    struct FixtureBudget {
+        total: i64,
+        spent: AtomicI64,
+    }
+
+    impl FixtureBudget {
+        fn new(total: i64, spent: i64) -> Arc<Self> {
+            Arc::new(Self {
+                total,
+                spent: AtomicI64::new(spent),
+            })
+        }
+
+        fn set_spent(&self, spent: i64) {
+            self.spent.store(spent, Ordering::SeqCst);
+        }
+    }
+
+    impl WorkflowBudgetHandle for FixtureBudget {
+        fn total(&self) -> i64 {
+            self.total
+        }
+
+        fn spent(&self) -> i64 {
+            self.spent.load(Ordering::SeqCst)
+        }
+
+        fn remaining(&self) -> i64 {
+            (self.total - self.spent()).max(0)
+        }
+    }
+
+    /// Invocation `args` carrying `budget.total`, the source of `budget.total`
+    /// (§4 `budget`).
+    fn workflow_budget_args(total: i64) -> serde_json::Value {
+        serde_json::json!({ "budget": { "total": total } })
+    }
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
@@ -872,6 +1011,227 @@ await new Promise(() => {});
     }
 
     #[tokio::test]
+    async fn workflow_budget_global_reads_total_from_args_without_handle() {
+        // With no budget handle threaded, `budget.total` comes from
+        // `args.budget.total`, `spent()` reports `0`, and `remaining()` reports
+        // `total` (acceptance: a workflow can read total/spent()/remaining();
+        // `budget.total` equals `args.budget.total`).
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(budget.total));\n",
+            "text(String(budget.spent()));\n",
+            "text(String(budget.remaining()));\n",
+            "text(String(budget.total === args.budget.total));\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            workflow_execute_request_with_args(source, workflow_budget_args(500), "run-budget-1"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec![
+                "500".to_string(),
+                "0".to_string(),
+                "500".to_string(),
+                "true".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_budget_global_forwards_to_handle_and_holds_invariant() {
+        // A threaded handle backs `spent()`/`remaining()`; `total` matches the
+        // handle's configured ceiling, and the `spent() + remaining() == total`
+        // invariant holds (acceptance: invariant relative to total).
+        let budget = FixtureBudget::new(100, 30);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(budget.total));\n",
+            "text(String(budget.spent()));\n",
+            "text(String(budget.remaining()));\n",
+            "text(String(budget.spent() + budget.remaining() === budget.total));\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime_with_budget(
+            HashMap::new(),
+            workflow_execute_request_with_args(source, workflow_budget_args(100), "run-budget-2"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+            Some(budget as Arc<dyn WorkflowBudgetHandle>),
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec![
+                "100".to_string(),
+                "30".to_string(),
+                "70".to_string(),
+                "true".to_string(),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_budget_remaining_is_clamped_at_zero_when_overspent() {
+        // Overshoot (spent > total) clamps `remaining()` at 0 (acceptance:
+        // remaining clamped at 0).
+        let budget = FixtureBudget::new(50, 80);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(budget.spent()));\n",
+            "text(String(budget.remaining()));\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime_with_budget(
+            HashMap::new(),
+            workflow_execute_request_with_args(source, workflow_budget_args(50), "run-budget-3"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+            Some(budget as Arc<dyn WorkflowBudgetHandle>),
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec!["80".to_string(), "0".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_budget_spent_is_live_after_agent_completes() {
+        // `budget.spent()` is read live at call time: the script reads it before
+        // an `agent()` call (0), the test bumps the shared handle to simulate the
+        // subagent consuming tokens, then the script re-reads it after the agent
+        // completes and observes the updated spend (acceptance: live values that
+        // change after subagents complete turns).
+        let budget = FixtureBudget::new(100, 0);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(budget.spent()));\n",
+            "await agent('do work');\n",
+            "text(String(budget.spent()));\n",
+            "text(String(budget.remaining()));\n",
+        );
+        let (runtime_tx, _ctrl, _handle) = spawn_runtime_with_budget(
+            HashMap::new(),
+            workflow_execute_request_with_args(source, workflow_budget_args(100), "run-budget-4"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+            Some(Arc::clone(&budget) as Arc<dyn WorkflowBudgetHandle>),
+        )
+        .unwrap();
+
+        // Wait for the `agent()` call, buffering the pre-agent events (including
+        // the first `text(String(budget.spent()))` output), then simulate the
+        // subagent having spent 40 output tokens before resolving it.
+        let mut events = Vec::new();
+        let call_id = loop {
+            let event = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+                .await
+                .expect("runtime event timeout")
+                .expect("runtime event channel closed");
+            match event {
+                RuntimeEvent::AgentCall { id, .. } => break id,
+                other => events.push(other),
+            }
+        };
+        budget.set_spent(40);
+        runtime_tx
+            .send(RuntimeCommand::ToolResponse {
+                id: call_id,
+                result: serde_json::json!("ok"),
+            })
+            .unwrap();
+
+        events.extend(drain_to_result(&mut event_rx).await);
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec!["0".to_string(), "40".to_string(), "60".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_budget_total_is_read_only() {
+        // Assignment to `budget.total` (and to the `budget` binding itself) must
+        // throw or be silently ignored; reading back proves the value is
+        // unchanged and still equals `args.budget.total` (acceptance:
+        // `budget.total` read-only, equals `args.budget.total`).
+        let budget = FixtureBudget::new(250, 10);
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "try { budget.total = 999; } catch (_e) {}\n",
+            "try { budget = { total: 0 }; } catch (_e) {}\n",
+            "text(String(budget.total));\n",
+            "text(String(budget.total === args.budget.total));\n",
+        );
+        let (_tx, _ctrl, _handle) = spawn_runtime_with_budget(
+            HashMap::new(),
+            workflow_execute_request_with_args(source, workflow_budget_args(250), "run-budget-5"),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+            Some(budget as Arc<dyn WorkflowBudgetHandle>),
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        assert_result_ok(&events);
+        assert_eq!(
+            text_outputs(&events),
+            vec!["250".to_string(), "true".to_string()],
+            "read-only budget.total must be unchanged by assignment",
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_exec_does_not_install_budget_global() {
+        // The `budget` global is workflow-only: a plain code-mode exec that reads
+        // `budget` sees a `ReferenceError`, never a leaked global.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(budget.total));\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("budget is not defined"),
+            "expected ReferenceError for missing `budget` global, got: {error_text}"
+        );
+    }
+
+    #[tokio::test]
     async fn plain_exec_does_not_install_args_or_workflow_globals() {
         // The `args` and `workflow` globals are workflow-only: a plain code-mode
         // exec that reads `args` sees a `ReferenceError`, never a leaked global.
@@ -1035,6 +1395,48 @@ await new Promise(() => {});
     }
 
     #[tokio::test]
+    async fn parallel_length_lying_proxy_cannot_dispatch_beyond_captured_cap() {
+        // A `Proxy` wrapping an array passes `Array.isArray`, so a naive guard that
+        // reads `.length` for the cap check and lets `Array.prototype.map` re-read
+        // it later could be tricked into dispatching for far more positions than the
+        // guard validated. Here the proxy reports `3` on the FIRST length read (the
+        // cap guard) and `5000` on every read afterwards, over a backing array of
+        // 5000 real thunks. Proxy-safe dispatch snapshots the single captured count
+        // (`3`), so exactly 3 thunks are invoked, the result has length 3, and the
+        // proxy's `length` trap fires exactly once.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "let dispatched = 0;\n",
+            "const real = [];\n",
+            "for (let i = 0; i < 5000; i++)\n",
+            "  real.push(() => { dispatched += 1; return Promise.resolve(i); });\n",
+            "let reads = 0;\n",
+            "const proxy = new Proxy(real, {\n",
+            "  get(target, prop, recv) {\n",
+            "    if (prop === 'length') {\n",
+            "      reads += 1;\n",
+            "      return reads === 1 ? 3 : 5000;\n",
+            "    }\n",
+            "    return Reflect.get(target, prop, recv);\n",
+            "  },\n",
+            "});\n",
+            "const results = await parallel(proxy);\n",
+            "text('dispatched=' + dispatched);\n",
+            "text('len=' + results.length);\n",
+            "text('reads=' + reads);\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "dispatched=3".to_string(),
+                "len=3".to_string(),
+                "reads=1".to_string(),
+            ],
+            "a length-lying proxy must not dispatch beyond the single captured cap",
+        );
+    }
+
+    #[tokio::test]
     async fn plain_exec_does_not_install_parallel_prelude() {
         // `parallel` is gated on the workflow flag exactly like the other
         // narrator globals: a plain code-mode exec that calls it sees a
@@ -1061,6 +1463,205 @@ await new Promise(() => {});
         assert!(
             error_text.contains("parallel is not defined"),
             "expected ReferenceError for missing `parallel` global, got: {error_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_returns_results_in_input_order() {
+        // Acceptance: `pipeline(items, ...stages)` resolves to a position-
+        // preserving array of length `items.length`; each item is threaded through
+        // every stage in order.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const results = await pipeline(\n",
+            "  ['a', 'b', 'c'],\n",
+            "  async (x) => x + '1',\n",
+            "  async (x) => x + '2',\n",
+            ");\n",
+            "text(String(results.length));\n",
+            "text(JSON.stringify(results));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["3".to_string(), "[\"a12\",\"b12\",\"c12\"]".to_string(),],
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_stages_have_no_barrier_between_items() {
+        // Acceptance: `pipeline` is no-barrier — item A can reach stage 3 while
+        // item B is still in stage 1. Item B's stage 1 is delayed, so item A runs
+        // all three stages to completion before B ever finishes stage 1. A
+        // per-stage *barrier* (the wrong semantics) would force every item through
+        // stage 1 before any item entered stage 2, ordering `B:s1` ahead of
+        // `A:s2`; the no-barrier chain instead emits every `A:*` before `B:s1`.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const events = [];\n",
+            "const stage = (n) => (x) =>\n",
+            "  new Promise((resolve) =>\n",
+            "    setTimeout(() => {\n",
+            "      events.push(x + ':s' + n);\n",
+            "      resolve(x);\n",
+            "    }, x === 'B' && n === 1 ? 60 : 0)\n",
+            "  );\n",
+            "const results = await pipeline(['A', 'B'], stage(1), stage(2), stage(3));\n",
+            "text(JSON.stringify(results));\n",
+            "text(events.join(','));\n",
+            "const aStage3 = events.indexOf('A:s3');\n",
+            "const bStage1 = events.indexOf('B:s1');\n",
+            "text(String(aStage3 >= 0 && bStage1 >= 0 && aStage3 < bStage1));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "[\"A\",\"B\"]".to_string(),
+                "A:s1,A:s2,A:s3,B:s1,B:s2,B:s3".to_string(),
+                "true".to_string(),
+            ],
+            "item A must reach stage 3 before item B leaves stage 1 (no barrier)",
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_stage_throw_drops_only_that_item_to_null() {
+        // Acceptance: a stage that throws resolves ONLY that item's position to
+        // `null`; sibling items advance through the remaining stages unaffected and
+        // keep their slots (position-preserving).
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const results = await pipeline(\n",
+            "  ['a', 'b', 'c'],\n",
+            "  async (x) => x,\n",
+            "  async (x) => {\n",
+            "    if (x === 'b') throw new Error('boom');\n",
+            "    return x.toUpperCase();\n",
+            "  },\n",
+            "  async (x) => x + '!',\n",
+            ");\n",
+            "text(JSON.stringify(results));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["[\"A!\",null,\"C!\"]".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_at_cap_boundary_dispatches_all() {
+        // The 4096-item boundary is inclusive: exactly 4096 items thread through
+        // the stages without tripping the cap guard.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "const items = [];\n",
+            "for (let i = 0; i < 4096; i++) items.push(i);\n",
+            "const results = await pipeline(items, async (x) => x + 1);\n",
+            "text(String(results.length));\n",
+            "text(String(results[0]) + ',' + String(results[4095]));\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec!["4096".to_string(), "1,4096".to_string()],
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_over_cap_throws_before_any_dispatch() {
+        // Acceptance: >4096 items throws a descriptive cap error BEFORE any stage
+        // runs. `dispatched` staying at 0 proves the guard fires ahead of
+        // `Array.prototype.map` mapping items onto stage chains.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "let dispatched = 0;\n",
+            "const items = [];\n",
+            "for (let i = 0; i < 4097; i++) items.push(i);\n",
+            "const stage = (x) => { dispatched += 1; return Promise.resolve(x); };\n",
+            "try {\n",
+            "  await pipeline(items, stage);\n",
+            "  text('NO_THROW');\n",
+            "} catch (e) {\n",
+            "  text(e.constructor.name);\n",
+            "  text(String(e.message.includes('4096')));\n",
+            "}\n",
+            "text('dispatched=' + dispatched);\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "RangeError".to_string(),
+                "true".to_string(),
+                "dispatched=0".to_string(),
+            ],
+            "cap must throw a descriptive RangeError before dispatching any stage",
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_length_lying_proxy_cannot_dispatch_beyond_captured_cap() {
+        // The `pipeline()` cap must be equally proxy-safe: the proxy reports `2` on
+        // the first length read (cap guard) and `5000` afterwards over a 5000-item
+        // backing array. Snapshotting the single captured count means exactly 2 item
+        // chains dispatch their (only) stage, the result has length 2, and the
+        // proxy's `length` trap fires exactly once.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "let dispatched = 0;\n",
+            "const real = [];\n",
+            "for (let i = 0; i < 5000; i++) real.push(i);\n",
+            "let reads = 0;\n",
+            "const proxy = new Proxy(real, {\n",
+            "  get(target, prop, recv) {\n",
+            "    if (prop === 'length') {\n",
+            "      reads += 1;\n",
+            "      return reads === 1 ? 2 : 5000;\n",
+            "    }\n",
+            "    return Reflect.get(target, prop, recv);\n",
+            "  },\n",
+            "});\n",
+            "const stage = (x) => { dispatched += 1; return Promise.resolve(x); };\n",
+            "const results = await pipeline(proxy, stage);\n",
+            "text('dispatched=' + dispatched);\n",
+            "text('len=' + results.length);\n",
+            "text('reads=' + reads);\n",
+        );
+        assert_eq!(
+            run_workflow_text_outputs(source).await,
+            vec![
+                "dispatched=2".to_string(),
+                "len=2".to_string(),
+                "reads=1".to_string(),
+            ],
+            "a length-lying proxy must not dispatch beyond the single captured cap",
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_exec_does_not_install_pipeline_prelude() {
+        // `pipeline` is gated on the workflow flag exactly like `parallel`: a plain
+        // code-mode exec that calls it sees a `ReferenceError`, never a leaked
+        // binding.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "await pipeline([1], async (x) => x);\n",
+        );
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let (_tx, _ctrl, _handle) = spawn_runtime(
+            HashMap::new(),
+            execute_request(source),
+            event_tx,
+            PendingRuntimeMode::Continue,
+            /*task_failure_handler*/ None,
+        )
+        .unwrap();
+
+        let events = drain_to_result(&mut event_rx).await;
+        let RuntimeEvent::Result { error_text, .. } = events.last().expect("result event") else {
+            panic!("last event must be Result");
+        };
+        let error_text = error_text.as_deref().unwrap_or_default();
+        assert!(
+            error_text.contains("pipeline is not defined"),
+            "expected ReferenceError for missing `pipeline` global, got: {error_text}"
         );
     }
 }

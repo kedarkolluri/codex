@@ -314,6 +314,22 @@ impl runtime::SessionRuntimeDelegate for ProtocolDelegate {
             .await
     }
 
+    async fn spawn_workflow(
+        &self,
+        cell_id: runtime::CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.delegate
+            .spawn_workflow(protocol_cell_id(&cell_id), name, args, cancellation_token)
+            .await
+    }
+
+    fn budget_handle(&self) -> Option<Arc<dyn codex_code_mode_protocol::WorkflowBudgetHandle>> {
+        self.delegate.budget_handle()
+    }
+
     fn cell_closed(&self, cell_id: &runtime::CellId) {
         self.delegate.cell_closed(&protocol_cell_id(cell_id));
     }

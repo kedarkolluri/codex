@@ -892,6 +892,8 @@ struct SpawningDelegate {
     barrier: Option<Arc<Barrier>>,
     seen_ordinals: Mutex<Vec<u64>>,
     seen_schema_ordinals: Mutex<Vec<u64>>,
+    workflow_calls: AtomicUsize,
+    seen_workflow_names: Mutex<Vec<String>>,
 }
 
 impl SpawningDelegate {
@@ -901,6 +903,8 @@ impl SpawningDelegate {
             barrier: None,
             seen_ordinals: Mutex::new(Vec::new()),
             seen_schema_ordinals: Mutex::new(Vec::new()),
+            workflow_calls: AtomicUsize::new(0),
+            seen_workflow_names: Mutex::new(Vec::new()),
         }
     }
 
@@ -922,6 +926,17 @@ impl SpawningDelegate {
         self.seen_schema_ordinals
             .lock()
             .expect("schema ordinals lock")
+            .clone()
+    }
+
+    fn workflow_calls(&self) -> usize {
+        self.workflow_calls.load(Ordering::Acquire)
+    }
+
+    fn seen_workflow_names(&self) -> Vec<String> {
+        self.seen_workflow_names
+            .lock()
+            .expect("workflow names lock")
             .clone()
     }
 }
@@ -987,6 +1002,39 @@ impl CodeModeSessionDelegate for SpawningDelegate {
                 prompt => {
                     AgentSpawnOutcome::Completed(JsonValue::String(format!("final:{prompt}")))
                 }
+            }
+        })
+    }
+
+    fn spawn_workflow<'a>(
+        &'a self,
+        _cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        _cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        self.workflow_calls.fetch_add(1, Ordering::AcqRel);
+        self.seen_workflow_names
+            .lock()
+            .expect("workflow names lock")
+            .push(name.clone());
+        Box::pin(async move {
+            match name.as_str() {
+                // A name that resolves in the registry: the nested run's top-level result, echoing
+                // back the `args` payload to prove it crossed the wire.
+                "child" => {
+                    let echoed = args
+                        .as_ref()
+                        .and_then(|args| args.get("tag"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("none")
+                        .to_string();
+                    AgentSpawnOutcome::Completed(JsonValue::String(format!("child:{echoed}")))
+                }
+                // A nested run that produced no result: resolves the promise to JS `null`.
+                "empty" => AgentSpawnOutcome::Failed,
+                // A name that does not resolve in the registry: the isolate throws.
+                _ => AgentSpawnOutcome::Rejected("WorkflowNotFound".to_string()),
             }
         })
     }
@@ -1143,5 +1191,79 @@ text(results.join(","));
         ordinals.len(),
         16,
         "each of the 16 agent() calls carried a distinct ordinal"
+    );
+}
+
+/// The real process-host bridge round-trips nested `workflow(nameOrRef, args)` calls end-to-end over
+/// the default `SpawnWorkflow`/`WorkflowSpawned` wire: a `Completed` (JS value, with `args` forwarded
+/// across the wire), a `Failed` (JS `null`, no throw), and a `Rejected` (the isolate throws). Before
+/// the wire variant existed this resolved to `null` on the process host regardless of outcome.
+#[tokio::test]
+async fn remote_workflow_spawn_round_trips_outcomes_over_the_wire() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(SpawningDelegate::new());
+    let session = provider
+        .create_session(delegate.clone())
+        .await
+        .expect("create remote session");
+
+    let source = r#"
+const child = await workflow("child", { tag: "hello" });
+const empty = await workflow("empty");
+let missingText;
+try {
+  await workflow("missing");
+  missingText = "resolved";
+} catch (err) {
+  missingText = "threw:" + String(err);
+}
+text(String(child));
+text(String(empty));
+text(missingText);
+"#;
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        execute(&session, workflow_request(source)),
+    )
+    .await
+    .expect("workflow completed before timeout");
+    let texts = result_texts(&response);
+    assert_eq!(texts.len(), 3, "expected three output lines, got {texts:?}");
+    assert_eq!(
+        texts[0], "child:hello",
+        "Completed marshals to a JS value and args crossed the wire",
+    );
+    assert_eq!(
+        texts[1], "null",
+        "Failed resolves the workflow() promise to JS null without throwing",
+    );
+    assert!(
+        texts[2].starts_with("threw:") && texts[2].contains("WorkflowNotFound"),
+        "Rejected must throw the registry-miss message in the isolate, got {:?}",
+        texts[2],
+    );
+
+    session.shutdown().await.expect("shutdown remote session");
+
+    assert_eq!(
+        delegate.workflow_calls(),
+        3,
+        "one wire spawn per workflow() call"
+    );
+    assert_eq!(
+        delegate.seen_workflow_names(),
+        vec![
+            "child".to_string(),
+            "empty".to_string(),
+            "missing".to_string()
+        ],
+        "each nested workflow name reached the client delegate over the wire",
+    );
+    assert_eq!(
+        delegate.spawn_calls(),
+        0,
+        "no agent() calls in this workflow"
     );
 }

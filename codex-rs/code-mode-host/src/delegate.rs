@@ -11,6 +11,7 @@ use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateResponse;
 use codex_code_mode_protocol::host::SessionId;
+use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
 use crate::peer::HostPeer;
@@ -45,7 +46,9 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 .await?
             {
                 DelegateResponse::ToolResult { result } => Ok(result),
-                DelegateResponse::NotificationDelivered | DelegateResponse::AgentSpawned { .. } => {
+                DelegateResponse::NotificationDelivered
+                | DelegateResponse::AgentSpawned { .. }
+                | DelegateResponse::WorkflowSpawned { .. } => {
                     Err("code-mode client returned an invalid tool result".to_string())
                 }
             }
@@ -74,7 +77,9 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 .await?
             {
                 DelegateResponse::NotificationDelivered => Ok(()),
-                DelegateResponse::ToolResult { .. } | DelegateResponse::AgentSpawned { .. } => {
+                DelegateResponse::ToolResult { .. }
+                | DelegateResponse::AgentSpawned { .. }
+                | DelegateResponse::WorkflowSpawned { .. } => {
                     Err("code-mode client returned an invalid notification result".to_string())
                 }
             }
@@ -110,6 +115,38 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 .await
             {
                 Ok(DelegateResponse::AgentSpawned { outcome }) => outcome.into(),
+                Ok(_) | Err(_) => AgentSpawnOutcome::Failed,
+            }
+        })
+    }
+
+    /// Route a workflow `workflow(nameOrRef, args)` nested run over the wire to the client-side
+    /// delegate (the real core workflow handler) and await the three-way outcome. Mirrors
+    /// [`Self::spawn_agent`] exactly: any wire failure, cancellation, or an unexpected response
+    /// variant is death-is-null (`Failed`), while an explicit `Rejected` from the client (e.g. an
+    /// unresolvable name) is faithfully preserved so the isolate throws.
+    fn spawn_workflow<'a>(
+        &'a self,
+        cell_id: CellId,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::SpawnWorkflow {
+                        cell_id: cell_id.into(),
+                        name,
+                        args,
+                    },
+                    cancellation_token,
+                )
+                .await
+            {
+                Ok(DelegateResponse::WorkflowSpawned { outcome }) => outcome.into(),
                 Ok(_) | Err(_) => AgentSpawnOutcome::Failed,
             }
         })

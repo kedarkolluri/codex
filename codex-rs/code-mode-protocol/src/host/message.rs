@@ -238,6 +238,16 @@ pub enum DelegateRequest {
         // the wire shape is unchanged.
         opts: Box<AgentCallOpts>,
     },
+    /// A workflow `workflow(nameOrRef, args)` nested run. `cell_id` routes the call to the owning
+    /// cell's local delegate (the real core workflow handler) just like [`Self::SpawnAgent`]; `name`
+    /// is the caller-supplied `nameOrRef` resolved against the registry client-side and `args` is the
+    /// invocation JSON injected as the nested run's read-only `args` global.
+    #[serde(rename = "workflow/spawn")]
+    SpawnWorkflow {
+        cell_id: WireCellId,
+        name: String,
+        args: Option<JsonValue>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -251,6 +261,11 @@ pub enum DelegateResponse {
     /// (resolve-with-value / resolve-to-null / reject) round-tripped back to the host isolate.
     #[serde(rename = "agent/spawned")]
     AgentSpawned { outcome: WireAgentSpawnOutcome },
+    /// The resolution of a [`DelegateRequest::SpawnWorkflow`]: the nested `workflow()` run's outcome
+    /// (resolve-with-value / resolve-to-null / reject) round-tripped back to the host isolate. Reuses
+    /// [`WireAgentSpawnOutcome`] because the three-way settlement is identical to `agent()`.
+    #[serde(rename = "workflow/spawned")]
+    WorkflowSpawned { outcome: WireAgentSpawnOutcome },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

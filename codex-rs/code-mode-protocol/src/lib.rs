@@ -45,6 +45,7 @@ pub use session::CodeModeSessionResultFuture;
 pub use session::NotificationFuture;
 pub use session::StartedCell;
 pub use session::ToolInvocationFuture;
+pub use session::WorkflowBudgetHandle;
 pub use workflow_meta::ParsedWorkflowMeta;
 pub use workflow_meta::parse_workflow_meta;
 

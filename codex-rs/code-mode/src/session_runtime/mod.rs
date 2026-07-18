@@ -289,6 +289,22 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
+    async fn spawn_workflow(
+        &self,
+        name: String,
+        args: Option<JsonValue>,
+        cancellation_token: CancellationToken,
+    ) -> codex_code_mode_protocol::AgentSpawnOutcome {
+        self.inner
+            .delegate
+            .spawn_workflow(self.cell_id.clone(), name, args, cancellation_token)
+            .await
+    }
+
+    fn budget_handle(&self) -> Option<Arc<dyn codex_code_mode_protocol::WorkflowBudgetHandle>> {
+        self.inner.delegate.budget_handle()
+    }
+
     async fn commit_completion(
         &self,
         stored_value_writes: HashMap<String, JsonValue>,
