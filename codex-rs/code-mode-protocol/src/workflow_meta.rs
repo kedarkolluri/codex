@@ -36,6 +36,31 @@ const MAX_DEPTH: usize = 32;
 /// of scanning an arbitrarily large file.
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
+/// Maximum number of characters of an offending identifier/number/key that is
+/// echoed back into an error message.
+///
+/// Error strings from this parser are surfaced to the model as tool results (see
+/// `CodeModeWorkflowHandler`). Because the scanned manifest region is only
+/// bounded by [`MAX_MANIFEST_BYTES`] (256 KiB), a single adversarial identifier
+/// or number could otherwise be reproduced verbatim into a ~60K-token error
+/// string that poisons the model context. Any offending token longer than this
+/// is truncated with an ellipsis marker.
+const MAX_ERROR_TOKEN_CHARS: usize = 80;
+
+/// Cap an offending identifier/number/key echoed into an error message so a
+/// pathological input cannot inflate the (model-visible) error string. Longer
+/// tokens are truncated to [`MAX_ERROR_TOKEN_CHARS`] characters plus an ellipsis
+/// marker.
+fn truncate_for_error(token: &str) -> String {
+    let mut chars = token.chars();
+    let truncated: String = chars.by_ref().take(MAX_ERROR_TOKEN_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 /// Parsed representation of a workflow's static `meta` manifest.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ParsedWorkflowMeta {
@@ -291,7 +316,8 @@ impl<'a> Parser<'a> {
         match self.parse_ident()? {
             Some(ident) if ident == expected => Ok(()),
             Some(ident) => Err(format!(
-                "expected `export const meta = {{ ... }}`: found `{ident}` where `{expected}` was expected"
+                "expected `export const meta = {{ ... }}`: found `{}` where `{expected}` was expected",
+                truncate_for_error(&ident)
             )),
             None => Err(format!(
                 "expected `export const meta = {{ ... }}`: missing `{expected}`"
@@ -379,7 +405,8 @@ impl<'a> Parser<'a> {
                         // Treating it as `null` would silently accept a
                         // non-literal reference, so reject it explicitly.
                         other => Err(format!(
-                            "`meta` must contain only static literals; found non-literal `{other}` (variable reference, function call, or expression)"
+                            "`meta` must contain only static literals; found non-literal `{}` (variable reference, function call, or expression)",
+                            truncate_for_error(other)
                         )),
                     },
                     None => Err(
@@ -437,7 +464,8 @@ impl<'a> Parser<'a> {
                 _ => {
                     // Shorthand `{ name }` is a variable reference, not a literal.
                     return Err(format!(
-                        "expected `:` after key `{key}` in `meta`; shorthand properties are not allowed"
+                        "expected `:` after key `{}` in `meta`; shorthand properties are not allowed",
+                        truncate_for_error(&key)
                     ));
                 }
             }
@@ -690,9 +718,12 @@ impl<'a> Parser<'a> {
             .chars()
             .filter(|ch| *ch != '_')
             .collect();
-        raw.parse::<f64>()
-            .map(LiteralValue::Number)
-            .map_err(|_| format!("invalid numeric literal `{raw}` in `meta`"))
+        raw.parse::<f64>().map(LiteralValue::Number).map_err(|_| {
+            format!(
+                "invalid numeric literal `{}` in `meta`",
+                truncate_for_error(&raw)
+            )
+        })
     }
 }
 
@@ -1143,6 +1174,70 @@ mod tests {
         )
         .unwrap();
         assert_eq!(meta.name, "\u{1F600}");
+    }
+
+    /// Re-review finding: an offending identifier echoed into an error message
+    /// must be capped, not reproduced verbatim. A ~256 KiB identifier would
+    /// otherwise become a ~60K-token error string surfaced to the model.
+    #[test]
+    fn caps_offending_non_literal_identifier_in_error_message() {
+        let huge = "a".repeat(200_000);
+        let source =
+            format!("export const meta = {{ name: 'n', description: 'd', extra: {huge} }};");
+        let err = parse_workflow_meta(&source).unwrap_err();
+        assert!(err.contains('…'), "expected an ellipsis marker: {err}");
+        assert!(err.contains("literal"), "unexpected error: {err}");
+        assert!(
+            err.len() < 512,
+            "error must stay bounded, got {} bytes",
+            err.len()
+        );
+        assert!(
+            !err.contains(&"a".repeat(super::MAX_ERROR_TOKEN_CHARS + 1)),
+            "offending identifier must not be echoed verbatim: {err}"
+        );
+    }
+
+    /// The wrong keyword after `export const` is likewise capped in the error.
+    #[test]
+    fn caps_offending_keyword_in_error_message() {
+        let huge = "x".repeat(200_000);
+        let source = format!("export const {huge} = 1;");
+        let err = parse_workflow_meta(&source).unwrap_err();
+        assert!(err.contains('…'), "expected an ellipsis marker: {err}");
+        assert!(
+            err.len() < 512,
+            "error must stay bounded, got {} bytes",
+            err.len()
+        );
+    }
+
+    /// A shorthand property whose key is pathologically long is capped in the
+    /// error rather than echoed in full.
+    #[test]
+    fn caps_offending_shorthand_key_in_error_message() {
+        let huge = "k".repeat(200_000);
+        let source = format!("export const meta = {{ {huge} }};");
+        let err = parse_workflow_meta(&source).unwrap_err();
+        assert!(err.contains("shorthand"), "unexpected error: {err}");
+        assert!(err.contains('…'), "expected an ellipsis marker: {err}");
+        assert!(
+            err.len() < 512,
+            "error must stay bounded, got {} bytes",
+            err.len()
+        );
+    }
+
+    /// A short offending token is echoed unchanged (no spurious ellipsis).
+    #[test]
+    fn short_offending_token_is_not_truncated() {
+        let err = parse_workflow_meta("export const meta = { name: NAME, description: 'd' };")
+            .unwrap_err();
+        assert!(err.contains("NAME"), "short token should be echoed: {err}");
+        assert!(
+            !err.contains('…'),
+            "short token should not be truncated: {err}"
+        );
     }
 
     /// A `\u{...}` code-point escape for an astral char still works.

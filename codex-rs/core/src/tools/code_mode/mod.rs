@@ -4,6 +4,8 @@ pub(crate) mod execute_spec;
 mod response_adapter;
 mod wait_handler;
 pub(crate) mod wait_spec;
+mod workflow_handler;
+pub(crate) mod workflow_spec;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -47,14 +49,22 @@ use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
+pub(crate) use workflow_handler::CodeModeWorkflowHandler;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
 pub(crate) const DEFAULT_WAIT_YIELD_TIME_MS: u64 = codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS;
+/// Un-namespaced name of the workflow host tool (P0-host-tool-skeleton).
+pub(crate) const WORKFLOW_TOOL_NAME: &str = "workflow";
 
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME
+}
+
+/// Returns true for the un-namespaced `workflow` host tool.
+pub(crate) fn is_workflow_tool_name(tool_name: &ToolName) -> bool {
+    tool_name.namespace.is_none() && tool_name.name == WORKFLOW_TOOL_NAME
 }
 
 #[derive(Clone)]
@@ -427,6 +437,192 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workflow_disabled_feature_is_unreachable() {
+        use super::workflow_handler::ensure_workflow_enabled;
+        use crate::function_tool::FunctionCallError;
+        use codex_features::Feature;
+        use codex_features::Features;
+
+        let disabled = Features::default();
+        let err = ensure_workflow_enabled(&disabled).expect_err("workflow must be gated off");
+        assert!(matches!(err, FunctionCallError::RespondToModel(_)));
+
+        let mut enabled = Features::default();
+        enabled.enable(Feature::Workflow);
+        ensure_workflow_enabled(&enabled).expect("enabled feature is reachable");
+    }
+
+    #[test]
+    fn workflow_invalid_meta_is_rejected() {
+        use super::workflow_handler::validate_workflow_meta;
+
+        // A body with no `export const meta` manifest must be rejected before any
+        // isolate execution.
+        validate_workflow_meta("text('no meta here');")
+            .expect_err("missing meta manifest must be rejected");
+        // A computed (non-static) meta is likewise rejected.
+        validate_workflow_meta("export const meta = buildMeta();")
+            .expect_err("non-static meta manifest must be rejected");
+    }
+
+    #[tokio::test]
+    async fn workflow_meta_only_body_runs_once_end_to_end() {
+        use super::workflow_handler::run_workflow_source;
+        use codex_features::Feature;
+        use codex_features::Features;
+
+        let service = CodeModeService::new(Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(
+                "codex-code-mode-host-does-not-exist".into(),
+            ),
+        ));
+
+        let mut features = Features::default();
+        features.enable(Feature::Workflow);
+
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo workflow' };\n",
+            "text('workflow-ran');",
+        );
+
+        let output = run_workflow_source(
+            &features,
+            &service,
+            "wf-call-1".to_string(),
+            Vec::new(),
+            source,
+        )
+        .await
+        .expect("valid workflow runs its body once");
+
+        assert_eq!(
+            output.response,
+            RuntimeResponse::Result {
+                cell_id: codex_code_mode::CellId::new("1".to_string()),
+                content_items: vec![CodeModeOutputContentItem::InputText {
+                    text: "workflow-ran".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+        service.shutdown().await.expect("shutdown service");
+    }
+
+    #[tokio::test]
+    async fn workflow_phase_and_log_body_runs_end_to_end() {
+        use super::workflow_handler::run_workflow_source;
+        use codex_features::Feature;
+        use codex_features::Features;
+
+        let service = CodeModeService::new(Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(
+                "codex-code-mode-host-does-not-exist".into(),
+            ),
+        ));
+
+        let mut features = Features::default();
+        features.enable(Feature::Workflow);
+
+        // A `phase()`/`log()`-only workflow (no `agent()`) must run body-once to
+        // completion: reaching the trailing `text(...)` proves the workflow
+        // narrator globals were installed for this run and did not throw.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo', phases: ['plan'] };\n",
+            "phase('plan');\n",
+            "log('starting');\n",
+            "text('workflow-ran');\n",
+        );
+
+        let output = run_workflow_source(
+            &features,
+            &service,
+            "wf-call-phase-log".to_string(),
+            Vec::new(),
+            source,
+        )
+        .await
+        .expect("phase/log workflow runs its body once");
+
+        assert_eq!(
+            output.response,
+            RuntimeResponse::Result {
+                cell_id: codex_code_mode::CellId::new("1".to_string()),
+                content_items: vec![CodeModeOutputContentItem::InputText {
+                    text: "workflow-ran".to_string(),
+                }],
+                error_text: None,
+            }
+        );
+        service.shutdown().await.expect("shutdown service");
+    }
+
+    #[tokio::test]
+    async fn workflow_invalid_meta_never_reaches_isolate() {
+        use super::workflow_handler::run_workflow_source;
+        use codex_features::Feature;
+        use codex_features::Features;
+
+        let service = CodeModeService::new(Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(
+                "codex-code-mode-host-does-not-exist".into(),
+            ),
+        ));
+
+        let mut features = Features::default();
+        features.enable(Feature::Workflow);
+
+        // No `meta` manifest: rejected before the isolate ever runs. If it had run,
+        // `text(...)` would have produced a `Result` output instead of an error.
+        let err = run_workflow_source(
+            &features,
+            &service,
+            "wf-call-2".to_string(),
+            Vec::new(),
+            "text('should-not-run');",
+        )
+        .await
+        .expect_err("invalid meta must be rejected");
+        match err {
+            crate::function_tool::FunctionCallError::RespondToModel(message) => {
+                assert!(
+                    message.contains("meta"),
+                    "expected a meta rejection, got: {message}"
+                );
+            }
+            other => panic!("expected RespondToModel, got {other:?}"),
+        }
+        service.shutdown().await.expect("shutdown service");
+    }
+
+    #[tokio::test]
+    async fn workflow_disabled_feature_skips_execution() {
+        use super::workflow_handler::run_workflow_source;
+        use codex_features::Features;
+
+        let service = CodeModeService::new(Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(
+                "codex-code-mode-host-does-not-exist".into(),
+            ),
+        ));
+
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo workflow' };\n",
+            "text('workflow-ran');",
+        );
+
+        run_workflow_source(
+            &Features::default(),
+            &service,
+            "wf-call-3".to_string(),
+            Vec::new(),
+            source,
+        )
+        .await
+        .expect_err("workflow is unreachable when the feature is disabled");
+        service.shutdown().await.expect("shutdown service");
+    }
+
     #[tokio::test]
     async fn missing_process_host_falls_back_to_in_process_session() {
         let service = CodeModeService::new(Arc::new(
@@ -442,6 +638,7 @@ mod tests {
                 source: "text('fallback')".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
+                workflow: false,
             })
             .await
             .expect("missing host should fall back to an in-process session")
@@ -460,5 +657,240 @@ mod tests {
             }
         );
         service.shutdown().await.expect("shutdown service");
+    }
+
+    /// Drive [`super::CodeModeWorkflowHandler`] end-to-end through its
+    /// [`crate::tools::registry::ToolExecutor`] surface — the same path that
+    /// `build_code_mode_executors` registers the tool on. Unlike the
+    /// `run_workflow_source` tests, this exercises payload matching, the
+    /// per-session `code_mode_service`, and the model-facing response adapter
+    /// (`to_response_item`), so a registration/gating/adaptation regression that
+    /// leaves `run_workflow_source` intact would still be caught. Returns the
+    /// model-facing [`ResponseInputItem`] the tool would emit.
+    async fn dispatch_workflow_via_handler(
+        workflow_enabled: bool,
+        source: &str,
+    ) -> Result<codex_protocol::models::ResponseInputItem, crate::function_tool::FunctionCallError>
+    {
+        use super::CodeModeWorkflowHandler;
+        use super::workflow_spec::create_workflow_tool;
+        use crate::session::step_context::StepContext;
+        use crate::session::tests::make_session_and_context;
+        use crate::tools::context::ToolCallSource;
+        use crate::tools::context::ToolInvocation;
+        use crate::tools::context::ToolOutput;
+        use crate::tools::registry::ToolExecutor;
+        use crate::turn_diff_tracker::TurnDiffTracker;
+        use codex_features::Feature;
+
+        let (session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        if workflow_enabled {
+            config
+                .features
+                .enable(Feature::Workflow)
+                .expect("test feature should be enableable in config");
+        } else {
+            config
+                .features
+                .disable(Feature::Workflow)
+                .expect("test feature should be disableable in config");
+        }
+        turn.config = Arc::new(config);
+
+        let session = Arc::new(session);
+        let turn = Arc::new(turn);
+        let step_context = StepContext::for_test(Arc::clone(&turn));
+
+        // Register the handler exactly as `build_code_mode_executors` does: the
+        // model-visible spec plus the (here empty) nested-tool specs.
+        let handler = CodeModeWorkflowHandler::new(create_workflow_tool(), Vec::new());
+
+        let payload = ToolPayload::Custom {
+            input: source.to_string(),
+        };
+        let invocation = ToolInvocation {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn),
+            step_context,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call_id: "wf-handler-call".to_string(),
+            tool_name: ToolName::plain(super::WORKFLOW_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        };
+
+        let result = handler.handle(invocation).await;
+        session
+            .services
+            .code_mode_service
+            .shutdown()
+            .await
+            .expect("shutdown service");
+        result.map(|output| output.to_response_item("wf-handler-call", &payload))
+    }
+
+    /// Pull the `(text, success)` out of the custom-tool output the workflow tool
+    /// emits, so a test can assert on the model-facing rendering.
+    fn custom_tool_output(
+        item: codex_protocol::models::ResponseInputItem,
+    ) -> (String, Option<bool>) {
+        match item {
+            codex_protocol::models::ResponseInputItem::CustomToolCallOutput { output, .. } => {
+                (output.body.to_text().unwrap_or_default(), output.success)
+            }
+            other => panic!("expected a custom-tool call output, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_handler_dispatches_valid_script_through_model_adapter() {
+        // (a) With the feature enabled, a trivial meta-valid script dispatched
+        // through the registered tool surface runs its body once and returns the
+        // isolate result via the model-facing adapter.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo workflow' };\n",
+            "text('workflow-ran');",
+        );
+
+        let item = dispatch_workflow_via_handler(/*workflow_enabled=*/ true, source)
+            .await
+            .expect("enabled workflow tool dispatches a valid script");
+        let (text, success) = custom_tool_output(item);
+
+        assert_eq!(success, Some(true), "model-facing success flag");
+        assert!(
+            text.contains("workflow-ran"),
+            "model-facing output should carry the isolate result, got: {text}"
+        );
+        assert!(
+            text.contains("Script completed"),
+            "model-facing output should carry the adapter status header, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_handler_is_unreachable_when_feature_disabled() {
+        // (b) With the feature disabled the tool is unreachable: even a valid
+        // script is rejected at the handler surface instead of dispatching.
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo workflow' };\n",
+            "text('workflow-ran');",
+        );
+
+        let err = dispatch_workflow_via_handler(/*workflow_enabled=*/ false, source)
+            .await
+            .expect_err("disabled workflow tool must be unreachable");
+        match err {
+            crate::function_tool::FunctionCallError::RespondToModel(message) => {
+                assert!(
+                    message.contains("workflow"),
+                    "expected a feature-gate rejection, got: {message}"
+                );
+            }
+            other => panic!("expected RespondToModel, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_handler_rejects_invalid_meta_before_isolate() {
+        // (c) With the feature enabled, an invalid-meta script is rejected at the
+        // handler surface before the isolate runs. If it had reached the isolate,
+        // `text(...)` would have produced a successful custom-tool output.
+        let err = dispatch_workflow_via_handler(
+            /*workflow_enabled=*/ true,
+            "text('should-not-run');",
+        )
+        .await
+        .expect_err("invalid meta must be rejected before isolate execution");
+        match err {
+            crate::function_tool::FunctionCallError::RespondToModel(message) => {
+                assert!(
+                    message.contains("meta"),
+                    "expected a meta rejection, got: {message}"
+                );
+            }
+            other => panic!("expected RespondToModel, got {other:?}"),
+        }
+    }
+
+    /// Drive the real tool-planning path (`build_code_mode_executors` via
+    /// [`crate::tools::router::ToolRouter::from_context`]) so the workflow tool's
+    /// registration/gating at `spec_plan.rs` is exercised — not just the handler
+    /// constructed directly. Returns the names of every tool the router
+    /// registered. `Feature::CodeMode` is always enabled so the code-mode
+    /// executors (and hence the workflow gate) are reached at all.
+    async fn registered_tool_names(workflow_enabled: bool) -> Vec<String> {
+        use crate::session::step_context::StepContext;
+        use crate::session::tests::make_session_and_context;
+        use crate::tools::router::ToolRouter;
+        use crate::tools::router::ToolRouterParams;
+        use codex_features::Feature;
+
+        let (_session, mut turn) = make_session_and_context().await;
+        let mut config = (*turn.config).clone();
+        config
+            .features
+            .enable(Feature::CodeMode)
+            .expect("code_mode feature should be enableable in config");
+        if workflow_enabled {
+            config
+                .features
+                .enable(Feature::Workflow)
+                .expect("workflow feature should be enableable in config");
+        }
+        turn.config = Arc::new(config);
+
+        let turn = Arc::new(turn);
+        let step_context = StepContext::for_test(Arc::clone(&turn));
+        let router = ToolRouter::from_context(
+            step_context.as_ref(),
+            ToolRouterParams {
+                mcp_tools: None,
+                deferred_mcp_tools: None,
+                tool_suggest_candidates: None,
+                extension_tool_executors: Vec::new(),
+                dynamic_tools: &[],
+            },
+            &Default::default(),
+        );
+        router
+            .registered_tool_names_for_test()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn build_code_mode_executors_registers_workflow_tool_when_feature_enabled() {
+        // (a) With `Feature::Workflow` enabled the planning path registers the
+        // dispatchable `workflow` tool.
+        let names = registered_tool_names(/*workflow_enabled=*/ true).await;
+        assert!(
+            names.iter().any(|name| name == super::WORKFLOW_TOOL_NAME),
+            "workflow tool must be registered when the feature is enabled, got: {names:?}"
+        );
+        // Sanity: the code-mode exec tool is registered too, proving we actually
+        // reached `build_code_mode_executors` (rather than the Direct path).
+        assert!(
+            names.iter().any(|name| name == super::PUBLIC_TOOL_NAME),
+            "code-mode exec tool should be registered, got: {names:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_code_mode_executors_omits_workflow_tool_when_feature_disabled() {
+        // (b) With `Feature::Workflow` disabled the planning path must NOT register
+        // the workflow tool, even though code mode is on.
+        let names = registered_tool_names(/*workflow_enabled=*/ false).await;
+        assert!(
+            !names.iter().any(|name| name == super::WORKFLOW_TOOL_NAME),
+            "workflow tool must be absent when the feature is disabled, got: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == super::PUBLIC_TOOL_NAME),
+            "code-mode exec tool should still be registered, got: {names:?}"
+        );
     }
 }
