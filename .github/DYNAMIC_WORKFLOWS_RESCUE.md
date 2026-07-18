@@ -44,6 +44,11 @@ The GitHub hierarchy is rooted at
 the detailed acceptance criteria and GitHub sub-issue relationships carry
 progress into the parent epics.
 
+The public human-facing board is
+[Codex Dynamic Workflows Project #3](https://github.com/users/kedarkolluri/projects/3).
+It tracks Phase, Workstream, Lane, Effort, Priority, assignees, parent issues,
+and sub-issue progress for the full delivery tree.
+
 - [#29](https://github.com/kedarkolluri/codex/issues/29) preserves the interrupted
   session and establishes the baseline.
 - [#24](https://github.com/kedarkolluri/codex/issues/24) owns M4 observability,
