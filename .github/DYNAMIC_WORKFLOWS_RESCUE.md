@@ -25,6 +25,9 @@ Deliver Dynamic Workflows for Codex with empirically measured Claude Code parity
 - saved-workflow discovery and reload;
 - three entrypoints: `codex workflow run`, model-callable `workflow_run`, and
   interactive `/workflow`;
+- execution through either the effective native Codex provider or an existing
+  configured router/provider such as Headroom, without child model overrides
+  silently resetting provider configuration;
 - background execution with a live TUI monitor, child-agent drill-in and return,
   persistent child sessions, completion notifications, and deterministic
   worktree isolation;
@@ -55,7 +58,8 @@ and sub-issue progress for the full delivery tree.
   entrypoints, session navigation, persistence, and worktree isolation. Its
   implementation children are
   [#28](https://github.com/kedarkolluri/codex/issues/28) and
-  [#30–#48](https://github.com/kedarkolluri/codex/issues/30).
+  [#30–#48](https://github.com/kedarkolluri/codex/issues/30), plus provider/router
+  compatibility in [#58](https://github.com/kedarkolluri/codex/issues/58).
 - [#25](https://github.com/kedarkolluri/codex/issues/25) owns deterministic tests,
   human-agent UAT, cross-host conformance, CI, and Claude comparison. Its
   children are [#49–#55](https://github.com/kedarkolluri/codex/issues/49) and
@@ -66,7 +70,8 @@ and sub-issue progress for the full delivery tree.
 Immediate critical path:
 
 1. Preserve the forensic objects in #29.
-2. Repair and prove the real CLI/production-host seam in #28 and #57.
+2. Repair and prove the real CLI/production-host seam in #28 and #57, including
+   native-provider and configured-router execution in #58.
 3. Build the protocol and run-model foundation in #32, #30, #33, and #31.
 4. Complete the M4 user experience under #24.
 5. Complete deterministic plus human-agent UAT and Claude evidence under #25.
@@ -229,6 +234,11 @@ later refinements.
 - Interactive `/workflow` picker and launcher.
 - Normalize all entrypoints to equivalent outcomes and journals.
 - Feature-gate every surface consistently.
+- Inherit the effective model provider, authentication, endpoint, headers, and
+  profile configuration. Applying per-agent model/effort overrides must not
+  reset the provider or bypass a configured router.
+- Prove the same fixture workflow under the native/default provider configuration
+  and a local mock OpenAI-compatible router without live network or secrets.
 
 ### App-server and TUI
 
