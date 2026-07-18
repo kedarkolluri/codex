@@ -148,30 +148,40 @@ pub(crate) async fn run_workflow_source(
     call_id: String,
     enabled_tools: Vec<ToolDefinition>,
     source: &str,
+    args: serde_json::Value,
 ) -> Result<WorkflowRunOutput, FunctionCallError> {
     ensure_workflow_enabled(features)?;
 
     // The workflow source is admitted identically to any code-mode program: an
     // optional leading `// @exec:` pragma followed by the ES-module body.
-    let args =
+    let exec_args =
         codex_code_mode::parse_exec_source(source).map_err(FunctionCallError::RespondToModel)?;
 
     // Reject scripts without a valid static `meta` manifest before we ever touch
     // the isolate.
-    validate_workflow_meta(&args.code)?;
+    validate_workflow_meta(&exec_args.code)?;
+
+    // Mint the run id host-side in Rust (uuid v7, `items.rs` pattern) — never in
+    // the isolate — so `workflow.runId` is a host-authored value the script can
+    // read but never derive. Exposed read-only inside the fresh isolate.
+    let run_id = uuid::Uuid::now_v7().to_string();
 
     let started_at = Instant::now();
     let started_cell = service
         .execute(codex_code_mode::ExecuteRequest {
             tool_call_id: call_id,
             enabled_tools,
-            source: args.code.clone(),
-            yield_time_ms: args.yield_time_ms,
-            max_output_tokens: args.max_output_tokens,
+            source: exec_args.code.clone(),
+            yield_time_ms: exec_args.yield_time_ms,
+            max_output_tokens: exec_args.max_output_tokens,
             // Explicit workflow invocation mode: authorizes the workflow-only
             // narrator globals for this fresh isolate. Plain code-mode exec
             // leaves this `false`.
             workflow: true,
+            // Invocation JSON injected read-only as the `args` global, and the
+            // host-minted run id exposed read-only as `workflow.runId`.
+            args: Some(args),
+            run_id: Some(run_id),
         })
         .await
         .map_err(FunctionCallError::RespondToModel)?;
@@ -189,7 +199,7 @@ pub(crate) async fn run_workflow_source(
 
     Ok(WorkflowRunOutput {
         response,
-        max_output_tokens: args.max_output_tokens,
+        max_output_tokens: exec_args.max_output_tokens,
         started_at,
     })
 }
@@ -223,6 +233,11 @@ impl CodeModeWorkflowHandler {
             call_id,
             enabled_tools,
             &source,
+            // The model-callable workflow tool does not yet carry an invocation
+            // payload; the `workflow(name, args)` hook that supplies real `args`
+            // arrives in a later ticket. Until then a workflow reads `args` as
+            // `null`.
+            serde_json::Value::Null,
         )
         .await?;
         // Script failures return on the `Ok` path as `RuntimeResponse::Result`

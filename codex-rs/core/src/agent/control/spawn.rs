@@ -25,7 +25,7 @@ enum SpawnInitialInput {
     Deferred,
 }
 
-fn default_agent_nickname_list() -> Vec<&'static str> {
+pub(super) fn default_agent_nickname_list() -> Vec<&'static str> {
     AGENT_NAMES
         .lines()
         .map(str::trim)
@@ -315,7 +315,7 @@ impl AgentControl {
                     depth,
                     agent_path,
                     agent_role,
-                    /*preferred_agent_nickname*/ None,
+                    options.preferred_agent_nickname.clone(),
                 )?;
                 (Some(session_source), agent_metadata)
             }
@@ -417,8 +417,13 @@ impl AgentControl {
 
         match initial_input {
             SpawnInitialInput::UserInput(input) => {
-                self.send_input_after_capacity_check(new_thread.thread_id, &state, input)
-                    .await?;
+                self.send_input_after_capacity_check(
+                    new_thread.thread_id,
+                    &state,
+                    input,
+                    /*final_output_json_schema*/ None,
+                )
+                .await?;
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
                 self.send_inter_agent_communication_after_capacity_check(

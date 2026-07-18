@@ -52,6 +52,10 @@ impl CodeModeExecuteHandler {
                 // Plain code-mode exec is never workflow mode: the workflow-only
                 // narrator globals stay uninstalled for model-authored programs.
                 workflow: false,
+                // Plain code-mode exec carries no invocation args and mints no
+                // run id; these are workflow-only.
+                args: None,
+                run_id: None,
             })
             .await
             .map_err(FunctionCallError::RespondToModel)?;

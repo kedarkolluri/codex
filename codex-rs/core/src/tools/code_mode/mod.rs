@@ -2,6 +2,7 @@ mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
 mod response_adapter;
+mod scheduler;
 mod wait_handler;
 pub(crate) mod wait_spec;
 mod workflow_handler;
@@ -492,6 +493,7 @@ mod tests {
             "wf-call-1".to_string(),
             Vec::new(),
             source,
+            serde_json::Value::Null,
         )
         .await
         .expect("valid workflow runs its body once");
@@ -503,6 +505,59 @@ mod tests {
                 content_items: vec![CodeModeOutputContentItem::InputText {
                     text: "workflow-ran".to_string(),
                 }],
+                error_text: None,
+            }
+        );
+        service.shutdown().await.expect("shutdown service");
+    }
+
+    #[tokio::test]
+    async fn workflow_args_and_run_id_reach_the_isolate() {
+        use super::workflow_handler::run_workflow_source;
+        use codex_features::Feature;
+        use codex_features::Features;
+
+        let service = CodeModeService::new(Arc::new(
+            ProcessOwnedCodeModeSessionProvider::with_host_program(
+                "codex-code-mode-host-does-not-exist".into(),
+            ),
+        ));
+
+        let mut features = Features::default();
+        features.enable(Feature::Workflow);
+
+        // The invocation JSON reaches the fresh isolate as the read-only `args`
+        // global, and the host-minted `workflow.runId` is a non-empty uuid the
+        // body can read (minted in Rust by `run_workflow_source`, never in JS).
+        let source = concat!(
+            "export const meta = { name: 'demo', description: 'demo' };\n",
+            "text(String(args.foo));\n",
+            "text(String(typeof workflow.runId === 'string' && workflow.runId.length > 0));\n",
+        );
+
+        let output = run_workflow_source(
+            &features,
+            &service,
+            "wf-call-args".to_string(),
+            Vec::new(),
+            source,
+            serde_json::json!({ "foo": "from-invocation" }),
+        )
+        .await
+        .expect("workflow with args runs its body once");
+
+        assert_eq!(
+            output.response,
+            RuntimeResponse::Result {
+                cell_id: codex_code_mode::CellId::new("1".to_string()),
+                content_items: vec![
+                    CodeModeOutputContentItem::InputText {
+                        text: "from-invocation".to_string(),
+                    },
+                    CodeModeOutputContentItem::InputText {
+                        text: "true".to_string(),
+                    },
+                ],
                 error_text: None,
             }
         );
@@ -540,6 +595,7 @@ mod tests {
             "wf-call-phase-log".to_string(),
             Vec::new(),
             source,
+            serde_json::Value::Null,
         )
         .await
         .expect("phase/log workflow runs its body once");
@@ -580,6 +636,7 @@ mod tests {
             "wf-call-2".to_string(),
             Vec::new(),
             "text('should-not-run');",
+            serde_json::Value::Null,
         )
         .await
         .expect_err("invalid meta must be rejected");
@@ -617,6 +674,7 @@ mod tests {
             "wf-call-3".to_string(),
             Vec::new(),
             source,
+            serde_json::Value::Null,
         )
         .await
         .expect_err("workflow is unreachable when the feature is disabled");
@@ -639,6 +697,8 @@ mod tests {
                 yield_time_ms: None,
                 max_output_tokens: None,
                 workflow: false,
+                args: None,
+                run_id: None,
             })
             .await
             .expect("missing host should fall back to an in-process session")

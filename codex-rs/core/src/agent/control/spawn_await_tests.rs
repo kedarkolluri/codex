@@ -1,7 +1,13 @@
 use super::active_turn_sub_id;
 use super::drain_buffered_final_message;
+use super::format_ordinal_nickname;
+use super::workflow_agent_nickname_preference;
 use crate::ThreadManager;
 use crate::agent::control::SpawnAgentOptions;
+use crate::agent::control::spawn::default_agent_nickname_list;
+use crate::agent::control::spawn_await_opts::SpawnAgentConfigOverrides;
+use crate::agent::control::spawn_await_opts::map_workflow_effort;
+use crate::agent::registry::AgentRegistry;
 use crate::agent::registry::next_thread_spawn_depth;
 use crate::config::Config;
 use crate::config::test_config;
@@ -16,6 +22,7 @@ use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::ThreadId;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
@@ -136,6 +143,8 @@ async fn spawn_and_await_final_message_uses_registering_path() -> anyhow::Result
                 text: "run the child".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentConfigOverrides::default(),
             options,
         ),
     )
@@ -197,6 +206,87 @@ async fn spawn_and_await_final_message_uses_registering_path() -> anyhow::Result
     Ok(())
 }
 
+/// Structured output (spec §6): an `opts.schema` threaded into `final_output_json_schema` reaches the
+/// child's turn as a strict `output_schema`, so the child's model request carries
+/// `text.format.schema` == the requested schema with `strict = true`. This proves the
+/// `opts.schema -> final_output_json_schema -> output_schema_strict` plumbing end-to-end (the parse +
+/// `jsonschema` recheck on the *return* is unit-tested in `code_mode::delegate::finalize_agent_output`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_and_await_final_message_threads_schema_into_child_turn() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-child"),
+            ev_assistant_message("msg-child", r#"{"answer":"ok"}"#),
+            ev_completed("resp-child"),
+        ]),
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(&manager, &config).await?;
+    let agent_control = manager.agent_control();
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "answer": { "type": "string" } },
+        "required": ["answer"],
+        "additionalProperties": false,
+    });
+
+    let options = SpawnAgentOptions {
+        environments: Some(parent_turn.environments.to_selections()),
+        ..Default::default()
+    };
+
+    let final_message = timeout(
+        Duration::from_secs(30),
+        agent_control.spawn_and_await_final_message(
+            &base_instructions,
+            parent_turn.as_ref(),
+            parent_thread_id,
+            vec![UserInput::Text {
+                text: "run the child".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(schema.clone()),
+            SpawnAgentConfigOverrides::default(),
+            options,
+        ),
+    )
+    .await
+    .expect("helper should finish before timeout");
+
+    // The helper still returns the raw final text; the caller does the parse + recheck.
+    assert_eq!(final_message.as_deref(), Some(r#"{"answer":"ok"}"#));
+
+    // The child's turn request carried the schema as a strict Responses-API `text.format`.
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should record requests");
+    let child_request = requests
+        .last()
+        .expect("the child turn should have issued a model request");
+    let body: serde_json::Value = child_request.body_json().expect("request body is JSON");
+    let format = body
+        .pointer("/text/format")
+        .expect("child request should carry text.format for the output schema");
+    assert_eq!(
+        format.get("type"),
+        Some(&serde_json::Value::String("json_schema".into())),
+    );
+    assert_eq!(format.get("strict"), Some(&serde_json::Value::Bool(true)));
+    assert_eq!(format.get("schema"), Some(&schema));
+
+    Ok(())
+}
+
 /// A spawn failure resolves to `None` (never a panic/throw): with no agent thread slots available,
 /// the registering spawn path fails before creating a child, and the helper reports `None` without
 /// broadcasting `notify_thread_created`.
@@ -231,6 +321,8 @@ async fn spawn_and_await_final_message_returns_none_on_spawn_error() -> anyhow::
                 text: "run the child".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentConfigOverrides::default(),
             options,
         ),
     )
@@ -319,6 +411,8 @@ async fn spawn_and_await_final_message_returns_none_on_turn_abort() -> anyhow::R
                 text: "run the child".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentConfigOverrides::default(),
             options,
         ),
     )
@@ -417,6 +511,8 @@ async fn spawn_and_await_final_message_survives_competing_next_event_drain() -> 
                 text: "run the child".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentConfigOverrides::default(),
             options,
         ),
     )
@@ -521,6 +617,8 @@ async fn spawn_and_await_final_message_returns_none_on_session_teardown() -> any
                 text: "run the child".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentConfigOverrides::default(),
             options,
         ),
     )
@@ -652,6 +750,7 @@ async fn await_first_turn_returns_none_when_a_foreign_turn_is_active() -> anyhow
                 text: "our prompt".to_string(),
                 text_elements: Vec::new(),
             }],
+            /*final_output_json_schema*/ None,
         ),
     )
     .await
@@ -767,4 +866,613 @@ fn drain_buffered_final_message_recovers_our_turn_message() {
     })
     .expect("send our abort event");
     assert_eq!(drain_buffered_final_message(&mut rx, "ours"), None);
+}
+
+/// Registers a parent thread and returns the pieces a config-override test drives directly: the
+/// parent thread (whose session owns the `ModelsManager` used to resolve `opts.model`), the parent
+/// turn, and a freshly-built child config — exactly the config `spawn_and_await_final_message`
+/// applies overrides on top of before spawning.
+async fn override_test_fixture(
+    manager: &ThreadManager,
+    config: &Config,
+) -> anyhow::Result<(Arc<crate::CodexThread>, Arc<TurnContext>, Config)> {
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(manager, config).await?;
+    let parent_thread = manager.get_thread(parent_thread_id).await?;
+    let child_config = build_agent_spawn_config(&base_instructions, parent_turn.as_ref())
+        .expect("child spawn config should build");
+    Ok((parent_thread, parent_turn, child_config))
+}
+
+/// `opts.model` sets the child model and `opts.effort` sets the child `ReasoningEffort` when both
+/// are requested and supported by the resolved model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_applies_requested_model_and_effort() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    SpawnAgentConfigOverrides {
+        model: Some("gpt-5.4".to_string()),
+        effort: Some("high".to_string()),
+        agent_type: None,
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect("a supported model/effort override should apply");
+
+    assert_eq!(
+        child_config.model.as_deref(),
+        Some("gpt-5.4"),
+        "opts.model must set the child model"
+    );
+    assert_eq!(
+        child_config.model_reasoning_effort,
+        Some(ReasoningEffort::High),
+        "opts.effort must set the child reasoning effort"
+    );
+
+    Ok(())
+}
+
+/// An `opts.effort`-only request (no `opts.model`) sets the child reasoning effort while inheriting
+/// the parent turn's model, and is validated against that inherited model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_effort_only_override_inherits_model() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+    let inherited_model = child_config.model.clone();
+
+    SpawnAgentConfigOverrides {
+        model: None,
+        effort: Some("high".to_string()),
+        agent_type: None,
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect("an effort-only override should apply against the inherited model");
+
+    assert_eq!(
+        child_config.model, inherited_model,
+        "an effort-only override must not change the inherited model"
+    );
+    assert_eq!(
+        child_config.model_reasoning_effort,
+        Some(ReasoningEffort::High)
+    );
+
+    Ok(())
+}
+
+/// An effort outside the resolved model's `supported_reasoning_levels` is rejected with an
+/// actionable error naming the effort, the model, and the supported set (`gpt-5.4` supports only
+/// `low|medium|high|xhigh`, so `max` — a valid *workflow* effort — is unsupported *by the model*).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_rejects_effort_unsupported_by_model() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    let error = SpawnAgentConfigOverrides {
+        model: Some("gpt-5.4".to_string()),
+        effort: Some("max".to_string()),
+        agent_type: None,
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect_err("an effort unsupported by the model must be rejected");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("max") && message.contains("gpt-5.4") && message.contains("not supported"),
+        "error must actionably name the effort, model, and that it is unsupported: {message}"
+    );
+
+    Ok(())
+}
+
+/// A malformed `opts.effort` (not one of the documented `low|medium|high|xhigh|max`) is rejected
+/// before any model resolution, with an actionable error listing the accepted values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_rejects_out_of_contract_effort_string() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    let error = SpawnAgentConfigOverrides {
+        model: None,
+        effort: Some("ultra".to_string()),
+        agent_type: None,
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect_err("an out-of-contract workflow effort must be rejected");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("ultra") && message.contains("low, medium, high, xhigh, max"),
+        "error must name the offending value and the accepted set: {message}"
+    );
+
+    Ok(())
+}
+
+/// Omitting both `opts.model` and `opts.effort` leaves the parent-inherited child config unchanged
+/// (and `is_empty()` reports the no-op so the helper can skip session resolution entirely).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_without_overrides_is_unchanged() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    let inherited = child_config.clone();
+    let overrides = SpawnAgentConfigOverrides::default();
+    assert!(
+        overrides.is_empty(),
+        "a default override carries no requested model/effort"
+    );
+
+    overrides
+        .apply(
+            &parent_thread.codex.session,
+            parent_turn.as_ref(),
+            &mut child_config,
+        )
+        .await
+        .expect("a no-op override must succeed");
+
+    assert_eq!(
+        child_config, inherited,
+        "omitting model/effort must leave the parent-inherited config unchanged"
+    );
+
+    Ok(())
+}
+
+/// Each documented workflow effort (`low..max`) maps to the correct `ReasoningEffort` variant, and
+/// every out-of-contract value is rejected rather than silently forwarded.
+#[test]
+fn map_workflow_effort_maps_documented_levels() {
+    assert_eq!(map_workflow_effort("low").unwrap(), ReasoningEffort::Low);
+    assert_eq!(
+        map_workflow_effort("medium").unwrap(),
+        ReasoningEffort::Medium
+    );
+    assert_eq!(map_workflow_effort("high").unwrap(), ReasoningEffort::High);
+    assert_eq!(
+        map_workflow_effort("xhigh").unwrap(),
+        ReasoningEffort::XHigh
+    );
+    assert_eq!(map_workflow_effort("max").unwrap(), ReasoningEffort::Max);
+
+    for invalid in ["", "none", "minimal", "ultra", "MAX", "extreme"] {
+        assert!(
+            map_workflow_effort(invalid).is_err(),
+            "out-of-contract effort `{invalid}` must be rejected"
+        );
+    }
+}
+
+/// Distinctive model slug a registered `reviewer` role layer stamps onto the child config, so tests
+/// can prove the role was resolved and applied by observing `config.model`.
+const REVIEWER_ROLE_MODEL: &str = "reviewer-role-model";
+
+/// Registers a user-defined `reviewer` role (whose role layer locks `model = REVIEWER_ROLE_MODEL`)
+/// on `config` so `opts.agentType = "reviewer"` resolves to it. Mirrors the user-role wiring the
+/// role-layer tests use (`agent/role_tests.rs`): a `reviewer.toml` on disk referenced from
+/// `config.agent_roles`.
+fn register_reviewer_role(config: &mut Config, codex_home: &TempDir) {
+    let role_path = codex_home.path().join("reviewer.toml");
+    std::fs::write(&role_path, format!("model = \"{REVIEWER_ROLE_MODEL}\"\n"))
+        .expect("write reviewer role config");
+    config.agent_roles.insert(
+        "reviewer".to_string(),
+        crate::config::AgentRoleConfig {
+            description: Some("Review carefully.".to_string()),
+            config_file: Some(role_path),
+            nickname_candidates: None,
+        },
+    );
+}
+
+/// `opts.agentType = "reviewer"` resolves the `reviewer` role and applies its role layer to the
+/// child config (its locked `model` lands on the child), proving the role name is resolved rather
+/// than dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_applies_requested_agent_type() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let mut config = test_config_for_server(&codex_home, &server).await?;
+    register_reviewer_role(&mut config, &codex_home);
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    SpawnAgentConfigOverrides {
+        model: None,
+        effort: None,
+        agent_type: Some("reviewer".to_string()),
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect("a registered role should resolve and apply");
+
+    assert_eq!(
+        child_config.model.as_deref(),
+        Some(REVIEWER_ROLE_MODEL),
+        "opts.agentType must apply the resolved role's layer to the child config"
+    );
+
+    Ok(())
+}
+
+/// An absent `opts.agentType` falls back to `DEFAULT_ROLE_NAME` (whose role layer is a no-op), so a
+/// blank/whitespace value is treated as absent (`is_empty()` reports it) and applying leaves the
+/// parent-inherited config unchanged rather than erroring or picking a foreign role.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_absent_agent_type_falls_back_to_default_role() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+    let inherited = child_config.clone();
+
+    // A blank/whitespace `agent_type` is treated as absent: it resolves to the no-op default role.
+    let overrides = SpawnAgentConfigOverrides {
+        model: None,
+        effort: None,
+        agent_type: Some("   ".to_string()),
+    };
+    assert!(
+        overrides.is_empty(),
+        "a blank agent_type resolves to the default role and must not count as a requested override"
+    );
+
+    overrides
+        .apply(
+            &parent_thread.codex.session,
+            parent_turn.as_ref(),
+            &mut child_config,
+        )
+        .await
+        .expect("the default-role fallback must succeed");
+
+    assert_eq!(
+        child_config, inherited,
+        "an absent agent_type must fall back to the no-op default role and leave the config unchanged"
+    );
+
+    Ok(())
+}
+
+/// An unknown `opts.agentType` surfaces an actionable error naming the offending role rather than
+/// silently spawning under the default role.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_rejects_unknown_agent_type() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    let error = SpawnAgentConfigOverrides {
+        model: None,
+        effort: None,
+        agent_type: Some("nonexistent-role".to_string()),
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect_err("an unknown role must be rejected, not silently defaulted");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("unknown agent_type") && message.contains("nonexistent-role"),
+        "error must actionably name the unknown role: {message}"
+    );
+
+    Ok(())
+}
+
+/// Ordering guarantee: the role layer is applied **after** the model/effort overrides (matching V2
+/// `spawn_agent`), so a role that locks a model takes precedence over a requested `opts.model`. The
+/// requested model resolves and is applied first, then the `reviewer` role's locked model wins —
+/// which is observable only if the role ran last.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_config_applies_agent_type_after_model_effort() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let mut config = test_config_for_server(&codex_home, &server).await?;
+    register_reviewer_role(&mut config, &codex_home);
+    let manager = build_manager(&config).await;
+    let (parent_thread, parent_turn, mut child_config) =
+        override_test_fixture(&manager, &config).await?;
+
+    SpawnAgentConfigOverrides {
+        model: Some("gpt-5.4".to_string()),
+        effort: Some("high".to_string()),
+        agent_type: Some("reviewer".to_string()),
+    }
+    .apply(
+        &parent_thread.codex.session,
+        parent_turn.as_ref(),
+        &mut child_config,
+    )
+    .await
+    .expect("a supported model/effort plus a registered role should apply");
+
+    assert_eq!(
+        child_config.model.as_deref(),
+        Some(REVIEWER_ROLE_MODEL),
+        "the role layer must run after the model override, so the role's locked model wins over \
+         the requested opts.model"
+    );
+
+    Ok(())
+}
+
+/// The ordinal-derived nickname preference is a pure function of the ordinal (no `Date`/`Math`/
+/// `rand` inputs), so two runs of the same fan-out assign identical nicknames per ordinal, and the
+/// documented pool-cycling mapping holds: `0..N` are the bare pool names, and each full wrap of the
+/// `N`-name pool advances the deterministic `the Nth` suffix.
+#[test]
+fn workflow_nickname_preference_is_deterministic_and_ordinal_only() {
+    let pool = default_agent_nickname_list();
+    let pool_len = pool.len();
+    assert!(
+        pool_len > 0,
+        "the shipped agent name pool must be non-empty"
+    );
+
+    // Same ordinal twice → identical (pure function).
+    assert_eq!(
+        workflow_agent_nickname_preference(0),
+        workflow_agent_nickname_preference(0),
+    );
+
+    // Two identical fan-outs (0..2N) assign identical nicknames per ordinal.
+    let run_a: Vec<String> = (0..pool_len * 2)
+        .map(workflow_agent_nickname_preference)
+        .collect();
+    let run_b: Vec<String> = (0..pool_len * 2)
+        .map(workflow_agent_nickname_preference)
+        .collect();
+    assert_eq!(
+        run_a, run_b,
+        "two runs of the same fan-out must assign identical nicknames per ordinal"
+    );
+
+    // Documented cycling mapping: bare pool names on the first pass, `the 2nd` on the next wrap.
+    assert_eq!(workflow_agent_nickname_preference(0), pool[0]);
+    assert_eq!(
+        workflow_agent_nickname_preference(pool_len - 1),
+        pool[pool_len - 1]
+    );
+    assert_eq!(
+        workflow_agent_nickname_preference(pool_len),
+        format!("{} the 2nd", pool[0]),
+    );
+    assert_eq!(
+        workflow_agent_nickname_preference(pool_len + 1),
+        format!("{} the 2nd", pool[1]),
+    );
+    assert_eq!(
+        workflow_agent_nickname_preference(pool_len * 2),
+        format!("{} the 3rd", pool[0]),
+    );
+}
+
+/// The ordinal → nickname mapping is **injective**: a fan-out never derives the same nickname for
+/// two distinct ordinals, so there is no collision for the registry to break (deterministically or
+/// otherwise). Cover several full pool cycles so the `the Nth` suffix path is exercised.
+#[test]
+fn workflow_nickname_preference_is_injective_across_cycles() {
+    let pool_len = default_agent_nickname_list().len();
+    let count = pool_len * 3 + 7;
+    let nicknames: std::collections::HashSet<String> =
+        (0..count).map(workflow_agent_nickname_preference).collect();
+    assert_eq!(
+        nicknames.len(),
+        count,
+        "distinct ordinals must derive distinct nicknames (no intra-fan-out collision)"
+    );
+}
+
+/// `format_ordinal_nickname` matches the registry's own reset-cycle naming (`registry.rs:44`):
+/// cycle 0 is the bare name, and subsequent cycles append the correct English ordinal suffix
+/// (including the 11th..13th special case).
+#[test]
+fn format_ordinal_nickname_matches_registry_suffix_scheme() {
+    assert_eq!(format_ordinal_nickname("Plato", 0), "Plato");
+    assert_eq!(format_ordinal_nickname("Plato", 1), "Plato the 2nd");
+    assert_eq!(format_ordinal_nickname("Plato", 2), "Plato the 3rd");
+    assert_eq!(format_ordinal_nickname("Plato", 3), "Plato the 4th");
+    // value = cycle + 1 == 11 → the 11th..13th special-case yields "th".
+    assert_eq!(format_ordinal_nickname("Plato", 10), "Plato the 11th");
+    assert_eq!(format_ordinal_nickname("Plato", 20), "Plato the 21st");
+}
+
+/// Rand-bypass proof (spec §13 Q4): reserving with an ordinal-derived **preference** and an *empty*
+/// candidate pool returns the preferred name verbatim. With no candidates, the non-preferred branch
+/// (the one that calls `rand::rng()`, `registry.rs:232`) can only return `None` → an error; getting
+/// the preferred name back therefore proves the `rand`-free preferred branch was taken. Because the
+/// preference is a pure function of the ordinal, the assignment is fully deterministic.
+#[test]
+fn preferred_nickname_bypasses_rand_pool_pick() {
+    let preferred = workflow_agent_nickname_preference(3);
+
+    let registry = Arc::new(AgentRegistry::default());
+    let mut reservation = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve slot");
+    let reserved = reservation
+        .reserve_agent_nickname_with_preference(/*names*/ &[], Some(preferred.as_str()))
+        .expect(
+            "the preferred branch must reserve the name without consulting the empty rand pool",
+        );
+    assert_eq!(
+        reserved, preferred,
+        "an ordinal-derived preference must be reserved verbatim, bypassing rand::rng()"
+    );
+
+    // Determinism: a second, independent registry given the same ordinal reserves the same name.
+    let other_registry = Arc::new(AgentRegistry::default());
+    let mut other_reservation = other_registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve slot");
+    let other_reserved = other_reservation
+        .reserve_agent_nickname_with_preference(
+            /*names*/ &[],
+            Some(workflow_agent_nickname_preference(3).as_str()),
+        )
+        .expect("preferred branch reserves without rand");
+    assert_eq!(
+        reserved, other_reserved,
+        "the same ordinal must reserve the same nickname across runs"
+    );
+}
+
+/// Collision resolution (finding: registry preferred branch): when two agents ask for the same
+/// preferred nickname, the second is resolved DETERMINISTICALLY (a `-2`/`-3` suffix), actually
+/// reserved (so a third advances again), and never duplicated — and never via `rand`.
+#[test]
+fn preferred_nickname_collision_resolves_deterministically() {
+    let registry = Arc::new(AgentRegistry::default());
+    let preferred = workflow_agent_nickname_preference(0);
+
+    let mut first = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve slot");
+    let first_name = first
+        .reserve_agent_nickname_with_preference(/*names*/ &[], Some(preferred.as_str()))
+        .expect("the first reservation takes the preferred name verbatim");
+    assert_eq!(first_name, preferred);
+
+    // A second agent requesting the same preferred name must not get a duplicate: it resolves to a
+    // deterministic `-2` suffix.
+    let mut second = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve slot");
+    let second_name = second
+        .reserve_agent_nickname_with_preference(/*names*/ &[], Some(preferred.as_str()))
+        .expect("the second reservation resolves the collision deterministically");
+    assert_eq!(second_name, format!("{preferred}-2"));
+
+    // The resolved `-2` was actually reserved, so a third collides with both and advances to `-3`.
+    let mut third = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve slot");
+    let third_name = third
+        .reserve_agent_nickname_with_preference(/*names*/ &[], Some(preferred.as_str()))
+        .expect("the third reservation advances the deterministic suffix");
+    assert_eq!(third_name, format!("{preferred}-3"));
+}
+
+/// End-to-end plumbing: a `SpawnAgentOptions::preferred_agent_nickname` set by the caller threads
+/// all the way through `spawn_agent_deferred_input` → `spawn_agent_internal` → `prepare_thread_spawn`
+/// and is the nickname the child actually registers with — so a workflow's ordinal-derived
+/// preference (not a random pool pick) is what lands on the spawned agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_options_preferred_nickname_is_reserved_verbatim() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-child"),
+            ev_assistant_message("msg-child", CHILD_FINAL_MESSAGE),
+            ev_completed("resp-child"),
+        ]),
+    )
+    .await;
+
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(&manager, &config).await?;
+    let agent_control = manager.agent_control();
+    let mut thread_created_rx = manager.subscribe_thread_created();
+
+    let preferred = workflow_agent_nickname_preference(0);
+    let options = SpawnAgentOptions {
+        environments: Some(parent_turn.environments.to_selections()),
+        preferred_agent_nickname: Some(preferred.clone()),
+        ..Default::default()
+    };
+
+    let final_message = timeout(
+        Duration::from_secs(30),
+        agent_control.spawn_and_await_final_message(
+            &base_instructions,
+            parent_turn.as_ref(),
+            parent_thread_id,
+            vec![UserInput::Text {
+                text: "run the child".to_string(),
+                text_elements: Vec::new(),
+            }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentConfigOverrides::default(),
+            options,
+        ),
+    )
+    .await
+    .expect("helper should finish before timeout");
+    assert_eq!(final_message.as_deref(), Some(CHILD_FINAL_MESSAGE));
+
+    let child_thread_id = thread_created_rx
+        .try_recv()
+        .expect("notify_thread_created should have broadcast the child thread id");
+    let metadata = agent_control
+        .get_agent_metadata(child_thread_id)
+        .expect("the spawned child should be registered with metadata");
+    assert_eq!(
+        metadata.agent_nickname.as_deref(),
+        Some(preferred.as_str()),
+        "the ordinal-derived preferred nickname must be the one the child registers with"
+    );
+
+    Ok(())
 }

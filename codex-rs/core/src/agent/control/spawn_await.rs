@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::control::spawn_await_opts::SpawnAgentConfigOverrides;
 use crate::agent::registry::next_thread_spawn_depth;
 use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents::build_agent_spawn_config;
@@ -27,7 +28,10 @@ impl AgentControl {
     /// skip the edge.
     ///
     /// The child config is built with [`build_agent_spawn_config`] so it inherits the parent
-    /// turn's provider/model/reasoning/developer-instructions and runtime state.
+    /// turn's provider/model/reasoning/developer-instructions and runtime state; the requested
+    /// `agent()` [`SpawnAgentConfigOverrides`] (`opts.model` / `opts.effort` / `opts.agentType`) are
+    /// then applied on top of that inherited config before the child is spawned. Omitted overrides
+    /// leave the inherited config unchanged.
     ///
     /// ## Why not drain `next_event()`
     ///
@@ -41,23 +45,31 @@ impl AgentControl {
     /// It subscribes *before* submitting the prompt (the spawn is deferred, so no turn runs until
     /// the helper drives it), guaranteeing the terminal event cannot fire before it is observing.
     ///
+    /// `final_output_json_schema` (spec §6 structured output) is threaded onto the child's first
+    /// turn's `Op::UserInput`, so `build_prompt` sets `Prompt.output_schema` +
+    /// `output_schema_strict = true` and the child is forced to emit schema-conformant JSON as its
+    /// final message. This helper still returns that message as the raw `Some(last_agent_message)`
+    /// string; the caller (the workflow `agent()` host) does the `serde_json` parse + `jsonschema`
+    /// recheck and marshals the validated object back to JS. `None` leaves the child unconstrained
+    /// and the final message is plain assistant text.
+    ///
     /// Returns:
     /// - `Some(last_agent_message)` on our turn's `EventMsg::TurnComplete`,
     /// - `None` on our turn's `EventMsg::TurnAborted`, a config-build/spawn/submit failure, or the
     ///   child reaching a final state (session-loop termination, or a final status observed after
     ///   the tap lagged) without ever yielding our turn's terminal event.
-    // The non-test caller (the cell_actor `SpawnAgent` dispatch) lands in a follow-up ticket;
-    // until then this keystone helper is exercised only by its integration tests.
-    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn spawn_and_await_final_message(
         &self,
         base_instructions: &BaseInstructions,
         parent_turn: &TurnContext,
         parent_thread_id: ThreadId,
         input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+        overrides: SpawnAgentConfigOverrides,
         mut options: SpawnAgentOptions,
     ) -> Option<String> {
-        let config = match build_agent_spawn_config(base_instructions, parent_turn) {
+        let mut config = match build_agent_spawn_config(base_instructions, parent_turn) {
             Ok(config) => config,
             Err(err) => {
                 warn!("failed to build subagent spawn config: {err}");
@@ -65,10 +77,58 @@ impl AgentControl {
             }
         };
 
+        // Apply the requested `agent()` `opts.model` / `opts.effort` / `opts.agentType` on top of the
+        // inherited config, in the same config-build step (and ordering) the V2 `spawn_agent` tool
+        // uses. Resolving a requested model needs the session `ModelsManager`, so look up the
+        // (registered) parent thread's session; effort-only requests validate against the parent
+        // turn's current model. Any unresolved model / unsupported effort / unknown role resolves the
+        // call to `None` (death-is-null) rather than spawning a child with the wrong model, an
+        // out-of-contract effort, or a silently-defaulted role.
+        if !overrides.is_empty() {
+            let state = match self.upgrade() {
+                Ok(state) => state,
+                Err(err) => {
+                    warn!("thread manager dropped before resolving subagent overrides: {err}");
+                    return None;
+                }
+            };
+            let parent_thread = match state.get_thread(parent_thread_id).await {
+                Ok(parent_thread) => parent_thread,
+                Err(err) => {
+                    warn!(
+                        "parent thread {parent_thread_id} not registered while resolving subagent \
+                         overrides: {err}"
+                    );
+                    return None;
+                }
+            };
+            if let Err(err) = overrides
+                .apply(&parent_thread.codex.session, parent_turn, &mut config)
+                .await
+            {
+                warn!("failed to apply subagent model/effort overrides: {err}");
+                return None;
+            }
+        } else {
+            // Even with no requested model/effort/agentType, the role layer must still run so a
+            // user-defined role literally named `default` (`DEFAULT_ROLE_NAME`) is applied to a bare
+            // `agent("prompt")` — matching the V2 `spawn_agent` path, which always calls
+            // `apply_role_to_config(.., None)`. This needs no session/`ModelsManager`, so it runs
+            // without upgrading the manager or looking up the parent thread.
+            if let Err(err) = overrides.apply_role_layer(&mut config).await {
+                warn!("failed to apply default subagent role: {err}");
+                return None;
+            }
+        }
+
         // Make the Subagent source intrinsic: constructing it here (rather than accepting an
         // `Option<SessionSource>`) forces the registering, spawn-edge-writing path for every
         // caller. `spawn_agent_internal` re-derives the agent nickname/path via
-        // `prepare_thread_spawn`, so the `None` fields below are placeholders it fills in.
+        // `prepare_thread_spawn`, so the `None` fields below are placeholders it fills in. When the
+        // caller set `options.preferred_agent_nickname` (a workflow ordinal-derived preference from
+        // `workflow_agent_nickname_preference`), that value is what `prepare_thread_spawn` reserves
+        // verbatim — bypassing the registry's `rand::rng()` pool pick so the nickname stays a pure
+        // function of the invocation ordinal.
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth: next_thread_spawn_depth(&parent_turn.session_source),
@@ -89,8 +149,34 @@ impl AgentControl {
             }
         };
 
-        self.await_first_turn_final_message(spawned.thread_id, input)
-            .await
+        // From here the child is registered (registry slot + nickname + a scheduler permit held by
+        // the caller). If this future is cancelled/dropped before `await_first_turn_final_message`
+        // returns, the child would leak; the reaper terminates + deregisters it on drop. It is
+        // disarmed on any normal return — a child that ran its turn keeps its natural lifecycle (the
+        // workflow monitor / live-attach depend on it), and a submit-failure reaps explicitly inside
+        // `await_first_turn_final_message`.
+        let mut reaper = SpawnedChildReaper::new(self.clone(), spawned.thread_id);
+        let result = self
+            .await_first_turn_final_message(spawned.thread_id, input, final_output_json_schema)
+            .await;
+        reaper.disarm();
+        result
+    }
+
+    /// Best-effort terminate + deregister a subagent this helper spawned but will not (or no longer)
+    /// drive to a turn outcome — the deferred prompt submit failed, or the spawn-and-await future was
+    /// cancelled/dropped. Interrupts any in-flight turn, removes the thread from the manager, and
+    /// releases the registry slot + nickname (mirroring `handle_thread_request_result`'s
+    /// `InternalAgentDied` cleanup). Releasing the registry slot is idempotent: a second call after
+    /// the thread is gone finds nothing to release and does not double-decrement.
+    pub(crate) async fn reap_spawned_child(&self, child_thread_id: ThreadId) {
+        if let Ok(state) = self.upgrade() {
+            // Interrupt any turn racing on the child before removing it; ignored when idle.
+            let _ = state.send_op(child_thread_id, Op::Interrupt).await;
+            let _ = state.remove_thread(&child_thread_id).await;
+        }
+        self.forget_v2_residency(child_thread_id);
+        self.state.release_spawned_thread(child_thread_id);
     }
 
     /// Subscribe to the spawned child's non-competing event tap, submit the prompt as a fresh
@@ -136,6 +222,7 @@ impl AgentControl {
         &self,
         child_thread_id: ThreadId,
         input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
     ) -> Option<String> {
         let state = match self.upgrade() {
             Ok(state) => state,
@@ -174,10 +261,16 @@ impl AgentControl {
         // a client would use: it re-runs the *current* execution-capacity check at submit time (the
         // deferred spawn's earlier check could be stale — another agent may have taken the last slot
         // in between) and hands back the submission id that stamps our (fresh) turn's events.
-        let submission_id = match self.send_input(child_thread_id, input).await {
+        let submission_id = match self
+            .send_input_with_schema(child_thread_id, input, final_output_json_schema)
+            .await
+        {
             Ok(submission_id) => submission_id,
             Err(err) => {
                 warn!("failed to submit subagent prompt: {err}");
+                // The child is registered but never ran our turn: terminate + deregister it so it
+                // does not leak its registry slot / nickname (and, transitively, the held permit).
+                self.reap_spawned_child(child_thread_id).await;
                 return None;
             }
         };
@@ -268,6 +361,50 @@ impl AgentControl {
     }
 }
 
+/// RAII guard that reaps a freshly-spawned-but-not-yet-finalized subagent if the spawn-and-await
+/// future is dropped/cancelled before it completes (finding: child leak on cancellation).
+///
+/// Armed the instant the child is registered; disarmed on any normal return from
+/// `await_first_turn_final_message` (a child that ran a turn keeps its natural lifecycle). If the
+/// future is instead dropped mid-await, `disarm` never runs and `Drop` spawns a detached best-effort
+/// reap so the registry slot / nickname (and the held scheduler permit) are not stranded.
+struct SpawnedChildReaper {
+    control: AgentControl,
+    child_thread_id: ThreadId,
+    armed: bool,
+}
+
+impl SpawnedChildReaper {
+    fn new(control: AgentControl, child_thread_id: ThreadId) -> Self {
+        Self {
+            control,
+            child_thread_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SpawnedChildReaper {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // `Drop` is synchronous but reaping is async; spawn a detached best-effort task on the
+        // current runtime. Guarded by `try_current` so dropping outside a runtime never panics.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let control = self.control.clone();
+            let child_thread_id = self.child_thread_id;
+            handle.spawn(async move {
+                control.reap_spawned_child(child_thread_id).await;
+            });
+        }
+    }
+}
+
 /// Read the sub_id of the child's currently-active turn, if any.
 ///
 /// A deferred-spawned child runs no turn of its own until the caller drives the first turn, so a
@@ -333,6 +470,74 @@ fn final_turn_message_from_status(status: &AgentStatus) -> Option<Option<String>
         | AgentStatus::Interrupted => Some(None),
         AgentStatus::PendingInit | AgentStatus::Running => None,
     }
+}
+
+/// Derive the preferred subagent nickname for a workflow agent purely from its **invocation
+/// ordinal** (the deterministic `next_agent_ordinal` spine, spec §7), so the nickname a fan-out
+/// assigns is a pure function of the ordinal — never `Date`/`Math`/`rand`.
+///
+/// ## Why this exists (bypassing `rand::rng()`)
+///
+/// The registry's default nickname pick calls `rand::rng()` to choose an unused pool name
+/// (`registry.rs:232`), which breaks deterministic replay: the same fan-out would hand out different
+/// nicknames on each run. Threading the value returned here through
+/// [`SpawnAgentOptions::preferred_agent_nickname`] →
+/// [`AgentControl::spawn_agent_deferred_input`] → `spawn_agent_internal` → `prepare_thread_spawn`
+/// makes the registry take its `preferred`-name branch
+/// ([`crate::agent::registry::SpawnReservation::reserve_agent_nickname_with_preference`]), which
+/// assigns the requested name verbatim and **never** touches `rand::rng()`. For a workflow whose
+/// every `agent()` supplies an ordinal-derived preference, `rand::rng()` is therefore unreachable on
+/// the spawn path (spec §6 "Determinism caveat", §13 open question 4).
+///
+/// ## Determinism & collision order (spec §13 Q4)
+///
+/// The mapping is **injective** in the ordinal, so a fan-out never derives the same nickname for two
+/// distinct ordinals and there is no random tiebreak to resolve: ordinals cycle through the fixed
+/// shared name pool (`spawn::default_agent_nickname_list`), and each full wrap of the pool advances a
+/// deterministic `Nth` suffix, exactly mirroring the registry's own pool-exhaustion naming
+/// (`format_agent_nickname`, `registry.rs:44`). Concretely, with a pool of `N` names,
+/// `ordinal = cycle * N + index` recovers uniquely as `(pool[index], cycle)`:
+/// - `0..N` → the bare pool names (`pool[0] .. pool[N-1]`),
+/// - `N..2N` → `"<name> the 2nd"`, then `"… the 3rd"`, and so on.
+///
+/// Two runs of the same fan-out therefore assign identical nicknames per ordinal, and the "collision
+/// fallback" is simply the next cycle's deterministic suffix — a documented ordinal order, never a
+/// random pick. The empty-pool degenerate case (the shipped `agent_names.txt` is never empty) falls
+/// back to the still-injective, still-deterministic `agent-<ordinal>`.
+///
+/// Called on the production spawn path by the code-mode `CoreTurnHost::spawn_agent`, which stamps the
+/// result onto [`SpawnAgentOptions::preferred_agent_nickname`] for every `agent()` invocation.
+pub(crate) fn workflow_agent_nickname_preference(ordinal: usize) -> String {
+    let pool = super::spawn::default_agent_nickname_list();
+    let Some(pool_len) = std::num::NonZeroUsize::new(pool.len()) else {
+        // Defensive: the shipped name pool is never empty, but keep the mapping injective and
+        // deterministic (no `rand`) rather than panicking if it ever is.
+        return format!("agent-{ordinal}");
+    };
+    let pool_len = pool_len.get();
+    let index = ordinal % pool_len;
+    let cycle = ordinal / pool_len;
+    format_ordinal_nickname(pool[index], cycle)
+}
+
+/// Append the deterministic `the Nth` cycle suffix used by [`workflow_agent_nickname_preference`],
+/// mirroring the registry's own reset-cycle naming (`registry.rs:44`): cycle `0` is the bare name,
+/// cycle `c` becomes `"<name> the {c + 1}<ordinal-suffix>"` (2nd, 3rd, 4th, …, 11th…13th).
+fn format_ordinal_nickname(name: &str, cycle: usize) -> String {
+    if cycle == 0 {
+        return name.to_string();
+    }
+    let value = cycle + 1;
+    let suffix = match value % 100 {
+        11..=13 => "th",
+        _ => match value % 10 {
+            1 => "st", // codespell:ignore
+            2 => "nd", // codespell:ignore
+            3 => "rd", // codespell:ignore
+            _ => "th", // codespell:ignore
+        },
+    };
+    format!("{name} the {value}{suffix}")
 }
 
 #[cfg(test)]

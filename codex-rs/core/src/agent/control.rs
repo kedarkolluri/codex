@@ -56,7 +56,8 @@ mod execution;
 mod legacy;
 mod residency;
 mod spawn;
-mod spawn_await;
+pub(crate) mod spawn_await;
+pub(crate) mod spawn_await_opts;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
@@ -70,6 +71,13 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    /// A caller-chosen nickname the freshly-spawned child should reserve verbatim, bypassing the
+    /// registry's `rand::rng()` pool pick (`registry.rs:232`). Deterministic-replay workflows derive
+    /// this purely from the agent's invocation ordinal
+    /// ([`crate::agent::control::spawn_await::workflow_agent_nickname_preference`]) so the assigned
+    /// nickname is a pure function of the ordinal — no `Date`/`Math`/`rand` inputs. `None` (the
+    /// non-workflow default) keeps the existing random pool pick.
+    pub(crate) preferred_agent_nickname: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -144,10 +152,24 @@ impl AgentControl {
         agent_id: ThreadId,
         input: Vec<UserInput>,
     ) -> CodexResult<String> {
+        self.send_input_with_schema(agent_id, input, /*final_output_json_schema*/ None)
+            .await
+    }
+
+    /// [`Self::send_input`] with an optional `final_output_json_schema` constraining the turn's final
+    /// assistant message (spec §6 structured output). Used by the workflow spawn-and-await helper to
+    /// thread an `agent()` `opts.schema` onto the child's first turn — the same `Op::UserInput`
+    /// schema slot the guardian review session (`guardian/review_session.rs`) uses.
+    pub(crate) async fn send_input_with_schema(
+        &self,
+        agent_id: ThreadId,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+    ) -> CodexResult<String> {
         let state = self.upgrade()?;
         self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
             .await?;
-        self.send_input_after_capacity_check(agent_id, &state, input)
+        self.send_input_after_capacity_check(agent_id, &state, input, final_output_json_schema)
             .await
     }
 
@@ -156,14 +178,18 @@ impl AgentControl {
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
         input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
     ) -> CodexResult<String> {
         let last_task_message = non_empty_task_message(render_input_preview(&input));
+        let op = Op::UserInput {
+            items: input,
+            final_output_json_schema,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides::default(),
+        };
         let result = self
-            .handle_thread_request_result(
-                agent_id,
-                state,
-                state.send_op(agent_id, input.into()).await,
-            )
+            .handle_thread_request_result(agent_id, state, state.send_op(agent_id, op).await)
             .await;
         if result.is_ok() {
             match last_task_message {
