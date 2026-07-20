@@ -41,6 +41,33 @@ fn workflow_dependency_validation_distinguishes_unset_and_explicit_false() {
 }
 
 #[tokio::test]
+async fn config_loading_enables_unset_workflow_dependencies() {
+    let codex_home = TempDir::new().expect("create temporary Codex home");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        "[features]\nworkflow = true\n",
+    )
+    .expect("write config");
+
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .build()
+        .await
+        .expect("workflow config with unset dependencies should load");
+
+    assert_eq!(
+        (
+            config.features.enabled(Feature::Workflow),
+            config.features.enabled(Feature::CodeMode),
+            config.features.enabled(Feature::MultiAgentV2),
+        ),
+        (true, true, true)
+    );
+}
+
+#[tokio::test]
 async fn config_loading_rejects_explicitly_disabled_workflow_dependencies() {
     for dependency in ["code_mode", "multi_agent_v2"] {
         let codex_home = TempDir::new().expect("create temporary Codex home");
