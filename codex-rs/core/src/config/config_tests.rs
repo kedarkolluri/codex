@@ -10644,7 +10644,8 @@ fn legacy_default_multi_agent_v2_usage_hint_identity_survives_config_drift() {
         DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
         DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
     ] {
-        let historical_hint = default_multi_agent_v2_usage_hint_text(base, 37);
+        let historical_hint =
+            default_multi_agent_v2_usage_hint_text(base, /*max_concurrency*/ 37);
         let historical_hint_with_model_override = append_usage_hint_text(
             Some(&historical_hint),
             DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT,
