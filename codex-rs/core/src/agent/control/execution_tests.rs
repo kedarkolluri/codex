@@ -4,6 +4,8 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use pretty_assertions::assert_eq;
+use std::sync::Arc;
+use std::sync::Barrier;
 
 fn control_with_limit(max_threads: usize) -> AgentControl {
     let control = AgentControl::default();
@@ -56,5 +58,50 @@ fn execution_guards_ignore_root_and_v1_turns() {
                 &SessionSource::SubAgent(SubAgentSource::Other("worker".to_string())),
             )
             .is_none()
+    );
+}
+
+#[test]
+fn execution_guard_capacity_reservation_is_atomic() {
+    let control = Arc::new(control_with_limit(/*max_threads*/ 1));
+    let start = Arc::new(Barrier::new(/*n*/ 3));
+    let finish = Arc::new(Barrier::new(/*n*/ 3));
+    let handles: [_; 2] = std::array::from_fn(|_| {
+        let control = Arc::clone(&control);
+        let start = Arc::clone(&start);
+        let finish = Arc::clone(&finish);
+        std::thread::spawn(move || {
+            let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+            start.wait();
+            let guard = control.try_execution_guard(MultiAgentVersion::V2, &source);
+            finish.wait();
+            guard
+        })
+    });
+
+    start.wait();
+    finish.wait();
+    let mut admitted = 0;
+    let mut rejected = 0;
+    for attempt in handles.map(|handle| handle.join().expect("capacity contender should not panic"))
+    {
+        match attempt {
+            Ok(Some(_guard)) => admitted += 1,
+            Ok(None) => panic!("V2 subagent execution should require capacity"),
+            Err(CodexErr::AgentLimitReached { max_threads }) => {
+                assert_eq!(max_threads, 1);
+                rejected += 1;
+            }
+            Err(error) => panic!("unexpected capacity error: {error}"),
+        }
+    }
+    assert_eq!((admitted, rejected), (1, 1));
+
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    assert!(
+        control
+            .try_execution_guard(MultiAgentVersion::V2, &source)
+            .expect("capacity should be released after both contenders exit")
+            .is_some()
     );
 }

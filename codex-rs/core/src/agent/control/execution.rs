@@ -80,6 +80,23 @@ impl AgentControl {
         is_execution_limited(multi_agent_version, session_source)
             .then(|| Arc::clone(&self.agent_execution_limiter).guard())
     }
+
+    // Used by the next stacked task-start reservation change.
+    #[allow(dead_code)]
+    pub(crate) fn try_execution_guard(
+        &self,
+        multi_agent_version: MultiAgentVersion,
+        session_source: &SessionSource,
+    ) -> CodexResult<Option<AgentExecutionGuard>> {
+        if !is_execution_limited(multi_agent_version, session_source) {
+            return Ok(None);
+        }
+        let max_threads = self.agent_execution_limiter.max_threads();
+        Arc::clone(&self.agent_execution_limiter)
+            .try_guard()
+            .map(Some)
+            .ok_or(CodexErr::AgentLimitReached { max_threads })
+    }
 }
 
 impl AgentExecutionLimiter {
@@ -98,6 +115,20 @@ impl AgentExecutionLimiter {
     fn guard(self: Arc<Self>) -> AgentExecutionGuard {
         self.active.fetch_add(1, Ordering::AcqRel);
         AgentExecutionGuard { limiter: self }
+    }
+
+    fn try_guard(self: Arc<Self>) -> Option<AgentExecutionGuard> {
+        let max_threads = self.max_threads();
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                if active < max_threads {
+                    Some(active + 1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .map(|_| AgentExecutionGuard { limiter: self })
     }
 }
 
