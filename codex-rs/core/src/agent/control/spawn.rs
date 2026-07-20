@@ -1,8 +1,13 @@
+mod usage_hint;
+
 use super::residency::is_v2_resident_session_source;
 use super::*;
 use crate::agent::role::apply_role_to_config;
 use crate::config::PermissionProfileSnapshot;
+use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentUsageHint;
 use codex_extension_api::ExtensionDataInit;
+use codex_features::Feature;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
 
@@ -78,22 +83,6 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
         RolloutItem::TurnContext(_) | RolloutItem::WorldState(_) => preserve_reference_context_item,
         RolloutItem::Compacted(_) | RolloutItem::EventMsg(_) | RolloutItem::SessionMeta(_) => true,
     }
-}
-
-fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &[String]) -> bool {
-    let ResponseItem::Message { role, content, .. } = item else {
-        return false;
-    };
-    if role != "developer" {
-        return false;
-    }
-    let [ContentItem::InputText { text }] = content.as_slice() else {
-        return false;
-    };
-
-    usage_hint_texts
-        .iter()
-        .any(|usage_hint_text| usage_hint_text == text)
 }
 
 async fn load_agent_model_context(
@@ -666,16 +655,21 @@ impl AgentControl {
                 Vec::new()
             };
         let preserve_reference_context_item = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
-        forked_rollout_items.retain(|item| {
-            keep_forked_rollout_item(item, preserve_reference_context_item)
-                && !matches!(
-                    item,
-                    RolloutItem::ResponseItem(response_item)
-                        if is_multi_agent_v2_usage_hint_message(
-                            response_item,
-                            &multi_agent_v2_usage_hint_texts_to_filter,
-                        )
-                )
+        forked_rollout_items.retain_mut(|item| {
+            if !keep_forked_rollout_item(item, preserve_reference_context_item) {
+                return false;
+            }
+            match item {
+                RolloutItem::ResponseItem(response_item)
+                    if multi_agent_version == MultiAgentVersion::V2 =>
+                {
+                    usage_hint::sanitize_message(
+                        response_item,
+                        &multi_agent_v2_usage_hint_texts_to_filter,
+                    )
+                }
+                _ => true,
+            }
         });
         if destination_history_mode == Some(ThreadHistoryMode::Paginated) {
             forked_rollout_items.retain(|item| {
@@ -694,11 +688,12 @@ impl AgentControl {
             if let RolloutItem::Compacted(compacted) = item
                 && let Some(replacement_history) = compacted.replacement_history.as_mut()
             {
-                replacement_history.retain(|response_item| {
-                    !is_multi_agent_v2_usage_hint_message(
-                        response_item,
-                        &multi_agent_v2_usage_hint_texts_to_filter,
-                    )
+                replacement_history.retain_mut(|response_item| {
+                    multi_agent_version != MultiAgentVersion::V2
+                        || usage_hint::sanitize_message(
+                            response_item,
+                            &multi_agent_v2_usage_hint_texts_to_filter,
+                        )
                 });
             }
         }
@@ -706,12 +701,19 @@ impl AgentControl {
             && multi_agent_version == MultiAgentVersion::V2
             && let Some(subagent_usage_hint_text) =
                 config.multi_agent_v2.subagent_usage_hint_text.clone()
-            && let Some(subagent_usage_hint_message) =
+        {
+            let subagent_usage_hint_message = if config.features.enabled(Feature::Workflow) {
+                Some(ContextualUserFragment::into(MultiAgentUsageHint::new(
+                    &subagent_usage_hint_text,
+                )))
+            } else {
                 crate::context_manager::updates::build_developer_update_item(vec![
                     subagent_usage_hint_text,
                 ])
-        {
-            forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+            };
+            if let Some(subagent_usage_hint_message) = subagent_usage_hint_message {
+                forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+            }
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);

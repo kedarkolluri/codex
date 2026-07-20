@@ -150,6 +150,7 @@ mod auth_keyring;
 pub mod edit;
 mod managed_features;
 mod multi_agent_v2_bounds;
+mod multi_agent_v2_usage_hint;
 mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
@@ -168,6 +169,9 @@ pub use codex_network_proxy::NetworkProxyAuditMetadata;
 use codex_sandboxing::compatibility_sandbox_policy_for_permission_profile;
 pub use codex_sandboxing::system_bwrap_warning;
 pub use managed_features::ManagedFeatures;
+pub(crate) use multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES as MULTI_AGENT_V2_PROMPT_FIELD_MAX_BYTES;
+use multi_agent_v2_usage_hint::default_multi_agent_v2_usage_hint_text;
+pub(crate) use multi_agent_v2_usage_hint::is_legacy_default_multi_agent_v2_usage_hint_text;
 pub use network_proxy_spec::NetworkProxySpec;
 pub use network_proxy_spec::StartedNetworkProxy;
 pub use permission_profile_catalog::PermissionProfileCatalogEntry;
@@ -258,12 +262,6 @@ All agents share the same directory. In detail:
 - All agents use the same current working directory.
 - As a result, edits made by one agent are immediately visible to all other agents.
 "#;
-fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency: usize) -> String {
-    format!(
-        "{usage_hint_text}\n{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\nThere are {max_concurrency} available concurrency slots, meaning that up to {max_concurrency} agents can be active at once, including you."
-    )
-}
-
 pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
 pub(crate) const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 =
     DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;

@@ -6,6 +6,7 @@ use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentUsageHint;
 use crate::context::TurnAborted;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentState;
@@ -8450,6 +8451,43 @@ async fn build_initial_context_adds_multi_agent_v2_root_usage_hint_as_developer_
             .iter()
             .any(|message| message.as_slice() == ["Subagent guidance."]),
         "did not expect subagent usage hint for root thread, got {developer_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn workflow_initial_context_marks_and_bounds_root_usage_hint() {
+    let root_usage_hint = "r".repeat(4_000);
+    let root_usage_hint_for_config = root_usage_hint.clone();
+    let (session, turn_context, _rx_event) = make_session_and_context_with_auth_and_config_and_rx(
+        CodexAuth::from_api_key("Test API Key"),
+        Vec::new(),
+        move |config| {
+            for feature in [Feature::MultiAgentV2, Feature::CodeMode, Feature::Workflow] {
+                config
+                    .features
+                    .enable(feature)
+                    .expect("test config should allow feature update");
+            }
+            config.multi_agent_v2.root_agent_usage_hint_text = Some(root_usage_hint_for_config);
+            config.multi_agent_v2.subagent_usage_hint_text = None;
+        },
+    )
+    .await;
+
+    let initial_context = build_initial_context(&session, &turn_context).await;
+    let expected = MultiAgentUsageHint::new(&root_usage_hint).render();
+    assert_eq!(expected.len(), 4_051);
+    assert_eq!(
+        MultiAgentUsageHint::new(&"é".repeat(2_001)).render(),
+        MultiAgentUsageHint::new(&"é".repeat(2_000)).render()
+    );
+    assert_eq!(
+        developer_message_texts(&initial_context)
+            .into_iter()
+            .flatten()
+            .filter(|text| MultiAgentUsageHint::matches_text(text))
+            .collect::<Vec<_>>(),
+        vec![expected.as_str()]
     );
 }
 

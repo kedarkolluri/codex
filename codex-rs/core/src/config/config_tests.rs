@@ -10639,6 +10639,49 @@ max_concurrent_threads_per_session = 17
 }
 
 #[test]
+fn legacy_default_multi_agent_v2_usage_hint_identity_survives_config_drift() {
+    for base in [
+        DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+        DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+    ] {
+        let historical_hint = default_multi_agent_v2_usage_hint_text(base, 37);
+        let historical_hint_with_model_override = append_usage_hint_text(
+            Some(&historical_hint),
+            DEFAULT_MULTI_AGENT_V2_MODEL_OVERRIDE_USAGE_HINT_TEXT,
+        );
+        let mismatched_count =
+            historical_hint.replacen("up to 37 agents", "up to 36 agents", /*count*/ 1);
+        let leading_zero_count = historical_hint
+            .replacen(
+                "There are 37 available",
+                "There are 037 available",
+                /*count*/ 1,
+            )
+            .replacen("up to 37 agents", "up to 037 agents", /*count*/ 1);
+        let zero_count = historical_hint.replace("37", "0");
+        let arbitrary_suffix = format!("{historical_hint}\nPreserve this arbitrary tail.");
+
+        assert_eq!(
+            [
+                is_legacy_default_multi_agent_v2_usage_hint_text(&historical_hint),
+                is_legacy_default_multi_agent_v2_usage_hint_text(
+                    &historical_hint_with_model_override,
+                ),
+                is_legacy_default_multi_agent_v2_usage_hint_text(&mismatched_count),
+                is_legacy_default_multi_agent_v2_usage_hint_text(&leading_zero_count),
+                is_legacy_default_multi_agent_v2_usage_hint_text(&zero_count),
+                is_legacy_default_multi_agent_v2_usage_hint_text(&arbitrary_suffix),
+            ],
+            [true, true, false, false, false, false]
+        );
+    }
+
+    assert!(!is_legacy_default_multi_agent_v2_usage_hint_text(
+        "Preserve this arbitrary developer instruction."
+    ));
+}
+
+#[test]
 fn multi_agent_v2_model_override_exposure_preserves_configured_usage_hints() {
     let config_toml = toml::from_str(
         r#"[features.multi_agent_v2]
