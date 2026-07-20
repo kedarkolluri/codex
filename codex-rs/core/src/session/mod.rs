@@ -203,6 +203,7 @@ use codex_protocol::exec_output::StreamOutput;
 mod code_mode_warning;
 mod config_lock;
 pub(crate) mod context_window;
+mod event_observer;
 mod handlers;
 mod inject;
 mod input_queue;
@@ -1977,6 +1978,7 @@ impl Session {
         if let Some(status) = agent_status_from_event(&event.msg) {
             self.agent_status.send_replace(status);
         }
+        self.event_observers.deliver(&event);
         if let Err(e) = self.tx_event.send(event).await {
             debug!("dropping event because channel is closed: {e}");
         }
