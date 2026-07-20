@@ -206,10 +206,10 @@ pub(crate) mod context_window;
 mod event_observer;
 mod handlers;
 mod inject;
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
 mod input_queue;
 mod mcp;
 mod mcp_runtime;
-mod pending_input_recording;
 pub(crate) mod multi_agents;
 mod review;
 mod rollout_budget;

@@ -38,6 +38,7 @@ pub(crate) struct PendingInputRecording {
     token: Arc<()>,
     turn_state: Weak<Mutex<TurnState>>,
     turn_context: Arc<TurnContext>,
+    claimed_input: Arc<[TurnInput]>,
     result_rx: watch::Receiver<Option<PendingInputRecordingResult>>,
 }
 
@@ -68,7 +69,6 @@ pub(crate) enum PendingInputClaim {
 }
 
 pub(crate) struct ClaimedPendingInput {
-    items: Vec<TurnInput>,
     completion: PendingInputRecordingCompletion,
 }
 
@@ -259,7 +259,7 @@ impl InputQueue {
             active_turn
                 .task
                 .as_ref()
-                .is_some_and(|task| task.turn_context.sub_id == turn_context.sub_id)
+                .is_some_and(|task| Arc::ptr_eq(&task.turn_context, turn_context))
         }) else {
             return PendingInputClaim::Inactive;
         };
@@ -314,17 +314,18 @@ impl InputQueue {
         if items.is_empty() {
             return PendingInputClaim::Empty;
         }
+        let claimed_input = Arc::<[TurnInput]>::from(items);
         let token = Arc::new(());
         let (result_tx, result_rx) = watch::channel(None);
         let recording = PendingInputRecording {
             token,
             turn_state: Arc::downgrade(turn_state),
             turn_context: Arc::clone(turn_context),
+            claimed_input,
             result_rx,
         };
         state.pending_input.recording = Some(recording.clone());
         PendingInputClaim::Acquired(ClaimedPendingInput {
-            items,
             completion: PendingInputRecordingCompletion {
                 recording,
                 result_tx: Some(result_tx),
@@ -463,8 +464,8 @@ impl ClaimedPendingInput {
         self.completion.recording.clone()
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<TurnInput>, PendingInputRecordingCompletion) {
-        (self.items, self.completion)
+    pub(crate) fn into_parts(self) -> (Arc<[TurnInput]>, PendingInputRecordingCompletion) {
+        (self.completion.recording.claimed_input(), self.completion)
     }
 }
 
@@ -474,7 +475,11 @@ impl PendingInputRecording {
     }
 
     fn matches_turn(&self, turn_context: &TurnContext) -> bool {
-        self.turn_context.sub_id == turn_context.sub_id
+        Arc::ptr_eq(&self.turn_context, turn_context)
+    }
+
+    pub(crate) fn claimed_input(&self) -> Arc<[TurnInput]> {
+        Arc::clone(&self.claimed_input)
     }
 
     pub(crate) async fn wait(mut self) -> PendingInputRecordingResult {
@@ -484,13 +489,9 @@ impl PendingInputRecording {
                 *result
             };
             if let Some(result) = result {
-                if result == PendingInputRecordingResult::Failed {
-                    self.clear_if_current().await;
-                }
                 return result;
             }
             if self.result_rx.changed().await.is_err() {
-                self.clear_if_current().await;
                 return PendingInputRecordingResult::Failed;
             }
         }

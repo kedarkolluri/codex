@@ -359,53 +359,57 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn any_new_input_interrupts_sleep() {
+async fn pending_input_survives_interrupt_after_interrupting_sleep() {
     const FIRST_SLEEP_CALL_ID: &str = "sleep-call-1";
     const SECOND_SLEEP_CALL_ID: &str = "sleep-call-2";
+    const THIRD_SLEEP_CALL_ID: &str = "sleep-call-3";
     const SLEEP_DURATION_MS: u64 = 3_600_000;
     const INITIAL_PROMPT: &str = "sleep for a while";
     const STEER_PROMPT: &str = "stop sleeping and continue";
+    const MAILBOX_INPUT: &str = "new mailbox input";
+    const FOLLOW_UP_PROMPT: &str = "continue after interruption";
     let sleep_arguments = json!({ "duration_ms": SLEEP_DURATION_MS }).to_string();
 
-    let first_chunks = vec![
-        chunk(ev_response_created("resp-1")),
-        chunk(ev_function_call_with_namespace(
-            FIRST_SLEEP_CALL_ID,
-            "clock",
-            "sleep",
-            &sleep_arguments,
-        )),
-        chunk(ev_completed("resp-1")),
-    ];
-    let second_chunks = vec![
-        chunk(ev_response_created("resp-2")),
-        chunk(ev_function_call_with_namespace(
-            SECOND_SLEEP_CALL_ID,
-            "clock",
-            "sleep",
-            &sleep_arguments,
-        )),
-        chunk(ev_completed("resp-2")),
-    ];
-    let (server, _completions) = start_streaming_sse_server(vec![
-        first_chunks,
-        second_chunks,
-        response_completed_chunks("resp-3"),
-    ])
+    let first_response = responses::sse(vec![
+        ev_response_created("resp-1"),
+        ev_function_call_with_namespace(FIRST_SLEEP_CALL_ID, "clock", "sleep", &sleep_arguments),
+        ev_completed("resp-1"),
+    ]);
+    let second_response = responses::sse(vec![
+        ev_response_created("resp-2"),
+        ev_function_call_with_namespace(SECOND_SLEEP_CALL_ID, "clock", "sleep", &sleep_arguments),
+        ev_completed("resp-2"),
+    ]);
+    let third_response = responses::sse(vec![
+        ev_response_created("resp-3"),
+        ev_function_call_with_namespace(THIRD_SLEEP_CALL_ID, "clock", "sleep", &sleep_arguments),
+        ev_completed("resp-3"),
+    ]);
+    let follow_up_response =
+        responses::sse(vec![ev_response_created("resp-4"), ev_completed("resp-4")]);
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            first_response,
+            second_response,
+            third_response,
+            follow_up_response,
+        ],
+    )
     .await;
-    let codex = test_codex()
-        .with_model("gpt-5.4")
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::CurrentTimeReminder)
-                .expect("test config should allow current-time reminders");
-            config.current_time_reminder = Some(CurrentTimeReminderConfig {
-                sleep_tool: true,
-                ..CurrentTimeReminderConfig::default()
-            });
-        })
-        .build_with_streaming_server(&server)
+    let mut builder = test_codex().with_model("gpt-5.4").with_config(|config| {
+        config
+            .features
+            .enable(Feature::CurrentTimeReminder)
+            .expect("test config should allow current-time reminders");
+        config.current_time_reminder = Some(CurrentTimeReminderConfig {
+            sleep_tool: true,
+            ..CurrentTimeReminderConfig::default()
+        });
+    });
+    let codex = builder
+        .build_with_auto_env(&server)
         .await
         .expect("build Codex test session")
         .codex;
@@ -417,25 +421,59 @@ async fn any_new_input_interrupts_sleep() {
     wait_for_sleep_item_completed(&codex, FIRST_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
     wait_for_sleep_item_started(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
 
-    submit_queue_only_agent_mail(&codex, "new mailbox input").await;
+    submit_queue_only_agent_mail(&codex, MAILBOX_INPUT).await;
     wait_for_sleep_item_completed(&codex, SECOND_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
+    // Reaching the third sleep proves both pending inputs were recorded and exposed to the model
+    // before the turn is aborted.
+    wait_for_sleep_item_started(&codex, THIRD_SLEEP_CALL_ID, SLEEP_DURATION_MS).await;
+
+    codex.submit(Op::Interrupt).await.expect("interrupt turn");
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnAborted(_))).await;
+
+    submit_user_input(&codex, FOLLOW_UP_PROMPT).await;
     wait_for_turn_complete(&codex).await;
 
-    let requests = server.requests().await;
-    assert_eq!(requests.len(), 3);
-    let second: Value = from_slice(&requests[1]).expect("parse second request");
-    let relevant_user_input = message_input_texts(&second, "user")
+    let requests = response_mock.requests();
+    assert_eq!(requests.len(), 4);
+    let second = requests[1].body_json();
+    let second_user_input = message_input_texts(&second, "user")
         .into_iter()
         .filter(|text| text == INITIAL_PROMPT || text == STEER_PROMPT)
         .collect::<Vec<_>>();
     assert_eq!(
-        relevant_user_input,
+        second_user_input,
         vec![INITIAL_PROMPT.to_string(), STEER_PROMPT.to_string()]
     );
     assert_interrupted_sleep_output(function_call_output_text(&second, FIRST_SLEEP_CALL_ID));
 
-    let third: Value = from_slice(&requests[2]).expect("parse third request");
+    let third = requests[2].body_json();
     assert_interrupted_sleep_output(function_call_output_text(&third, SECOND_SLEEP_CALL_ID));
+    let third_agent_messages = requests[2].inputs_of_type("agent_message");
+    assert_eq!(third_agent_messages.len(), 1);
+    assert_eq!(
+        third_agent_messages[0]["content"],
+        json!([{"type": "input_text", "text": MAILBOX_INPUT}])
+    );
+
+    let fourth_user_input = requests[3]
+        .message_input_texts("user")
+        .into_iter()
+        .filter(|text| text == INITIAL_PROMPT || text == STEER_PROMPT || text == FOLLOW_UP_PROMPT)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fourth_user_input,
+        vec![
+            INITIAL_PROMPT.to_string(),
+            STEER_PROMPT.to_string(),
+            FOLLOW_UP_PROMPT.to_string(),
+        ]
+    );
+    let fourth_agent_messages = requests[3].inputs_of_type("agent_message");
+    assert_eq!(fourth_agent_messages.len(), 1);
+    assert_eq!(
+        fourth_agent_messages[0]["content"],
+        json!([{"type": "input_text", "text": MAILBOX_INPUT}])
+    );
 
     codex.submit(Op::Shutdown).await.expect("shutdown session");
     wait_for_event(&codex, |event| matches!(event, EventMsg::ShutdownComplete)).await;
@@ -468,8 +506,6 @@ async fn any_new_input_interrupts_sleep() {
             },
         ]
     );
-
-    server.shutdown().await;
 }
 
 fn assert_two_responses_input_snapshot(snapshot_name: &str, requests: &[Vec<u8>]) {
