@@ -184,6 +184,10 @@ impl TurnMetadataState {
         Some(Value::Object(metadata))
     }
 
+    pub(crate) fn thread_source(&self) -> Option<&ThreadSource> {
+        self.thread_source.as_ref()
+    }
+
     pub(crate) fn to_responses_metadata(
         &self,
         installation_id: String,

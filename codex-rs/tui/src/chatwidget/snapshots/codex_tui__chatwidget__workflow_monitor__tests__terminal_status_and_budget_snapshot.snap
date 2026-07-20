@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 80)"
+---
+◆ Workflow release  run-term  completed · duration 8s
+  3.45K tokens · 6 tools
+  ✓ verify · 1/1 agents · duration 6s
+    └─ ✓ verifier  gpt-5.5 · xhigh  completed · attempt 1 · 3.45K tok · 6 tools
+       · 0ms
+  budget  3.6K / 8K weighted tokens
+  ↳ release ready
+
+  Enter inspect agents

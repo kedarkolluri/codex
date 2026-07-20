@@ -134,9 +134,13 @@ async fn handle_spawn_agent(
             fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
             parent_thread_id: Some(session.thread_id),
             environments: Some(turn.environments.to_selections()),
+            spawn_workspace: None,
             // The V1 `spawn_agent` tool keeps the registry's random nickname pool pick; only
             // deterministic-replay workflows supply an ordinal-derived preference.
             preferred_agent_nickname: None,
+            // This path already carries the role in its explicit `thread_spawn_source` above.
+            agent_role: None,
+            parent_completion_delivery: Default::default(),
         },
     ))
     .await

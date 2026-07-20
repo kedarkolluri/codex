@@ -1,0 +1,30 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: agent
+---
+WorkflowAgent {
+    id: 9,
+    attempt: 0,
+    last_attempt_reason: None,
+    parent_node_id: None,
+    phase_index: 0,
+    label: "inspector",
+    model: "gpt-5.5",
+    effort: High,
+    child_thread_id: Some(
+        "thread-inspector",
+    ),
+    state: Active,
+    status: Running,
+    token_usage: TokenUsage {
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: 0,
+    },
+    tool_call_count: 0,
+    duration_ms: 0,
+    returned_null: false,
+    child_node_ids: [],
+}

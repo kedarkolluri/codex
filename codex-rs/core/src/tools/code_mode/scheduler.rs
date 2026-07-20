@@ -53,6 +53,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 /// Upper bound on the *policy* concurrency cap, independent of the machine's core
 /// count (`min(16, ...)` in the spec §5 formula).
@@ -134,6 +135,14 @@ pub(crate) enum SpawnAttempt<T> {
     /// The child never started, so the scheduler drops the permit and **requeues** the
     /// call rather than failing it.
     AgentLimitReached,
+}
+
+/// Result of cancellation-aware scheduler admission.
+pub(crate) enum WorkflowAdmission<T> {
+    /// The spawn closure ran to a terminal result while holding a permit.
+    Finalized(T),
+    /// Cancellation won while the call was queued, before a permit or child resource was acquired.
+    Cancelled,
 }
 
 /// The per-run lifetime cap (spec §5) was hit: `admit` rejected an `agent()` invocation
@@ -302,6 +311,46 @@ impl WorkflowScheduler {
                     // Requeue: drop the permit first so a sibling can make progress and
                     // free a registry slot, then yield and re-acquire from the back of
                     // the fair wait queue.
+                    drop(permit);
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+
+    /// Cancellation-aware admission for workflow calls that own external child resources.
+    ///
+    /// Cancellation can end the wait for a concurrency permit, when no child or worktree exists.
+    /// Once the permit is acquired, `spawn` is awaited to completion rather than dropped; the
+    /// closure is responsible for observing the same token, stopping its child, and explicitly
+    /// closing its resource guards before it returns.
+    pub(crate) async fn admit_cancellable<F, Fut, T>(
+        &self,
+        cancellation_token: &CancellationToken,
+        mut spawn: F,
+    ) -> Result<WorkflowAdmission<T>, AgentCapReached>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = SpawnAttempt<T>>,
+    {
+        if !self.try_increment_lifetime() {
+            return Err(AgentCapReached {
+                cap: self.lifetime_cap,
+            });
+        }
+        loop {
+            let permit = tokio::select! {
+                permit = self.semaphore.acquire() => permit.ok(),
+                _ = cancellation_token.cancelled() => {
+                    return Ok(WorkflowAdmission::Cancelled);
+                }
+            };
+            match spawn().await {
+                SpawnAttempt::Finalized(value) => {
+                    drop(permit);
+                    return Ok(WorkflowAdmission::Finalized(value));
+                }
+                SpawnAttempt::AgentLimitReached => {
                     drop(permit);
                     tokio::task::yield_now().await;
                 }

@@ -1,0 +1,38 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "rendered_reasons.join(\"\\n\\n\")"
+---
+COMPLETED
+› ◆ Workflow release-check  …456789ab  completed · duration 4s
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+FAILED
+› ◆ Workflow release-check  …456789ab  failed · duration 4s
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+INTERRUPTED
+› ◆ Workflow release-check  …456789ab  interrupted · duration 4s
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+STOPPED
+› ◆ Workflow release-check  …456789ab  stopped · duration 4s
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+PAUSED
+› ◆ Workflow release-check  …456789ab  paused · duration 4s
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · r resume · Enter inspect agents · Esc exit

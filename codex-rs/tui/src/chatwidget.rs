@@ -404,6 +404,8 @@ mod side;
 use self::safety_buffering::SafetyBufferingState;
 mod status_state;
 mod windows_sandbox_prompts;
+mod workflow_entry;
+mod workflow_monitor;
 use self::status_state::StatusIndicatorState;
 use self::status_state::StatusState;
 use self::status_state::TerminalTitleStatusKind;
@@ -417,6 +419,8 @@ mod tool_lifecycle;
 mod tool_requests;
 mod transcript;
 use self::transcript::TranscriptState;
+use self::workflow_monitor::WorkflowMonitor;
+use self::workflow_monitor::WorkflowNotification;
 mod turn_lifecycle;
 mod turn_runtime;
 use self::turn_lifecycle::TurnLifecycleState;
@@ -628,6 +632,11 @@ pub(crate) struct ChatWidget {
     review: ReviewState,
     // Active hook runs render in a dedicated live cell so they can run alongside tools.
     active_hook_cell: Option<HookCell>,
+    /// Persisted target shown in `/experimental`. The runtime feature in `config` stays fixed
+    /// until restart because the app-server workflow registry is initialized at startup.
+    workflow_feature_configured_enabled: bool,
+    /// Bounded live projection of workflow progress for this thread.
+    workflow_monitor: WorkflowMonitor,
     // Ambient companion rendered over the transcript area, never inside the footer rows.
     ambient_pet: Option<crate::pets::AmbientPet>,
     pet_picker_preview_state: crate::pets::PetPickerPreviewState,

@@ -1,0 +1,20 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "crate::chatwidget::tests::render_bottom_popup(&chat, 90)"
+---
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+
+  Save workflow `release-check`
+  Choose where to save the exact durable script.
+
+› 1. Personal  Save to your private .agents workflow registry.
+  2. Project   Scripts can contain secrets. Project files may be committed; review
+               before commit.
+  3. Cancel    Do not save this workflow.
+
+  Press enter to confirm or esc to go back

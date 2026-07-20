@@ -141,5 +141,12 @@ mod websocket_fallback;
 mod window_headers;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
+mod workflow_agent_controls;
+mod workflow_broker_integration;
+mod workflow_budget_semantics;
+mod workflow_host_parity;
+mod workflow_model_resume;
+mod workflow_role_context_bounds;
 mod workflow_uat;
+mod workflow_worktree_uat;
 mod workspace_roots;

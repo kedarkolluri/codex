@@ -1,0 +1,21 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "crate::chatwidget::tests::render_bottom_popup(&chat, 80)"
+---
+› ◆ Workflow release-check  run-stop  running · elapsed ≥ 5s
+  0 tokens · 0 tools
+  ● verify · 0/1 agents · elapsed ≥ 4s
+    └─ ● verifier  gpt-5.5 · high  running · attempt 1 · ≥0ms
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc
+  exit
+
+
+  Stop workflow?
+  release-check · run-stop-confirm
+
+  1. Stop selected workflow  Cancel this run and wait for its agents and
+                             resources to stop.
+› 2. Cancel                  Keep the workflow running.
+
+  Press enter to confirm or esc to go back

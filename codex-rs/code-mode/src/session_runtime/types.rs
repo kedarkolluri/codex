@@ -2,11 +2,10 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
-use std::sync::Arc;
-
 use codex_code_mode_protocol::AgentCallOpts;
 use codex_code_mode_protocol::AgentSpawnOutcome;
-use codex_code_mode_protocol::WorkflowBudgetHandle;
+use codex_code_mode_protocol::WorkflowBudgetSnapshot;
+use codex_code_mode_protocol::WorkflowHostProgress;
 use serde_json::Value as JsonValue;
 use tokio_util::sync::CancellationToken;
 
@@ -95,6 +94,11 @@ pub(crate) struct CreateCellRequest {
     /// Host-minted uuid v7 run identifier; exposed read-only as `workflow.runId`.
     /// See [`codex_code_mode_protocol::ExecuteRequest::run_id`].
     pub(crate) run_id: Option<String>,
+    /// Typed prefix-replay seed decoded from the execute request before the
+    /// isolate starts. Empty for fresh runs and plain code-mode cells.
+    pub(crate) replay_entries: Vec<codex_workflow_journal::AgentCallLine>,
+    /// Initial run-local workflow budget mirror. Absent for plain cells.
+    pub(crate) workflow_budget: Option<WorkflowBudgetSnapshot>,
 }
 
 /// Tool metadata exposed to code running inside a cell.
@@ -154,12 +158,24 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
     fn spawn_agent(
         &self,
         cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: AgentCallOpts,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = AgentSpawnOutcome> + Send {
-        let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
+        let _ = (
+            cell_id,
+            node_id,
+            parent_node_id,
+            phase,
+            prompt,
+            ordinal,
+            opts,
+            cancellation_token,
+        );
         async { AgentSpawnOutcome::Failed }
     }
 
@@ -178,45 +194,58 @@ pub(crate) trait SessionRuntimeDelegate: Send + Sync + 'static {
         async { AgentSpawnOutcome::Failed }
     }
 
-    /// The live shared token-budget handle backing the workflow `budget` global, or `None` when this
-    /// delegate runs no budgeted workflow. The default returns `None` so delegates without a budget
-    /// need no changes.
-    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
-        None
-    }
-
-    /// Prior-run journal `agent_call` lines seeding prefix-replay for a resumed run
-    /// (spec §7 "Resume algorithm", `P3-resume-entry`). The default returns an empty
-    /// vec so a fresh (non-resume) run seeds no replay state. See
-    /// [`codex_code_mode_protocol::CodeModeSessionDelegate::replay_entries`].
-    fn replay_entries(&self, cell_id: CellId) -> Vec<codex_workflow_journal::AgentCallLine> {
+    fn workflow_budget_snapshot(
+        &self,
+        cell_id: CellId,
+    ) -> impl Future<Output = Result<Option<WorkflowBudgetSnapshot>, String>> + Send {
         let _ = cell_id;
-        Vec::new()
+        async { Ok(None) }
     }
 
-    /// Journal a workflow `phase(title)` marker for `cell_id` (§7 `phase` line). The default is a
-    /// no-op so delegates that do not journal need no changes.
-    fn journal_phase(&self, cell_id: CellId, title: String) -> impl Future<Output = ()> + Send {
+    /// Journal a workflow `phase(title)` marker for `cell_id` (§7 `phase` line). An error stops the
+    /// workflow; the default is a successful no-op for delegates that do not journal.
+    fn journal_phase(
+        &self,
+        cell_id: CellId,
+        title: String,
+    ) -> impl Future<Output = Result<(), String>> + Send {
         let _ = (cell_id, title);
-        async {}
+        async { Ok(()) }
     }
 
-    /// Journal a workflow `log(message)` marker for `cell_id` (§7 `log` line). The default is a
-    /// no-op so delegates that do not journal need no changes.
-    fn journal_log(&self, cell_id: CellId, message: String) -> impl Future<Output = ()> + Send {
+    /// Journal a workflow `log(message)` marker for `cell_id` (§7 `log` line). An error stops the
+    /// workflow; the default is a successful no-op for delegates that do not journal.
+    fn journal_log(
+        &self,
+        cell_id: CellId,
+        message: String,
+    ) -> impl Future<Output = Result<(), String>> + Send {
         let _ = (cell_id, message);
-        async {}
+        async { Ok(()) }
     }
 
     /// Handle a prefix-replay cache hit for `cell_id` (§7 resume step 3): re-append `entry` to the
-    /// run's journal and re-add its `tokens_spent` to the shared budget, WITHOUT spawning. The
-    /// default is a no-op so delegates that neither journal nor meter need no changes.
+    /// run's journal and charge its `tokens_spent` to the run-local workflow meter, WITHOUT
+    /// spawning. The cached promise is resolved only after this acknowledgement succeeds; an error rejects it.
+    /// The default is a successful no-op so delegates that neither journal nor meter need no changes.
     fn replay_agent(
         &self,
         cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         entry: codex_workflow_journal::AgentCallLine,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        let _ = (cell_id, node_id, parent_node_id, phase, entry);
+        async { Ok(()) }
+    }
+
+    fn workflow_progress(
+        &self,
+        cell_id: CellId,
+        progress: WorkflowHostProgress,
     ) -> impl Future<Output = ()> + Send {
-        let _ = (cell_id, entry);
+        let _ = (cell_id, progress);
         async {}
     }
 

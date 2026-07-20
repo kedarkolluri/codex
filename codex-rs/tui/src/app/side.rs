@@ -533,6 +533,9 @@ impl App {
         let active_thread_id_before_switch = self.active_thread_id;
         let side_thread_to_discard = self.side_thread_to_discard_after_switch(thread_id);
         self.select_agent_thread(tui, app_server, thread_id).await?;
+        if self.active_thread_id == Some(thread_id) {
+            self.clear_workflow_monitor_returns();
+        }
         if self.active_thread_id == Some(thread_id)
             && let Some(side_thread_id) = side_thread_to_discard
         {

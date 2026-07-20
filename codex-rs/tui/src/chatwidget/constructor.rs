@@ -36,6 +36,7 @@ impl ChatWidget {
         let mut config = config;
         config.model = model.clone();
         let prevent_idle_sleep = config.features.enabled(Feature::PreventIdleSleep);
+        let workflow_feature_configured_enabled = config.features.enabled(Feature::Workflow);
         let mut rng = rand::rng();
         let placeholder = PLACEHOLDERS[rng.random_range(0..PLACEHOLDERS.len())].to_string();
         let side_placeholder =
@@ -180,6 +181,8 @@ impl ChatWidget {
             status_state: StatusState::default(),
             review: ReviewState::default(),
             active_hook_cell: None,
+            workflow_feature_configured_enabled,
+            workflow_monitor: WorkflowMonitor::default(),
             ambient_pet: None,
             pet_picker_preview_state: crate::pets::PetPickerPreviewState::default(),
             pet_picker_preview_pet: None,
@@ -260,6 +263,7 @@ impl ChatWidget {
         widget.sync_personality_command_enabled();
         widget.sync_plugins_command_enabled();
         widget.sync_goal_command_enabled();
+        widget.sync_workflow_command_enabled();
         widget.sync_mentions_v2_enabled();
         widget
             .bottom_pane

@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 80)"
+---
+◆ Workflow collect  run-resu  running · elapsed ≥ 6s
+  680 tokens · 1 tool
+  ● work · 2/2 agents · elapsed ≥ 5s
+    └─ ✓ parallel · 2 items
+      ├─ × api-check  gpt-5.5 · medium  errored · attempt 1 · 460 tok · 1 tool ·
+         0ms
+         fixture endpoint returned 503
+      └─ ✓ optional-docs  gpt-5.5-mini · low  completed · attempt 1 · null · 220
+         tok · 0ms
+
+  Enter inspect agents

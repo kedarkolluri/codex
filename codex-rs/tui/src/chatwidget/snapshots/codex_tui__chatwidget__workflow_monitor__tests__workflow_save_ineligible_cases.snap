@@ -1,0 +1,39 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"RUNNING FULL RUN\\n{running_rendered}\\n\\nAGENT FOCUS\\n{agent_rendered}\\n\\nCOMPACT AND SATURATED\\n{capacity_rendered}\")"
+---
+RUNNING FULL RUN
+› ◆ Workflow running  run-save  running · elapsed ≥ 1s
+  ● work · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc exit
+
+AGENT FOCUS
+◆ Workflow agent-focused  run-save  completed · duration 8s
+  10 tokens · 0 tools
+  ✓ work · 1/1 agents · duration 7s
+  › └─ ✓ worker  gpt-5.5 · high  completed · attempt 1 · 10 tok · 0ms
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose · Enter inspect agent · Esc exit
+
+COMPACT AND SATURATED
+  … 1 workflow run omitted
+
+◆ Workflow overflow-1  run-save  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow overflow-2  run-save  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow overflow-3  run-save  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◇ Workflow overflow-4  run-save  compact · running
+◇ Workflow overflow-5  run-save  compact · running
+◇ Workflow overflow-6  run-save  compact · running
+◇ Workflow overflow-7  run-save  compact · running
+
+  … 2 additional workflow runs omitted at monitor capacity · latest run-save
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit

@@ -9,7 +9,7 @@
 //! The workflows file watcher ([`crate::workflows_watcher::WorkflowsWatcher`])
 //! calls [`WorkflowsService::clear_cache`] whenever a watched workflow file
 //! changes, then emits `workflows/changed`, so the next reader observes fresh
-//! metadata. Registry readers (the P4 workflow entrypoint requests) call
+//! metadata. Registry readers such as `workflow/list` call
 //! [`WorkflowsService::registry_for_roots`] to obtain a cached registry for a
 //! given precedence-ordered root set.
 
@@ -75,9 +75,7 @@ impl WorkflowsService {
     /// Return the cached registry for `roots`, discovering (and caching) it on a
     /// miss. Discovery never executes workflow bodies.
     ///
-    /// Consumed by the P4 workflow entrypoint requests; the watcher only needs
-    /// [`Self::clear_cache`].
-    #[allow(dead_code)]
+    /// The watcher only needs [`Self::clear_cache`].
     pub(crate) async fn registry_for_roots(
         &self,
         roots: Vec<WorkflowRoot>,

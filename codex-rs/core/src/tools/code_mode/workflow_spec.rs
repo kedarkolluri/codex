@@ -1,39 +1,54 @@
-use codex_tools::FreeformTool;
-use codex_tools::FreeformToolFormat;
+use std::collections::BTreeMap;
+
+use codex_tools::JsonSchema;
+use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 
 use super::WORKFLOW_TOOL_NAME;
 
-/// Freeform grammar for the workflow tool. Identical in shape to the code-mode
-/// `exec` grammar (optional `// @exec:` pragma line followed by raw source); the
-/// body is a workflow ES module that opens with a static `export const meta`
-/// manifest.
-const WORKFLOW_FREEFORM_GRAMMAR: &str = r#"
-start: pragma_source | plain_source
-pragma_source: PRAGMA_LINE NEWLINE SOURCE
-plain_source: SOURCE
-
-PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
-NEWLINE: /\r?\n/
-SOURCE: /[\s\S]+/
-"#;
-
-/// Build the [`ToolSpec`] for the workflow host tool. This is a skeleton spec:
-/// it advertises the raw-source freeform interface only. Rich per-workflow
-/// descriptions (args schema, phases, budget) arrive in later phases.
+/// Build the model-callable workflow launcher.
+///
+/// The model may select a statically discovered saved workflow and provide
+/// bounded JSON arguments, but it cannot submit inline source or an arbitrary
+/// filesystem path. Workflow source remains host-authored and reviewable.
 pub(crate) fn create_workflow_tool() -> ToolSpec {
-    ToolSpec::Freeform(FreeformTool {
+    let properties = BTreeMap::from([
+        (
+            "name".to_string(),
+            JsonSchema::string(Some(
+                "Exact metadata name of a saved workflow discovered by Codex.".to_string(),
+            )),
+        ),
+        (
+            "args".to_string(),
+            JsonSchema {
+                description: Some(
+                    "Optional JSON value exposed to the workflow as the read-only `args` global."
+                        .to_string(),
+                ),
+                ..Default::default()
+            },
+        ),
+        (
+            "resumeFromRunId".to_string(),
+            JsonSchema::string(Some(
+                "Optional canonical workflow run UUID whose compatible journal prefix should be replayed."
+                    .to_string(),
+            )),
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
         name: WORKFLOW_TOOL_NAME.to_string(),
-        description: "Run a dynamic workflow: raw JavaScript source that opens with a static \
-             `export const meta = { name, description, phases }` manifest followed by the \
-             workflow body. The manifest is validated before execution and the body then runs \
-             exactly once in a fresh isolate. Orchestration hooks (agent handoff, journal, \
-             budget) arrive in later milestones."
+        description: "Start a saved Dynamic Workflow in the background. The workflow is resolved by its exact saved metadata name; inline source and filesystem paths are not accepted. Returns after the run is durably initialized, while progress and completion continue through workflow events."
             .to_string(),
-        format: FreeformToolFormat {
-            r#type: "grammar".to_string(),
-            syntax: "lark".to_string(),
-            definition: WORKFLOW_FREEFORM_GRAMMAR.to_string(),
-        },
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["name".to_string()]),
+            /*additional_properties*/ Some(false.into()),
+        ),
+        output_schema: None,
     })
 }

@@ -3,6 +3,12 @@ use codex_protocol::config_types::MultiAgentMode;
 
 pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Clone, Copy)]
+pub(super) enum WorkflowReplayMode {
+    Disabled,
+    Enabled,
+}
+
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
     pub(super) thread_manager: Arc<ThreadManager>,
@@ -247,12 +253,16 @@ pub(super) async fn ensure_listener_task_running(
     // registration is held for the listener task's lifetime below and
     // unregisters on drop.
     let workflows_watch_registration = match listener_task_context.workflows_watcher.as_ref() {
-        Some(workflows_watcher) => workflows_watcher.register_thread_config(
-            config.as_ref(),
+        Some(workflows_watcher) => workflows_watcher.register_thread_environments(
             listener_task_context.thread_manager.as_ref(),
             &environments,
         ),
         None => codex_file_watcher::WatchRegistration::default(),
+    };
+    let workflow_replay_mode = if listener_task_context.workflows_watcher.is_some() {
+        WorkflowReplayMode::Enabled
+    } else {
+        WorkflowReplayMode::Disabled
     };
     let thread_settings_baseline =
         thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
@@ -316,6 +326,7 @@ pub(super) async fn ensure_listener_task_running(
                         &thread_watch_manager,
                         &outgoing_for_task,
                         &pending_thread_unloads,
+                        workflow_replay_mode,
                         listener_command,
                     )
                     .await;
@@ -477,6 +488,7 @@ pub(super) async fn handle_thread_listener_command(
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
     pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    workflow_replay_mode: WorkflowReplayMode,
     listener_command: ThreadListenerCommand,
 ) {
     match listener_command {
@@ -490,6 +502,7 @@ pub(super) async fn handle_thread_listener_command(
                 thread_watch_manager,
                 outgoing,
                 pending_thread_unloads,
+                workflow_replay_mode,
                 *resume_request,
             )
             .await;
@@ -547,6 +560,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
     pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    workflow_replay_mode: WorkflowReplayMode,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
     let active_turn = {
@@ -696,6 +710,23 @@ pub(super) async fn handle_pending_thread_resume_request(
             &token_usage_thread,
             conversation.as_ref(),
             token_usage_turn_id,
+        )
+        .await;
+    }
+    if matches!(workflow_replay_mode, WorkflowReplayMode::Enabled)
+        && conversation
+            .config()
+            .await
+            .features
+            .enabled(Feature::Workflow)
+    {
+        // Match cold resume for workflow monitors as well: replay only to the connection that just
+        // joined, after its response, and leave the durable rollout untouched.
+        super::workflow_event_replay::send_workflow_replay_to_connection(
+            outgoing,
+            connection_id,
+            conversation_id,
+            &pending.history_items,
         )
         .await;
     }

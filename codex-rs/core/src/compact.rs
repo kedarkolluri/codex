@@ -253,6 +253,13 @@ async fn run_compact_task_inner_impl(
         let turn_input = history
             .clone()
             .for_prompt(&turn_context.model_info.input_modalities);
+        if sess.is_workflow_managed_agent().await {
+            crate::context::validate_workflow_child_model_history(&turn_input).map_err(|_| {
+                CodexErr::InvalidRequest(
+                    "workflow child history exceeds model-context limits".to_string(),
+                )
+            })?;
+        }
         let turn_input_len = turn_input.len();
         let prompt = Prompt {
             input: turn_input,
@@ -331,8 +338,6 @@ async fn run_compact_task_inner_impl(
         // belongs to this compaction turn.
         summary_item.set_turn_id_if_missing(&turn_context.sub_id);
     }
-    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
-
     let (initial_context, world_state_baseline) = build_compaction_initial_context(
         sess.as_ref(),
         turn_context.as_ref(),
@@ -343,6 +348,10 @@ async fn run_compact_task_inner_impl(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
+    let new_history = sess
+        .bound_workflow_child_compacted_history(new_history)
+        .await?;
+    let (window_number, window_ids) = sess.advance_auto_compact_window().await;
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage(_) => {
@@ -364,7 +373,7 @@ async fn run_compact_task_inner_impl(
         world_state_baseline,
         compacted_item,
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(&turn_context).await;
 
     sess.emit_turn_item_completed(&turn_context, compaction_item)

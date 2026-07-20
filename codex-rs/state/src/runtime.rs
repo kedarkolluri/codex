@@ -18,6 +18,13 @@ use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
 use crate::WorkflowRun;
+use crate::WorkflowRunAgent;
+use crate::WorkflowRunAgentUpsertParams;
+use crate::WorkflowRunFilesystemCycleResult;
+use crate::WorkflowRunFilesystemIndexState;
+use crate::WorkflowRunPendingCleanupBatch;
+use crate::WorkflowRunPublicationAdmission;
+use crate::WorkflowRunRecoveryBatch;
 use crate::WorkflowRunStatus;
 use crate::WorkflowRunUpsertParams;
 use crate::apply_rollout_item;
@@ -73,6 +80,8 @@ mod remote_control;
 #[cfg(test)]
 mod test_support;
 mod threads;
+mod workflow_run_agents;
+mod workflow_run_recovery;
 mod workflow_runs;
 
 pub use external_agent_config_imports::ExternalAgentConfigImportDetailsRecord;

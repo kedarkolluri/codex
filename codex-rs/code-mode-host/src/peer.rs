@@ -145,7 +145,12 @@ impl HostPeer {
             DelegateRequest::InvokeTool { invocation } => invocation.cell_id.clone().into(),
             DelegateRequest::Notify { cell_id, .. }
             | DelegateRequest::SpawnAgent { cell_id, .. }
-            | DelegateRequest::SpawnWorkflow { cell_id, .. } => cell_id.clone().into(),
+            | DelegateRequest::SpawnWorkflow { cell_id, .. }
+            | DelegateRequest::JournalPhase { cell_id, .. }
+            | DelegateRequest::JournalLog { cell_id, .. }
+            | DelegateRequest::ReplayAgent { cell_id, .. }
+            | DelegateRequest::WorkflowProgress { cell_id, .. }
+            | DelegateRequest::WorkflowBudget { cell_id } => cell_id.clone().into(),
         };
         let (dispatched_tx, dispatched_rx) = oneshot::channel();
         if let Err(err) = self.route_cell_message(

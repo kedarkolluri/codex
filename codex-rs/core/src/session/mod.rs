@@ -27,6 +27,7 @@ use crate::context::AvailableSkillsInstructions;
 use crate::context::CollaborationModeInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::MultiAgentModeInstructions;
+use crate::context::MultiAgentUsageHint;
 use crate::context::NetworkRuleSaved;
 use crate::context::PermissionsInstructions;
 use crate::context::PersonalitySpecInstructions;
@@ -217,6 +218,7 @@ pub(crate) mod step_context;
 pub(crate) mod time_reminder;
 mod token_budget;
 pub(crate) mod turn;
+mod turn_admission;
 pub(crate) mod turn_context;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;
@@ -239,6 +241,7 @@ use self::turn::AssistantMessageStreamParsers;
 #[cfg(test)]
 use self::turn::collect_explicit_app_ids_from_skill_items;
 use self::turn::realtime_text_for_event;
+pub(crate) use self::turn_admission::StartTurnIfIdleOutcome;
 use self::turn_context::TurnContext;
 use self::turn_context::TurnSkillsContext;
 #[cfg(test)]
@@ -467,6 +470,35 @@ pub(crate) fn resolve_multi_agent_version(
         })
 }
 
+fn bound_workflow_child_session_config(
+    config: &mut Config,
+    inherited_base_instructions: Option<String>,
+    thread_source: Option<&ThreadSource>,
+) -> CodexResult<()> {
+    if !crate::agent::control::is_workflow_managed_thread_source(thread_source) {
+        return Ok(());
+    }
+    if config.base_instructions.is_none() {
+        config.base_instructions = inherited_base_instructions;
+    }
+    crate::agent::role_context_bounds::bound_workflow_child_context(config)
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))
+}
+
+fn validate_resolved_workflow_child_base_instructions(
+    config: &Config,
+    base_instructions: &str,
+    thread_source: Option<&ThreadSource>,
+) -> CodexResult<()> {
+    if !crate::agent::control::is_workflow_managed_thread_source(thread_source) {
+        return Ok(());
+    }
+    let mut effective_config = config.clone();
+    effective_config.base_instructions = Some(base_instructions.to_string());
+    crate::agent::role_context_bounds::bound_workflow_child_context(&mut effective_config)
+        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))
+}
+
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
@@ -536,6 +568,14 @@ impl Codex {
             external_time_provider,
             inherited_multi_agent_version,
         } = args;
+        let inherited_base_instructions = conversation_history
+            .get_base_instructions()
+            .map(|instructions| instructions.text);
+        bound_workflow_child_session_config(
+            &mut config,
+            inherited_base_instructions,
+            thread_source.as_ref(),
+        )?;
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
 
@@ -618,6 +658,11 @@ impl Codex {
             .clone()
             .or_else(|| conversation_history.get_base_instructions().map(|s| s.text))
             .unwrap_or_else(|| model_info.get_model_instructions(config.personality));
+        validate_resolved_workflow_child_base_instructions(
+            config.as_ref(),
+            &base_instructions,
+            thread_source.as_ref(),
+        )?;
 
         // Dynamic tools are defined at thread start and persisted in rollout session metadata.
         let dynamic_tools = if dynamic_tools.is_empty() {
@@ -746,6 +791,47 @@ impl Codex {
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.submit_with_trace(op, /*trace*/ None).await
+    }
+
+    /// Enqueue user input whose session-loop dispatch may start a turn only if the thread is idle.
+    ///
+    /// The admission marker is consumed in the same serialized loop iteration as the input. This
+    /// preserves FIFO ordering against already-queued client submissions and avoids observing
+    /// `active_turn` on either side of an asynchronous queue send.
+    pub(crate) async fn submit_user_input_if_idle(
+        &self,
+        op: Op,
+    ) -> CodexResult<StartTurnIfIdleOutcome> {
+        if !matches!(op, Op::UserInput { .. }) {
+            return Err(CodexErr::InvalidRequest(
+                "idle turn admission requires user input".to_string(),
+            ));
+        }
+        let submission_id = new_submission_id();
+        let (mut registration, response_rx) = self
+            .session
+            .turn_admissions
+            .register(submission_id.clone())
+            .map_err(CodexErr::Fatal)?;
+        let submission = Submission {
+            id: submission_id.clone(),
+            op,
+            client_user_message_id: None,
+            trace: None,
+        };
+        self.submit_with_id(submission).await?;
+        // Once enqueue succeeds, the session loop owns the marker even if this future is dropped.
+        registration.commit();
+        match response_rx.await {
+            Ok(turn_admission::TurnAdmissionOutcome::Started) => {
+                Ok(StartTurnIfIdleOutcome::Started { submission_id })
+            }
+            Ok(turn_admission::TurnAdmissionOutcome::Busy) => Ok(StartTurnIfIdleOutcome::Busy),
+            Ok(turn_admission::TurnAdmissionOutcome::Failed(message)) => {
+                Err(CodexErr::InvalidRequest(message))
+            }
+            Err(_) => Err(CodexErr::InternalAgentDied),
+        }
     }
 
     pub async fn submit_with_trace(
@@ -1328,7 +1414,10 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+    async fn try_record_initial_history(
+        &self,
+        conversation_history: InitialHistory,
+    ) -> CodexResult<()> {
         let is_subagent = {
             let state = self.state.lock().await;
             state
@@ -1353,7 +1442,7 @@ impl Session {
                 let rollout_items = resumed_history.history;
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                    .await?;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -1398,7 +1487,7 @@ impl Session {
                     }
                 }
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                    .await?;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1421,6 +1510,14 @@ impl Session {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+        self.try_record_initial_history(conversation_history)
+            .await
+            .expect("test history should satisfy resume bounds");
     }
 
     #[instrument(
@@ -1435,7 +1532,7 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Option<PreviousTurnSettings> {
+    ) -> CodexResult<Option<PreviousTurnSettings>> {
         let rollout_reconstruction::RolloutReconstruction {
             mut history,
             previous_turn_settings,
@@ -1453,6 +1550,19 @@ impl Session {
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
+        if self.is_workflow_managed_agent().await {
+            let mut projected_history = ContextManager::new();
+            projected_history.replace(history.clone());
+            let projected_history =
+                projected_history.for_prompt(&turn_context.model_info.input_modalities);
+            crate::context::validate_workflow_child_model_history(&projected_history).map_err(
+                |_| {
+                    CodexErr::InvalidRequest(
+                        "workflow child history exceeds model-context limits".to_string(),
+                    )
+                },
+            )?;
+        }
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
@@ -1485,7 +1595,7 @@ impl Session {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
         }
-        previous_turn_settings
+        Ok(previous_turn_settings)
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(
@@ -1857,6 +1967,9 @@ impl Session {
             }
         };
         if !is_final(&status) {
+            return;
+        }
+        if self.is_workflow_managed_agent().await {
             return;
         }
 
@@ -2852,8 +2965,20 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        let items = self.prepare_conversation_items_for_history(turn_context, items);
-        let items = items.as_ref();
+        let workflow_managed_agent = self.is_workflow_managed_agent().await;
+        let bounded_items = workflow_managed_agent.then(|| {
+            crate::context::bound_workflow_child_output_items(items.iter().cloned())
+        });
+        let items = bounded_items.as_deref().unwrap_or(items);
+        let prepared_items = self.prepare_conversation_items_for_history(turn_context, items);
+        // Image preparation can rewrite a retained data URL, so revalidate the exact serialized
+        // payload after preparation and ID assignment before it reaches history or persistence.
+        let prepared_bounded_items = workflow_managed_agent.then(|| {
+            crate::context::bound_workflow_child_output_items(prepared_items.iter().cloned())
+        });
+        let items = prepared_bounded_items
+            .as_deref()
+            .unwrap_or(prepared_items.as_ref());
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
@@ -2880,9 +3005,12 @@ impl Session {
         let world_state_item = world_state_snapshot
             .merge_patch_from(&previous_snapshot)
             .map(WorldStateItem::patch);
-        let items = crate::context_manager::updates::merge_contextual_fragments(
+        let mut items = crate::context_manager::updates::merge_contextual_fragments(
             world_state.render_diff(&previous_snapshot),
         );
+        if self.is_workflow_managed_agent().await {
+            items = crate::context::bound_workflow_child_context_items(items);
+        }
         if !items.is_empty() {
             self.record_conversation_items(turn_context, &items).await;
         }
@@ -2952,6 +3080,13 @@ impl Session {
         turn_context: &TurnContext,
         mut communication: InterAgentCommunication,
     ) {
+        if self.is_workflow_managed_agent().await {
+            warn!(
+                thread_id = %self.thread_id(),
+                "discarded inter-agent communication addressed to a workflow-managed child"
+            );
+            return;
+        }
         communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
         let items = self.prepare_conversation_items_for_history(
@@ -3055,7 +3190,8 @@ impl Session {
         reference_context_item: Option<TurnContextItem>,
         world_state_baseline: Option<Arc<WorldState>>,
         compacted_item: CompactedItem,
-    ) {
+    ) -> CodexResult<()> {
+        let items = self.bound_workflow_child_compacted_history(items).await?;
         let items = if turn_context.item_ids_enabled() {
             Self::assign_missing_response_item_ids(Cow::Owned(items)).into_owned()
         } else {
@@ -3092,6 +3228,18 @@ impl Session {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
         }
+        Ok(())
+    }
+
+    pub(crate) async fn bound_workflow_child_compacted_history(
+        &self,
+        items: Vec<ResponseItem>,
+    ) -> CodexResult<Vec<ResponseItem>> {
+        if !self.is_workflow_managed_agent().await {
+            return Ok(items);
+        }
+        crate::context::bound_workflow_child_compacted_history(items)
+            .map_err(|message| CodexErr::InvalidRequest(message.to_string()))
     }
 
     async fn persist_rollout_response_items(&self, items: &[ResponseItem]) {
@@ -3467,11 +3615,24 @@ impl Session {
             }
         }
 
-        let multi_agent_v2_usage_hint_text =
-            multi_agents::usage_hint_text(turn_context, &session_source);
+        let workflow_managed_agent = self.is_workflow_managed_agent().await;
+        let multi_agent_v2_usage_hint_text = (!workflow_managed_agent)
+            .then(|| multi_agents::usage_hint_text(turn_context, &session_source))
+            .flatten();
 
         let mut items = Vec::with_capacity(4);
-        if let Some(developer_message) =
+        if workflow_managed_agent {
+            // Keep every bounded workflow-child fragment as its own model item. In particular,
+            // inherited developer instructions must not be aggregated with permissions, skills,
+            // or extension context into an item that crosses the per-item ceiling.
+            for section in developer_sections {
+                if let Some(developer_message) =
+                    crate::context_manager::updates::build_developer_update_item(vec![section])
+                {
+                    items.push(developer_message);
+                }
+            }
+        } else if let Some(developer_message) =
             crate::context_manager::updates::build_developer_update_item(developer_sections)
         {
             items.push(developer_message);
@@ -3483,15 +3644,14 @@ impl Session {
                 items.push(developer_message);
             }
         }
-        if let Some(usage_hint_text) = multi_agent_v2_usage_hint_text
-            && let Some(usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    usage_hint_text.to_string(),
-                ])
-        {
-            items.push(usage_hint_message);
+        if let Some(usage_hint_text) = multi_agent_v2_usage_hint_text {
+            items.push(ContextualUserFragment::into(MultiAgentUsageHint::new(
+                usage_hint_text,
+            )));
         }
-        if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context) {
+        if !workflow_managed_agent
+            && let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context)
+        {
             items.push(ContextualUserFragment::into(
                 MultiAgentModeInstructions::new(multi_agent_mode),
             ));
@@ -3512,6 +3672,9 @@ impl Session {
                 ])
         {
             items.push(guardian_developer_message);
+        }
+        if workflow_managed_agent {
+            items = crate::context::bound_workflow_child_context_items(items);
         }
         // New context windows and compaction install these items directly into replacement history.
         for item in &mut items {
@@ -3560,15 +3723,18 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         world_state: Arc<WorldState>,
-    ) -> u64 {
+    ) -> CodexResult<u64> {
+        let context_items = self
+            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+            .await;
+        let context_items = self
+            .bound_workflow_child_compacted_history(context_items)
+            .await?;
         let window = {
             let mut state = self.state.lock().await;
             state.start_new_context_window()
         };
         let (window_number, window_ids) = window;
-        let context_items = self
-            .build_initial_context_with_world_state(turn_context, world_state.as_ref())
-            .await;
         let turn_context_item = turn_context.to_turn_context_item();
         self.replace_compacted_history(
             turn_context,
@@ -3584,9 +3750,9 @@ impl Session {
                 window_id: Some(window_ids.window_id.to_string()),
             },
         )
-        .await;
+        .await?;
         self.recompute_token_usage(turn_context).await;
-        window_number
+        Ok(window_number)
     }
 
     pub(crate) async fn reference_context_item(&self) -> Option<TurnContextItem> {
@@ -3663,6 +3829,9 @@ impl Session {
                 self.build_turn_context_contribution_items(turn_context)
                     .await,
             );
+        }
+        if !should_inject_full_context && self.is_workflow_managed_agent().await {
+            context_items = crate::context::bound_workflow_child_context_items(context_items);
         }
         // A snapshot can change without producing model-visible or TurnContext updates.
         let only_world_state_changed = !turn_context_changed && context_items.is_empty();
@@ -4097,6 +4266,14 @@ async fn build_hooks_for_config(
 #[cfg(test)]
 #[path = "elicitation_holders_tests.rs"]
 mod elicitation_holders_tests;
+
+#[cfg(test)]
+#[path = "workflow_child_tools_tests.rs"]
+mod workflow_child_tools_tests;
+
+#[cfg(test)]
+#[path = "workflow_child_boundaries_tests.rs"]
+mod workflow_child_boundaries_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

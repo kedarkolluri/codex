@@ -11,10 +11,12 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::AgentCapReached;
 use super::LIFETIME_SPAWN_CAP;
 use super::SpawnAttempt;
+use super::WorkflowAdmission;
 use super::WorkflowScheduler;
 use super::normalize_workflow_concurrency;
 use super::policy_cap_from_cores;
@@ -277,6 +279,93 @@ async fn permit_released_on_failure_abort_finalize() {
         2,
         "permit released on failure/abort finalize"
     );
+}
+
+#[tokio::test]
+async fn cancellable_admission_stops_while_queued_without_running_spawn() {
+    let scheduler = WorkflowScheduler::with_cap(1);
+    let gate = Arc::new(Semaphore::new(0));
+    let entered = Arc::new(Semaphore::new(0));
+    let occupying = {
+        let scheduler = scheduler.clone();
+        let gate = Arc::clone(&gate);
+        let entered = Arc::clone(&entered);
+        tokio::spawn(async move {
+            scheduler
+                .admit(|| {
+                    let gate = Arc::clone(&gate);
+                    let entered = Arc::clone(&entered);
+                    async move {
+                        entered.add_permits(1);
+                        let _permit = gate.acquire().await.expect("gate open");
+                        SpawnAttempt::Finalized(())
+                    }
+                })
+                .await
+                .expect("occupying admission succeeds")
+        })
+    };
+    let _entered = entered.acquire().await.expect("occupying spawn entered");
+    let cancellation_token = CancellationToken::new();
+    cancellation_token.cancel();
+    let spawn_calls = Arc::new(AtomicUsize::new(0));
+
+    let admission = scheduler
+        .admit_cancellable(&cancellation_token, || {
+            let spawn_calls = Arc::clone(&spawn_calls);
+            async move {
+                spawn_calls.fetch_add(1, Ordering::AcqRel);
+                SpawnAttempt::Finalized(())
+            }
+        })
+        .await
+        .expect("cancellation is not a lifetime-cap error");
+
+    assert!(matches!(admission, WorkflowAdmission::Cancelled));
+    assert_eq!(spawn_calls.load(Ordering::Acquire), 0);
+    gate.add_permits(1);
+    occupying.await.expect("join occupying admission");
+}
+
+#[tokio::test]
+async fn cancellation_after_permit_does_not_drop_the_resource_owning_spawn() {
+    let scheduler = WorkflowScheduler::with_cap(1);
+    let cancellation_token = CancellationToken::new();
+    let entered = Arc::new(Semaphore::new(0));
+    let cleanup_finished = Arc::new(AtomicUsize::new(0));
+    let admission = {
+        let scheduler = scheduler.clone();
+        let cancellation_token = cancellation_token.clone();
+        let entered = Arc::clone(&entered);
+        let cleanup_finished = Arc::clone(&cleanup_finished);
+        tokio::spawn(async move {
+            scheduler
+                .admit_cancellable(&cancellation_token, || {
+                    let cancellation_token = cancellation_token.clone();
+                    let entered = Arc::clone(&entered);
+                    let cleanup_finished = Arc::clone(&cleanup_finished);
+                    async move {
+                        entered.add_permits(1);
+                        cancellation_token.cancelled().await;
+                        cleanup_finished.store(1, Ordering::Release);
+                        SpawnAttempt::Finalized("cleaned")
+                    }
+                })
+                .await
+                .expect("within lifetime cap")
+        })
+    };
+    let _entered = entered
+        .acquire()
+        .await
+        .expect("resource-owning spawn entered");
+
+    cancellation_token.cancel();
+    let result = admission.await.expect("join cancellable admission");
+
+    assert!(matches!(result, WorkflowAdmission::Finalized("cleaned")));
+    assert_eq!(cleanup_finished.load(Ordering::Acquire), 1);
+    assert_eq!(scheduler.available_permits(), 1);
 }
 
 // -- requeue on AgentLimitReached ------------------------------------------------

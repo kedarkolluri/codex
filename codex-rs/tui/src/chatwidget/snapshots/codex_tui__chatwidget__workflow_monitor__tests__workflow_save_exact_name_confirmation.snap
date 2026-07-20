@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "crate::chatwidget::tests::render_bottom_popup(&chat, 90)"
+---
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+
+  Save completed workflow?
+  Exact durable name: release-check
+
+› 1. Continue with this exact name  The durable script is saved byte-for-byte; its name
+                                    cannot be edited.
+  2. Cancel                         Do not save this workflow.
+
+  Press enter to confirm or esc to go back

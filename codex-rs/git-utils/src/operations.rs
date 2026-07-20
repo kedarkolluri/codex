@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Stdio;
 
 use crate::GitToolingError;
 
@@ -89,6 +90,18 @@ where
         })
 }
 
+pub(crate) fn run_git_for_stdout_bytes<I, S>(
+    dir: &Path,
+    args: I,
+    env: Option<&[(OsString, OsString)]>,
+) -> Result<Vec<u8>, GitToolingError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Ok(run_git(dir, args, env)?.output.stdout)
+}
+
 fn run_git<I, S>(
     dir: &Path,
     args: I,
@@ -111,7 +124,11 @@ where
     }
     let command_string = build_command_string(&args_vec);
     let mut command = Command::new("git");
-    command.current_dir(dir);
+    command
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .stdin(Stdio::null());
     if let Some(envs) = env {
         for (key, value) in envs {
             command.env(key, value);

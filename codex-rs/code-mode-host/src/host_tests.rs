@@ -14,6 +14,7 @@ use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WORKFLOW_V1_CAPABILITY;
 use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::WireResult;
 use pretty_assertions::assert_eq;
@@ -36,11 +37,19 @@ fn client_hello(
     versions: impl IntoIterator<Item = ProtocolVersion>,
     required_capabilities: CapabilitySet,
 ) -> ClientToHost {
+    client_hello_with_optional(versions, required_capabilities, CapabilitySet::empty())
+}
+
+fn client_hello_with_optional(
+    versions: impl IntoIterator<Item = ProtocolVersion>,
+    required_capabilities: CapabilitySet,
+    optional_capabilities: CapabilitySet,
+) -> ClientToHost {
     ClientToHost::ClientHello(
         ClientHello::new(
             SupportedProtocolVersions::try_new(versions).expect("supported versions"),
             required_capabilities,
-            CapabilitySet::empty(),
+            optional_capabilities,
         )
         .expect("client hello"),
     )
@@ -52,6 +61,11 @@ fn session_id(value: &str) -> SessionId {
 
 fn request_id(value: i64) -> RequestId {
     RequestId::new(value)
+}
+
+fn host_capabilities() -> CapabilitySet {
+    CapabilitySet::try_new([Capability::new(WORKFLOW_V1_CAPABILITY).expect("workflow capability")])
+        .expect("host capabilities")
 }
 
 async fn decode_frame(frame: EncodedFrame) -> HostToClient {
@@ -81,6 +95,8 @@ fn execute_request(source: &str) -> WireExecuteRequest {
         workflow: false,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 
@@ -156,6 +172,132 @@ async fn handshake_and_multiple_session_lifecycles_are_ordered() {
             })
         );
     }
+
+    drop(writer);
+    drop(reader);
+    host.await.expect("host task").expect("host connection");
+}
+
+#[tokio::test]
+async fn workflow_capability_is_selected_only_when_offered() {
+    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
+    let (host_reader, host_writer) = tokio::io::split(host_stream);
+    let (client_reader, client_writer) = tokio::io::split(client_stream);
+    let host = tokio::spawn(run(host_reader, host_writer));
+    let mut reader = FramedReader::new(client_reader);
+    let mut writer = FramedWriter::new(client_writer);
+
+    writer
+        .write(&client_hello_with_optional(
+            [ProtocolVersion::V1],
+            CapabilitySet::empty(),
+            host_capabilities(),
+        ))
+        .await
+        .expect("write capability-aware hello");
+    assert_eq!(
+        reader.read::<HostToClient>().await.expect("read hello"),
+        Some(HostToClient::HostHello(HostHello::new(
+            ProtocolVersion::V1,
+            host_capabilities(),
+        )))
+    );
+
+    drop(writer);
+    drop(reader);
+    host.await.expect("host task").expect("host connection");
+}
+
+#[tokio::test]
+async fn legacy_client_workflow_is_rejected_without_poisoning_plain_execution() {
+    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 4096);
+    let (host_reader, host_writer) = tokio::io::split(host_stream);
+    let (client_reader, client_writer) = tokio::io::split(client_stream);
+    let host = tokio::spawn(run(host_reader, host_writer));
+    let mut reader = FramedReader::new(client_reader);
+    let mut writer = FramedWriter::new(client_writer);
+
+    writer
+        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
+        .await
+        .expect("write legacy hello");
+    assert_eq!(
+        reader.read::<HostToClient>().await.expect("read hello"),
+        Some(HostToClient::HostHello(HostHello::new(
+            ProtocolVersion::V1,
+            CapabilitySet::empty(),
+        )))
+    );
+
+    let session_id = session_id("legacy-session");
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 1),
+            request: HostRequest::OpenSession {
+                session_id: session_id.clone(),
+            },
+        })
+        .await
+        .expect("open legacy session");
+    assert!(matches!(
+        reader.read::<HostToClient>().await.expect("session ready"),
+        Some(HostToClient::Response {
+            id,
+            result: WireResult::Ok {
+                value: HostResponse::SessionReady { .. },
+            },
+        }) if id == request_id(/*value*/ 1)
+    ));
+
+    let mut workflow = execute_request("text('must not run');");
+    workflow.workflow = true;
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 2),
+            request: HostRequest::Execute {
+                session_id: session_id.clone(),
+                request: workflow,
+            },
+        })
+        .await
+        .expect("send unnegotiated workflow");
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("workflow rejection"),
+        Some(HostToClient::Response {
+            id: request_id(/*value*/ 2),
+            result: WireResult::Err {
+                message: format!(
+                    "code-mode host requires negotiated `{WORKFLOW_V1_CAPABILITY}` capability for workflow execution"
+                ),
+            },
+        })
+    );
+
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 3),
+            request: HostRequest::Execute {
+                session_id,
+                request: execute_request("text('still alive');"),
+            },
+        })
+        .await
+        .expect("send plain execution after rejection");
+    assert!(matches!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("plain execution response"),
+        Some(HostToClient::Response {
+            id,
+            result: WireResult::Ok {
+                value: HostResponse::ExecutionStarted { .. },
+            },
+        }) if id == request_id(/*value*/ 3)
+    ));
 
     drop(writer);
     drop(reader);
@@ -343,6 +485,7 @@ async fn request_task_panic_disconnects_host() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        supports_workflow_v1: false,
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     };
@@ -372,6 +515,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        supports_workflow_v1: false,
         closing: AtomicBool::new(false),
         peer,
     });
@@ -431,6 +575,7 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(/*permits*/ 0)),
+        supports_workflow_v1: false,
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     };

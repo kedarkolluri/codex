@@ -4,6 +4,17 @@ use crate::session::turn_context::TurnContext;
 use codex_protocol::ThreadId;
 use std::sync::Arc;
 
+pub(crate) async fn ensure_collaboration_sender_allowed(
+    session: &Session,
+) -> Result<(), FunctionCallError> {
+    if session.is_workflow_managed_agent().await {
+        return Err(FunctionCallError::RespondToModel(
+            "workflow-managed agents cannot use generic collaboration tools".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Resolves a single tool-facing agent target to a thread id.
 pub(crate) async fn resolve_agent_target(
     session: &Arc<Session>,
@@ -11,21 +22,31 @@ pub(crate) async fn resolve_agent_target(
     target: &str,
 ) -> Result<ThreadId, FunctionCallError> {
     register_session_root(session, turn);
-    if let Ok(thread_id) = ThreadId::from_string(target) {
-        return Ok(thread_id);
-    }
-
-    session
+    let thread_id = match ThreadId::from_string(target) {
+        Ok(thread_id) => thread_id,
+        Err(_) => session
+            .services
+            .agent_control
+            .resolve_agent_reference(session.thread_id, &turn.session_source, target)
+            .await
+            .map_err(|err| match err {
+                codex_protocol::error::CodexErr::UnsupportedOperation(message) => {
+                    FunctionCallError::RespondToModel(message)
+                }
+                other => FunctionCallError::RespondToModel(other.to_string()),
+            })?,
+    };
+    if session
         .services
         .agent_control
-        .resolve_agent_reference(session.thread_id, &turn.session_source, target)
+        .is_workflow_managed_agent(thread_id)
         .await
-        .map_err(|err| match err {
-            codex_protocol::error::CodexErr::UnsupportedOperation(message) => {
-                FunctionCallError::RespondToModel(message)
-            }
-            other => FunctionCallError::RespondToModel(other.to_string()),
-        })
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "workflow-managed agents are available only through workflow controls".to_string(),
+        ));
+    }
+    Ok(thread_id)
 }
 
 fn register_session_root(session: &Arc<Session>, turn: &Arc<TurnContext>) {

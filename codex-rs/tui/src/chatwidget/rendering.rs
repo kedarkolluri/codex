@@ -26,6 +26,14 @@ impl ChatWidget {
         let mut flex = FlexRenderable::new();
         flex.push(/*flex*/ 1, active_cell_renderable);
         flex.push(/*flex*/ 0, active_hook_cell_renderable);
+        if self.workflow_monitor.is_visible() {
+            flex.push(
+                /*flex*/ 1,
+                RenderableItem::Borrowed(&self.workflow_monitor).inset(Insets::tlbr(
+                    /*top*/ 1, /*left*/ 0, /*bottom*/ 0, /*right*/ 0,
+                )),
+            );
+        }
         if let Some(cell) = self.pending_token_activity_output() {
             flex.push(
                 /*flex*/ 1,

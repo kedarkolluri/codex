@@ -1830,6 +1830,127 @@ default_permissions = "locked-down"
 }
 
 #[tokio::test]
+async fn update_feature_flags_workflow_enable_stays_pending_until_restart() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    app.config.codex_home = codex_home.path().to_path_buf().abs();
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+
+    app.update_feature_flags(&mut app_server, vec![(Feature::Workflow, true)])
+        .await;
+
+    assert_eq!(
+        app.workflow_feature_state,
+        WorkflowFeatureState {
+            runtime_enabled: false,
+            configured_enabled: true,
+        }
+    );
+    assert!(!app.config.features.enabled(Feature::Workflow));
+    assert!(
+        !app.chat_widget
+            .config_ref()
+            .features
+            .enabled(Feature::Workflow)
+    );
+    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+    assert!(config.contains("workflow = true"));
+
+    let cell = match app_event_rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+        other => panic!("expected InsertHistoryCell event, got {other:?}"),
+    };
+    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 120));
+    assert!(rendered.contains("Dynamic workflows will be enabled after restarting Codex."));
+
+    app.refresh_in_memory_config_from_disk().await?;
+
+    assert_eq!(
+        app.workflow_feature_state,
+        WorkflowFeatureState {
+            runtime_enabled: false,
+            configured_enabled: true,
+        }
+    );
+    assert!(!app.config.features.enabled(Feature::Workflow));
+
+    let current_cwd = app.config.cwd.clone();
+    let resume_config = app
+        .rebuild_config_for_resume_or_fallback(&current_cwd, current_cwd.to_path_buf())
+        .await?;
+    assert!(!resume_config.features.enabled(Feature::Workflow));
+    assert_eq!(
+        app.workflow_feature_state,
+        WorkflowFeatureState {
+            runtime_enabled: false,
+            configured_enabled: true,
+        }
+    );
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn update_feature_flags_workflow_disable_stays_pending_until_restart() -> Result<()> {
+    let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let codex_home = tempdir()?;
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        "[features]\nworkflow = true\n",
+    )?;
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
+        .build()
+        .await?;
+    app.config = config;
+    app.chat_widget
+        .set_feature_enabled(Feature::Workflow, /*enabled*/ true);
+    app.workflow_feature_state = WorkflowFeatureState::from_config(&app.config);
+    let mut app_server = start_config_write_test_app_server(&app).await?;
+
+    app.update_feature_flags(&mut app_server, vec![(Feature::Workflow, false)])
+        .await;
+
+    assert_eq!(
+        app.workflow_feature_state,
+        WorkflowFeatureState {
+            runtime_enabled: true,
+            configured_enabled: false,
+        }
+    );
+    assert!(app.config.features.enabled(Feature::Workflow));
+    assert!(
+        app.chat_widget
+            .config_ref()
+            .features
+            .enabled(Feature::Workflow)
+    );
+    let config = std::fs::read_to_string(codex_home.path().join("config.toml"))?;
+    assert!(!config.contains("workflow"));
+
+    let cell = match app_event_rx.try_recv() {
+        Ok(AppEvent::InsertHistoryCell(cell)) => cell,
+        other => panic!("expected InsertHistoryCell event, got {other:?}"),
+    };
+    let rendered = lines_to_single_string(&cell.display_lines(/*width*/ 120));
+    assert!(rendered.contains("Dynamic workflows will be disabled after restarting Codex."));
+
+    app.refresh_in_memory_config_from_disk().await?;
+
+    assert_eq!(
+        app.workflow_feature_state,
+        WorkflowFeatureState {
+            runtime_enabled: true,
+            configured_enabled: false,
+        }
+    );
+    assert!(app.config.features.enabled(Feature::Workflow));
+    app_server.shutdown().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn update_feature_flags_enabling_guardian_selects_auto_review() -> Result<()> {
     let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
     let codex_home = tempdir()?;
@@ -4052,6 +4173,7 @@ async fn make_test_app() -> App {
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
+    let workflow_feature_state = WorkflowFeatureState::from_config(&config);
 
     App {
         model_catalog: chat_widget.model_catalog(),
@@ -4060,6 +4182,7 @@ async fn make_test_app() -> App {
         chat_widget,
         workspace_command_runner: None,
         config,
+        workflow_feature_state,
         state_db: None,
         cli_kv_overrides: Vec::new(),
         harness_overrides: ConfigOverrides::default(),
@@ -4095,6 +4218,7 @@ async fn make_test_app() -> App {
         side_threads: HashMap::new(),
         active_thread_id: None,
         active_thread_rx: None,
+        workflow_monitor_returns: Vec::new(),
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,
         primary_session_configured: None,
@@ -4116,6 +4240,7 @@ async fn make_test_app_with_channels() -> (
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
+    let workflow_feature_state = WorkflowFeatureState::from_config(&config);
 
     (
         App {
@@ -4125,6 +4250,7 @@ async fn make_test_app_with_channels() -> (
             chat_widget,
             workspace_command_runner: None,
             config,
+            workflow_feature_state,
             state_db: None,
             cli_kv_overrides: Vec::new(),
             harness_overrides: ConfigOverrides::default(),
@@ -4160,6 +4286,7 @@ async fn make_test_app_with_channels() -> (
             side_threads: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
+            workflow_monitor_returns: Vec::new(),
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,
@@ -5449,6 +5576,27 @@ async fn replace_chat_widget_reseeds_collab_agent_metadata_for_replay() {
         saw_named_wait,
         "expected replayed wait item to keep agent name"
     );
+}
+
+#[tokio::test]
+async fn replace_chat_widget_preserves_workflow_runtime_and_pending_state() {
+    let mut app = make_test_app().await;
+    app.set_configured_workflow_feature_enabled(/*enabled*/ true);
+    let (mut replacement, _app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+    replacement.set_feature_enabled(Feature::Workflow, /*enabled*/ true);
+
+    app.replace_chat_widget(replacement);
+
+    assert!(!app.config.features.enabled(Feature::Workflow));
+    assert!(
+        !app.chat_widget
+            .config_ref()
+            .features
+            .enabled(Feature::Workflow)
+    );
+    app.chat_widget.open_experimental_popup();
+    let popup = render_bottom_popup(&app.chat_widget, /*width*/ 100);
+    assert!(popup.contains("[x] Dynamic workflows"));
 }
 
 #[tokio::test]

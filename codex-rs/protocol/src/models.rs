@@ -569,6 +569,36 @@ impl PermissionProfile {
         }
     }
 
+    /// Add an exact managed read entry even when broader policy already permits reading the path.
+    ///
+    /// Some sandbox backends need structurally explicit roots that are semantically redundant in
+    /// the canonical profile. This never adds write access and leaves disabled, external, and
+    /// unrestricted managed profiles unchanged.
+    pub fn with_explicit_readable_root(mut self, root: AbsolutePathBuf) -> Self {
+        let Self::Managed {
+            file_system:
+                ManagedFileSystemPermissions::Restricted {
+                    entries,
+                    glob_scan_max_depth: _,
+                },
+            network: _,
+        } = &mut self
+        else {
+            return self;
+        };
+        let already_explicit = entries.iter().any(|entry| {
+            entry.access.can_read()
+                && matches!(&entry.path, FileSystemPath::Path { path } if path == &root)
+        });
+        if !already_explicit {
+            entries.push(FileSystemSandboxEntry {
+                path: FileSystemPath::Path { path: root },
+                access: FileSystemAccessMode::Read,
+            });
+        }
+        self
+    }
+
     pub fn from_runtime_permissions(
         file_system_sandbox_policy: &FileSystemSandboxPolicy,
         network_sandbox_policy: NetworkSandboxPolicy,

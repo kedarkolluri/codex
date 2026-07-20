@@ -552,8 +552,12 @@ pub(crate) async fn record_pending_input(
             .await;
         }
         TurnInput::ResponseItem(item) => {
-            sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
-                .await;
+            let items = if sess.is_workflow_managed_agent().await {
+                crate::context::bound_workflow_child_injected_messages(vec![item])
+            } else {
+                vec![item]
+            };
+            sess.record_conversation_items(turn_context, &items).await;
         }
         TurnInput::InterAgentCommunication(communication) => {
             sess.record_inter_agent_communication(turn_context, communication)
@@ -597,7 +601,11 @@ pub(crate) async fn record_additional_contexts(
     turn_context: &Arc<TurnContext>,
     additional_contexts: Vec<String>,
 ) {
-    let developer_messages = additional_context_messages(additional_contexts);
+    let mut developer_messages = additional_context_messages(additional_contexts);
+    if sess.is_workflow_managed_agent().await {
+        developer_messages =
+            crate::context::bound_workflow_child_context_items(developer_messages);
+    }
     if developer_messages.is_empty() {
         return;
     }
@@ -777,6 +785,7 @@ fn compaction_trigger_label(value: CompactionTrigger) -> &'static str {
 #[cfg(test)]
 mod tests {
     use codex_protocol::models::ContentItem;
+    use codex_protocol::models::ResponseItem;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookExecutionMode;
     use codex_protocol::protocol::HookHandlerType;
@@ -788,7 +797,11 @@ mod tests {
     use super::additional_context_messages;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
+    use super::record_additional_contexts;
+    use super::record_pending_input;
+    use crate::session::TurnInput;
     use crate::session::tests::make_session_and_context;
+    use crate::session::tests::make_workflow_session_and_context_with_rx;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -826,6 +839,82 @@ mod tests {
                 ("developer", "second tide note".to_string()),
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_hook_context_is_bounded_before_recording() {
+        let (session, turn_context, _rx) = make_workflow_session_and_context_with_rx().await;
+        let oversized = format!(
+            "HOOK_OPEN{}HOOK_CLOSE",
+            "h".repeat(crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES)
+        );
+
+        record_additional_contexts(&session, &turn_context, vec![oversized]).await;
+
+        let history = session.clone_history().await;
+        let [codex_protocol::models::ResponseItem::Message { content, .. }] = history.raw_items()
+        else {
+            panic!("expected one bounded hook-context message");
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected one hook-context text fragment");
+        };
+        assert!(text.len() <= crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES);
+        assert!(text.starts_with("HOOK_OPEN"));
+        assert!(text.ends_with("HOOK_CLOSE"));
+        assert!(text.contains("[workflow context truncated]"));
+    }
+
+    #[tokio::test]
+    async fn workflow_pending_response_context_is_split_and_bounded_before_recording() {
+        let (session, turn_context, _rx) = make_workflow_session_and_context_with_rx().await;
+        let oversized = format!(
+            "PENDING_OPEN{}PENDING_CLOSE",
+            "p".repeat(crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES)
+        );
+        let item = ResponseItem::Message {
+            id: None,
+            role: "developer".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: oversized,
+                },
+                ContentItem::InputText {
+                    text: "second fragment".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        record_pending_input(
+            &session,
+            &turn_context,
+            TurnInput::ResponseItem(item),
+            Vec::new(),
+        )
+        .await;
+
+        let history = session.clone_history().await;
+        let items = history.raw_items();
+        assert_eq!(items.len(), 2);
+        let texts = items
+            .iter()
+            .map(|item| {
+                let ResponseItem::Message { content, .. } = item else {
+                    panic!("expected bounded pending-context message");
+                };
+                let [ContentItem::InputText { text }] = content.as_slice() else {
+                    panic!("expected one pending-context text fragment");
+                };
+                text
+            })
+            .collect::<Vec<_>>();
+        assert!(texts[0].len() <= crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES);
+        assert!(texts[0].starts_with("PENDING_OPEN"));
+        assert!(texts[0].ends_with("PENDING_CLOSE"));
+        assert!(texts[0].contains("[workflow context truncated]"));
+        assert_eq!(texts[1], "second fragment");
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use codex_code_mode::InProcessCodeModeSession;
+use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
@@ -25,6 +26,7 @@ use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WORKFLOW_V1_CAPABILITY;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::Semaphore;
@@ -57,9 +59,9 @@ where
 {
     let mut reader = FramedReader::new(reader);
     let mut writer = FramedWriter::new(writer);
-    if !negotiate(&mut reader, &mut writer).await? {
+    let Some(negotiated) = negotiate(&mut reader, &mut writer).await? else {
         return Ok(());
-    }
+    };
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(/*max_capacity*/ 128);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
@@ -70,6 +72,7 @@ where
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        supports_workflow_v1: negotiated.supports_workflow_v1,
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     });
@@ -158,7 +161,15 @@ where
     Ok(())
 }
 
-async fn negotiate<R, W>(reader: &mut FramedReader<R>, writer: &mut FramedWriter<W>) -> Result<bool>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NegotiatedCapabilities {
+    supports_workflow_v1: bool,
+}
+
+async fn negotiate<R, W>(
+    reader: &mut FramedReader<R>,
+    writer: &mut FramedWriter<W>,
+) -> Result<Option<NegotiatedCapabilities>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -168,7 +179,7 @@ where
         .await
         .context("failed to read code-mode client hello")?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let ClientToHost::ClientHello(client_hello) = first_message else {
         writer
@@ -179,7 +190,7 @@ where
             })
             .await
             .context("failed to reject invalid code-mode client hello")?;
-        return Ok(false);
+        return Ok(None);
     };
 
     let supported_versions = SupportedProtocolVersions::try_new([ProtocolVersion::V1])?;
@@ -193,10 +204,11 @@ where
             })
             .await
             .context("failed to reject incompatible code-mode client")?;
-        return Ok(false);
+        return Ok(None);
     }
 
-    let host_capabilities = CapabilitySet::empty();
+    let workflow_v1 = Capability::new(WORKFLOW_V1_CAPABILITY)?;
+    let host_capabilities = CapabilitySet::try_new([workflow_v1.clone()])?;
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -210,17 +222,32 @@ where
             })
             .await
             .context("failed to reject unsupported code-mode capability")?;
-        return Ok(false);
+        return Ok(None);
     }
+
+    // HostHello reports the negotiated intersection, not every feature the host binary happens to
+    // implement. Retaining this bit is what prevents the extended workflow-v1 callback wire from
+    // being emitted to a legacy V1 client whose deny-unknown-fields decoder cannot accept it.
+    let selected_capabilities = CapabilitySet::try_new(
+        client_hello
+            .required_capabilities()
+            .iter()
+            .chain(client_hello.optional_capabilities().iter())
+            .filter(|capability| host_capabilities.contains(capability))
+            .cloned(),
+    )?;
+    let supports_workflow_v1 = selected_capabilities.contains(&workflow_v1);
 
     writer
         .write(&HostToClient::HostHello(HostHello::new(
             ProtocolVersion::V1,
-            host_capabilities,
+            selected_capabilities,
         )))
         .await
         .context("failed to write code-mode host hello")?;
-    Ok(true)
+    Ok(Some(NegotiatedCapabilities {
+        supports_workflow_v1,
+    }))
 }
 
 struct HostState {
@@ -230,6 +257,7 @@ struct HostState {
     request_tasks: TaskTracker,
     request_permits: Arc<Semaphore>,
     active_cell_permits: Arc<Semaphore>,
+    supports_workflow_v1: bool,
     closing: AtomicBool,
     peer: Arc<HostPeer>,
 }
@@ -300,6 +328,15 @@ impl HostState {
             } => {
                 if cancellation.is_cancelled() {
                     self.respond(request_id, Err("code-mode request cancelled".to_string()));
+                    return;
+                }
+                if request.workflow && !self.supports_workflow_v1 {
+                    self.respond(
+                        request_id,
+                        Err(format!(
+                            "code-mode host requires negotiated `{WORKFLOW_V1_CAPABILITY}` capability for workflow execution"
+                        )),
+                    );
                     return;
                 }
                 let request = match request.try_into() {

@@ -1,8 +1,10 @@
 use super::*;
 use crate::ModelsManagerConfig;
 use codex_protocol::config_types::Personality;
+use codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
 use codex_protocol::openai_models::ApprovalMessages;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeMap;
 
 fn config_with_personality(personality: Option<Personality>) -> ModelsManagerConfig {
     ModelsManagerConfig {
@@ -10,6 +12,107 @@ fn config_with_personality(personality: Option<Personality>) -> ModelsManagerCon
         personality,
         ..Default::default()
     }
+}
+
+fn product_instruction_variants() -> Vec<(String, String)> {
+    let mut variants = Vec::new();
+    let bundled_models = crate::bundled_models_response()
+        .expect("bundled models should parse")
+        .models;
+    for model in bundled_models {
+        let model_label = model.slug.clone();
+        push_model_instruction_variants(&mut variants, &model_label, model);
+    }
+    for slug in [
+        "unknown-model",
+        "gpt-5.2-codex",
+        "exp-codex-personality",
+    ] {
+        push_model_instruction_variants(&mut variants, slug, model_info_from_slug(slug));
+    }
+    variants.push((
+        "protocol default base instructions".to_string(),
+        BASE_INSTRUCTIONS_DEFAULT.to_string(),
+    ));
+    variants
+}
+
+fn push_model_instruction_variants(
+    variants: &mut Vec<(String, String)>,
+    model_label: &str,
+    model: ModelInfo,
+) {
+    let personality_disabled =
+        with_config_overrides(model.clone(), &ModelsManagerConfig::default());
+    variants.push((
+        format!("{model_label}/personality-disabled"),
+        personality_disabled.get_model_instructions(/*personality*/ None),
+    ));
+    for personality in [
+        /*personality*/ None,
+        Some(Personality::None),
+        Some(Personality::Friendly),
+        Some(Personality::Pragmatic),
+    ] {
+        let config = config_with_personality(personality);
+        let effective_model = with_config_overrides(model.clone(), &config);
+        variants.push((
+            format!("{model_label}/{personality:?}"),
+            effective_model.get_model_instructions(personality),
+        ));
+    }
+}
+
+#[test]
+fn audited_model_instruction_manifest_matches_every_product_variant() {
+    let tokenizer = tiktoken_rs::o200k_base().expect("construct o200k tokenizer");
+    let mut inventory = BTreeMap::<String, (String, Vec<String>, usize)>::new();
+
+    for (label, instructions) in product_instruction_variants() {
+        let sha256 = instruction_sha256(&instructions);
+        let token_count = tokenizer.count_ordinary(&instructions);
+        assert!(
+            is_audited_model_instruction(&instructions),
+            "product instruction variant {label} ({sha256}) is not audited"
+        );
+        assert!(
+            token_count <= AUDITED_MODEL_INSTRUCTION_MAX_TOKENS,
+            "product instruction variant {label} has {token_count} o200k tokens"
+        );
+        match inventory.entry(sha256) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((instructions, vec![label], token_count));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                assert_eq!(entry.get().0, instructions);
+                assert_eq!(entry.get().2, token_count);
+                entry.get_mut().1.push(label);
+            }
+        }
+    }
+
+    assert_eq!(inventory.len(), AUDITED_MODEL_INSTRUCTIONS.len());
+    for audited in AUDITED_MODEL_INSTRUCTIONS {
+        let (instructions, _labels, token_count) = inventory
+            .get(audited.sha256)
+            .unwrap_or_else(|| panic!("stale audited instruction digest {}", audited.sha256));
+        assert_eq!(
+            (instructions.len(), *token_count),
+            (audited.utf8_bytes, audited.o200k_tokens)
+        );
+    }
+}
+
+#[test]
+fn high_token_unicode_does_not_match_the_product_audit() {
+    let tokenizer = tiktoken_rs::o200k_base().expect("construct o200k tokenizer");
+    let instructions = "\u{10ffff}".repeat(8_192);
+
+    assert_eq!(
+        (instructions.len(), tokenizer.count_ordinary(&instructions)),
+        (32 * 1024, 32 * 1024)
+    );
+    assert!(!is_audited_model_instruction(&instructions));
 }
 
 #[test]

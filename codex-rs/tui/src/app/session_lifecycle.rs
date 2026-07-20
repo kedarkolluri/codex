@@ -334,6 +334,13 @@ impl App {
             chat_widget.last_terminal_title = previous_terminal_title;
         }
         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
+        chat_widget.set_feature_enabled(
+            Feature::Workflow,
+            self.workflow_feature_state.runtime_enabled,
+        );
+        chat_widget.set_workflow_feature_configured_enabled(
+            self.workflow_feature_state.configured_enabled,
+        );
         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
             chat_widget.set_collab_agent_metadata(
                 thread_id,
@@ -479,6 +486,7 @@ impl App {
         self.side_threads.clear();
         self.active_thread_id = None;
         self.active_thread_rx = None;
+        self.clear_workflow_monitor_returns();
         self.primary_thread_id = None;
         self.last_subagent_backfill_attempt = None;
         self.primary_session_configured = None;

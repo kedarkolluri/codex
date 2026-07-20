@@ -222,6 +222,8 @@ mod thread_goal_actions;
 mod thread_routing;
 mod thread_session_state;
 mod thread_settings;
+mod workflow_actions;
+mod workflow_navigation;
 
 use self::agent_navigation::AgentNavigationDirection;
 use self::agent_navigation::AgentNavigationState;
@@ -234,6 +236,7 @@ use self::side::SideParentStatusChange;
 use self::side::SideThreadState;
 use self::startup_prompts::*;
 use self::thread_events::*;
+use self::workflow_navigation::WorkflowMonitorReturnTarget;
 
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
@@ -500,6 +503,22 @@ struct InitialHistoryReplayBuffer {
     render_from_transcript_tail: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkflowFeatureState {
+    runtime_enabled: bool,
+    configured_enabled: bool,
+}
+
+impl WorkflowFeatureState {
+    fn from_config(config: &Config) -> Self {
+        let enabled = config.features.enabled(Feature::Workflow);
+        Self {
+            runtime_enabled: enabled,
+            configured_enabled: enabled,
+        }
+    }
+}
+
 pub(crate) struct App {
     model_catalog: Arc<ModelCatalog>,
     pub(crate) session_telemetry: SessionTelemetry,
@@ -508,6 +527,9 @@ pub(crate) struct App {
     workspace_command_runner: Option<WorkspaceCommandRunner>,
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
+    /// Workflow discovery is fixed when the app-server starts. Keep the persisted target
+    /// separate so `/experimental` can show a pending change without changing this process.
+    workflow_feature_state: WorkflowFeatureState,
     pub(crate) state_db: Option<StateDbHandle>,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
@@ -571,6 +593,7 @@ pub(crate) struct App {
     side_threads: HashMap<ThreadId, SideThreadState>,
     active_thread_id: Option<ThreadId>,
     active_thread_rx: Option<mpsc::Receiver<ThreadBufferedEvent>>,
+    workflow_monitor_returns: Vec<WorkflowMonitorReturnTarget>,
     primary_thread_id: Option<ThreadId>,
     last_subagent_backfill_attempt: Option<ThreadId>,
     primary_session_configured: Option<ThreadSessionState>,
@@ -1014,6 +1037,7 @@ See the Codex keymap documentation for supported actions and examples."
         #[cfg(not(debug_assertions))]
         let upgrade_version = crate::updates::get_upgrade_version(&config);
 
+        let workflow_feature_state = WorkflowFeatureState::from_config(&config);
         let mut app = Self {
             model_catalog,
             session_telemetry: session_telemetry.clone(),
@@ -1021,6 +1045,7 @@ See the Codex keymap documentation for supported actions and examples."
             chat_widget,
             workspace_command_runner: Some(workspace_command_runner),
             config,
+            workflow_feature_state,
             state_db,
             cli_kv_overrides,
             harness_overrides,
@@ -1056,6 +1081,7 @@ See the Codex keymap documentation for supported actions and examples."
             side_threads: HashMap::new(),
             active_thread_id: None,
             active_thread_rx: None,
+            workflow_monitor_returns: Vec::new(),
             primary_thread_id: None,
             last_subagent_backfill_attempt: None,
             primary_session_configured: None,

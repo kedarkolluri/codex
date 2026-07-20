@@ -188,7 +188,8 @@ where
         let mut candidates = Vec::new();
         collect_workflow_files(
             &root.path,
-            0,
+            root.scope,
+            /*depth*/ 0,
             MAX_WORKFLOW_FILES_PER_ROOT,
             &mut candidates,
             &mut errors,
@@ -475,6 +476,7 @@ async fn scan_directory(dir: &Path, files_cap: usize, raw_ceiling: usize) -> Opt
 /// Missing directories are tolerated silently.
 async fn collect_workflow_files(
     dir: &Path,
+    scope: WorkflowScope,
     depth: usize,
     limit: usize,
     out: &mut Vec<PathBuf>,
@@ -522,8 +524,23 @@ async fn collect_workflow_files(
         if out.len() > limit {
             return;
         }
+        // `$CODEX_HOME/workflows/runs` is durable execution state, not a
+        // saved-workflow source. Its persisted `script.js` files must never
+        // re-enter discovery. A project or personal directory named `runs`,
+        // and a nested Codex-home directory with that name, remain ordinary
+        // saved-workflow directories.
+        if scope == WorkflowScope::CodexHome
+            && depth == 0
+            && subdir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("runs"))
+        {
+            continue;
+        }
         Box::pin(collect_workflow_files(
             &subdir,
+            scope,
             depth + 1,
             limit,
             out,

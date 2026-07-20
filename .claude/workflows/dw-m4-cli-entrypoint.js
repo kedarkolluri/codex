@@ -41,7 +41,7 @@ IMPLEMENT: a \`codex workflow run <name|path> [--args <json>] [--resume <runId>]
 - Keep it minimal but REAL and correct; reuse existing session/exec plumbing rather than reinventing. If run_workflow_source needs an ExecContext/Session you must construct, mirror exactly how the code_mode exec path builds it.
 
 TEST: add a test that invokes the new subcommand end-to-end on a phase()/log() workflow (through the assembled CLI path, e.g. an exec-crate integration test like the existing codex exec tests) asserting it runs with workflow globals installed and no model — this is the real-entrypoint coverage that was missing. Iterate targeted cargo test until green; scoped cargo fmt + clippy --all-targets clean; finish with cargo check --workspace. NEVER git commit/add/push. If the full entrypoint is too large, implement the smallest correct version that makes \`codex workflow run <path>\` run a phase()/log() workflow end-to-end, and note what you deferred (e.g. saved-name resolution, --resume). Return the structured result.`,
-  { label: 'cli-run', phase: 'Implement', schema: RESULT, model: 'opus' }
+  { label: 'cli-run', phase: 'Implement', schema: RESULT }
 )
 
 phase('Prove')
@@ -61,7 +61,7 @@ STEPS (export PATH="$HOME/.cargo/bin:$PATH" first):
 5. If the phase()/log() run succeeds, ALSO try an agent() fan-out workflow file (body: const rs = await parallel([() => agent('reply with the letter A'), () => agent('reply with the letter B')]); rs) — copy ~/.codex/auth.json into the CODEX_HOME so it can reach the live backend — and capture whether real subagents spawn and return.
 6. If --resume was wired, run the same script twice and note whether the second run replays from the journal.
 Set ran_binary_output to the ACTUAL captured CLI output (trimmed to the relevant lines), status done ONLY if the phase()/log() workflow genuinely ran end-to-end through the CLI, and notes on the agent()/resume attempts. Do NOT edit source or git — verification by observation only.`,
-  { label: 'prove', phase: 'Prove', schema: RESULT, model: 'opus' }
+  { label: 'prove', phase: 'Prove', schema: RESULT }
 )
 
 return { impl, prove }

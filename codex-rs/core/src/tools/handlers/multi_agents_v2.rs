@@ -1,6 +1,7 @@
 //! Implements the MultiAgentV2 collaboration tool surface.
 
 use crate::agent::AgentStatus;
+use crate::agent::agent_resolver::ensure_collaboration_sender_allowed;
 use crate::agent::agent_resolver::resolve_agent_target;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;

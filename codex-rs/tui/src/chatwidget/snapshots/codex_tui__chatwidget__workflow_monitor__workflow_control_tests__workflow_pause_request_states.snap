@@ -1,0 +1,37 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "format!(\"PENDING\\n{pending}\\n\\nAPPLIED\\n{applied}\\n\\nALREADY PAUSED\\n{already_paused}\\n\\nFAILED\\n{failed}\")"
+---
+PENDING
+› ◆ Workflow release-check  …456789ab  running · elapsed ≥ 0s
+  pause  publishing checkpoint and stopping…
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+APPLIED
+› ◆ Workflow release-check  …456789ab  running · elapsed ≥ 0s
+  pause  durable checkpoint published
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+ALREADY PAUSED
+› ◆ Workflow release-check  …456789ab  running · elapsed ≥ 0s
+  pause  workflow was already paused
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+FAILED
+› ◆ Workflow release-check  …456789ab  running · elapsed ≥ 0s
+  pause failed  unavailable
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc exit

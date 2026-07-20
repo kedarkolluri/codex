@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"FULL\\n{full_rendered}\\n\\nCOMPACT\\n{summarized_rendered}\")"
+---
+FULL
+◆ Workflow stoppable  run-stop  stopped · duration 8s
+  10 tokens · 0 tools
+  ✓ work · 1/1 agents · duration 7s
+    └─ ■ worker  gpt-5.5 · high  shutdown · attempt 1 · 10 tok · 0ms
+  budget  10 / 10 weighted tokens
+
+  Enter inspect agents
+
+COMPACT
+◇ Workflow compact-stop  run-stop  compact · stopped

@@ -6,6 +6,7 @@ use crate::config::ConfigBuilder;
 use crate::config::ConfigOverrides;
 use crate::config::test_config;
 use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentUsageHint;
 use crate::context::TurnAborted;
 use crate::environment_selection::ThreadEnvironments;
 use crate::function_tool::FunctionCallError;
@@ -160,8 +161,10 @@ use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::responses::strip_metadata_from_items;
 use core_test_support::test_codex::local;
@@ -659,6 +662,7 @@ fn test_tool_runtime(session: Arc<Session>, turn_context: Arc<TurnContext>) -> T
             deferred_mcp_tools: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            collaboration_tool_access: Default::default(),
         },
         &Default::default(),
     ));
@@ -2808,7 +2812,8 @@ async fn start_new_context_window_assigns_and_persists_item_ids() {
 
     session
         .start_new_context_window(turn_context.as_ref(), world_state)
-        .await;
+        .await
+        .expect("start context window");
 
     let live_history = session.clone_history().await;
     assert!(!live_history.raw_items().is_empty());
@@ -5612,6 +5617,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        turn_admissions: Arc::new(super::turn_admission::TurnAdmissionRegistry::default()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -7293,6 +7299,162 @@ async fn shutdown_and_wait_allows_multiple_waiters() {
         .expect("second shutdown waiter");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_turn_admission_rejects_a_foreign_user_input_queued_first() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    mount_response_once(
+        &server,
+        sse_response(sse(vec![
+            ev_response_created("resp-foreign"),
+            ev_completed("resp-foreign"),
+        ]))
+        .set_delay(Duration::from_secs(30)),
+    )
+    .await;
+
+    let server_uri = server.uri();
+    let (session, rx_event) = make_session_with_config_and_rx(move |config| {
+        config.model_provider.base_url = Some(server_uri);
+    })
+    .await?;
+    let initial_model = session.collaboration_mode().await.model().to_string();
+    let (tx_sub, rx_sub) = async_channel::bounded(4);
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (start_loop_tx, start_loop_rx) = tokio::sync::oneshot::channel();
+    let session_for_loop = Arc::clone(&session);
+    let config = session.get_config().await;
+    let session_loop_handle = tokio::spawn(async move {
+        start_loop_rx.await.expect("start session loop");
+        submission_loop(session_for_loop, config, rx_sub).await;
+    });
+    let codex = Arc::new(Codex {
+        tx_sub,
+        rx_event,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    });
+
+    let foreign_submission_id = codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "foreign prompt".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    let expected_rejected_model = "must-not-be-applied".to_string();
+    let admission = {
+        let codex = Arc::clone(&codex);
+        let rejected_model = expected_rejected_model.clone();
+        tokio::spawn(async move {
+            codex
+                .submit_user_input_if_idle(Op::UserInput {
+                    items: vec![UserInput::Text {
+                        text: "workflow prompt".to_string(),
+                        text_elements: Vec::new(),
+                    }],
+                    final_output_json_schema: None,
+                    responsesapi_client_metadata: None,
+                    additional_context: Default::default(),
+                    thread_settings: ThreadSettingsOverrides {
+                        model: Some(rejected_model),
+                        ..Default::default()
+                    },
+                })
+                .await
+        })
+    };
+    timeout(Duration::from_secs(5), async {
+        while codex.tx_sub.len() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both user inputs should be queued before the session loop starts");
+    assert!(session.active_turn.lock().await.is_none());
+
+    start_loop_tx.send(()).expect("release session loop");
+    let outcome = timeout(Duration::from_secs(5), admission)
+        .await
+        .expect("idle admission should resolve")
+        .expect("idle admission task should not panic")?;
+    assert_eq!(outcome, StartTurnIfIdleOutcome::Busy);
+    assert_eq!(
+        session.collaboration_mode().await.model().to_string(),
+        initial_model
+    );
+    assert_ne!(
+        session.collaboration_mode().await.model(),
+        expected_rejected_model
+    );
+    assert_eq!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|turn| turn.task.as_ref())
+            .map(|task| task.turn_context.sub_id.clone()),
+        Some(foreign_submission_id)
+    );
+
+    codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn idle_turn_admission_clears_reservation_when_settings_are_rejected() -> anyhow::Result<()> {
+    let (session, rx_event) = make_session_with_config_and_rx(|config| {
+        config.permissions.approval_policy =
+            codex_config::Constrained::allow_only(AskForApproval::OnRequest);
+    })
+    .await?;
+    let (tx_sub, rx_sub) = async_channel::bounded(4);
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let session_for_loop = Arc::clone(&session);
+    let config = session.get_config().await;
+    let session_loop_handle = tokio::spawn(async move {
+        submission_loop(session_for_loop, config, rx_sub).await;
+    });
+    let codex = Codex {
+        tx_sub,
+        rx_event,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination_from_handle(session_loop_handle),
+    };
+
+    let error = codex
+        .submit_user_input_if_idle(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "workflow prompt".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect_err("disallowed turn settings should reject admission");
+    assert!(matches!(error, CodexErr::InvalidRequest(_)));
+    assert!(
+        session.active_turn.lock().await.is_none(),
+        "a failed pre-start configuration must release the idle-turn reservation"
+    );
+
+    codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn shutdown_and_wait_waits_when_shutdown_is_already_in_progress() {
     let (session, _turn_context) = make_session_and_context().await;
@@ -7744,6 +7906,7 @@ where
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        turn_admissions: Arc::new(super::turn_admission::TurnAdmissionRegistry::default()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });
@@ -7774,6 +7937,23 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+pub(crate) async fn make_workflow_session_and_context_with_rx() -> (
+    Arc<Session>,
+    Arc<TurnContext>,
+    async_channel::Receiver<Event>,
+) {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    session
+        .state
+        .lock()
+        .await
+        .session_configuration
+        .thread_source = Some(codex_protocol::protocol::ThreadSource::Feature(
+        "workflow".to_string(),
+    ));
+    (session, turn_context, rx)
 }
 
 #[tokio::test]
@@ -8128,6 +8308,50 @@ async fn record_context_updates_emits_environment_item_for_time_changes() {
         .expect("environment update item should be emitted");
     assert!(environment_update.contains("<current_date>2026-02-27</current_date>"));
     assert!(environment_update.contains("<timezone>Europe/Berlin</timezone>"));
+}
+
+#[tokio::test]
+async fn workflow_steady_state_context_is_split_bounded_and_omits_multi_agent_mode() {
+    let (session, previous_context, _rx) = make_workflow_session_and_context_with_rx().await;
+    let mut current_context = previous_context
+        .with_model(
+            previous_context.model_info.slug.clone(),
+            &session.services.models_manager,
+        )
+        .await;
+    current_context.multi_agent_version = MultiAgentVersion::V2;
+    current_context.collaboration_mode.settings.developer_instructions = Some(format!(
+        "STEADY_OPEN{}STEADY_CLOSE",
+        "d".repeat(crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES)
+    ));
+    let mut config = (*current_context.config).clone();
+    config.include_collaboration_mode_instructions = true;
+    config.multi_agent_v2.multi_agent_mode_hint_text = Some("stale spawn guidance".to_string());
+    current_context.config = Arc::new(config);
+
+    let update_items =
+        record_context_update_items(&session, previous_context, current_context).await;
+
+    let developer_texts = developer_input_texts(&update_items);
+    let bounded = developer_texts
+        .iter()
+        .find(|text| text.contains("STEADY_OPEN"))
+        .expect("expected bounded collaboration-mode update");
+    assert!(bounded.len() <= crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES);
+    assert!(bounded.contains("STEADY_CLOSE"));
+    assert!(bounded.ends_with(codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG));
+    assert!(bounded.contains("[workflow context truncated]"));
+    assert!(
+        developer_texts
+            .iter()
+            .all(|text| !text.contains(codex_protocol::protocol::MULTI_AGENT_MODE_OPEN_TAG))
+    );
+    for item in update_items {
+        let ResponseItem::Message { content, .. } = item else {
+            panic!("expected only workflow context messages");
+        };
+        assert_eq!(content.len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -8498,10 +8722,11 @@ async fn build_initial_context_adds_multi_agent_v2_root_usage_hint_as_developer_
     let initial_context = build_initial_context(&session, &turn_context).await;
 
     let developer_messages = developer_message_texts(&initial_context);
+    let expected = MultiAgentUsageHint::new("Root guidance.").render();
     assert!(
         developer_messages
             .iter()
-            .any(|message| message.as_slice() == ["Root guidance."]),
+            .any(|message| message.as_slice() == [expected.as_str()]),
         "expected standalone root usage hint developer message, got {developer_messages:?}"
     );
     assert!(
@@ -8536,10 +8761,11 @@ async fn build_initial_context_adds_multi_agent_v2_subagent_usage_hint_as_develo
     let initial_context = build_initial_context(&session, &turn_context).await;
 
     let developer_messages = developer_message_texts(&initial_context);
+    let expected = MultiAgentUsageHint::new("Subagent guidance.").render();
     assert!(
         developer_messages
             .iter()
-            .any(|message| message.as_slice() == ["Subagent guidance."]),
+            .any(|message| message.as_slice() == [expected.as_str()]),
         "expected standalone subagent usage hint developer message, got {developer_messages:?}"
     );
     assert!(
@@ -9880,7 +10106,7 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
 
 #[tokio::test]
 async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    let (sess, tc, _rx) = make_workflow_session_and_context_with_rx().await;
     sess.spawn_task(
         Arc::clone(&tc),
         Vec::new(),
@@ -9891,7 +10117,9 @@ async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
     )
     .await;
 
-    let item = user_message("synthetic idle input");
+    let item = user_message(&"x".repeat(
+        crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES + 1,
+    ));
     let err = sess
         .try_start_turn_if_idle(vec![item.clone()])
         .await
@@ -9903,6 +10131,67 @@ async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
         Vec::<TurnInput>::new(),
         sess.input_queue.get_pending_input(&sess.active_turn).await
     );
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn workflow_inject_if_running_rejection_returns_original_input() {
+    let (sess, _tc, _rx) = make_workflow_session_and_context_with_rx().await;
+    let item = user_message(&"x".repeat(
+        crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES + 1,
+    ));
+
+    let rejected = sess
+        .inject_if_running(vec![item.clone()])
+        .await
+        .expect_err("idle workflow child should reject active-turn injection");
+
+    assert_eq!(rejected, vec![item]);
+}
+
+#[tokio::test]
+async fn workflow_inject_if_running_bounds_messages_at_the_queue_boundary() {
+    let (sess, tc, _rx) = make_workflow_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    let input = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: "first".to_string(),
+            },
+            ContentItem::InputText {
+                text: "x".repeat(crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES + 1),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    sess.inject_if_running(vec![input])
+        .await
+        .expect("active workflow child should accept injected context");
+
+    let pending = sess.input_queue.get_pending_input(&sess.active_turn).await;
+    assert_eq!(pending.len(), 2);
+    for item in pending {
+        let TurnInput::ResponseItem(ResponseItem::Message { content, .. }) = item else {
+            panic!("expected bounded response-message input");
+        };
+        let [ContentItem::InputText { text }] = content.as_slice() else {
+            panic!("expected one text fragment per injected message");
+        };
+        assert!(text.len() <= crate::context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES);
+    }
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 }
@@ -10531,6 +10820,7 @@ async fn fatal_tool_error_stops_turn_and_reports_error() {
             mcp_tools: Some(tools),
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            collaboration_tool_access: Default::default(),
         },
         &Default::default(),
     );

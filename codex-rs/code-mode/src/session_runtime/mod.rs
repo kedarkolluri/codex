@@ -272,6 +272,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
 
     async fn spawn_agent(
         &self,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: codex_code_mode_protocol::AgentCallOpts,
@@ -281,6 +284,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .delegate
             .spawn_agent(
                 self.cell_id.clone(),
+                node_id,
+                parent_node_id,
+                phase,
                 prompt,
                 ordinal,
                 opts,
@@ -301,32 +307,46 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
             .await
     }
 
-    fn budget_handle(&self) -> Option<Arc<dyn codex_code_mode_protocol::WorkflowBudgetHandle>> {
-        self.inner.delegate.budget_handle()
+    async fn workflow_budget_snapshot(
+        &self,
+    ) -> Result<Option<codex_code_mode_protocol::WorkflowBudgetSnapshot>, String> {
+        self.inner
+            .delegate
+            .workflow_budget_snapshot(self.cell_id.clone())
+            .await
     }
 
-    fn replay_entries(&self) -> Vec<codex_workflow_journal::AgentCallLine> {
-        self.inner.delegate.replay_entries(self.cell_id.clone())
-    }
-
-    async fn journal_phase(&self, title: String) {
+    async fn journal_phase(&self, title: String) -> Result<(), String> {
         self.inner
             .delegate
             .journal_phase(self.cell_id.clone(), title)
-            .await;
+            .await
     }
 
-    async fn journal_log(&self, message: String) {
+    async fn journal_log(&self, message: String) -> Result<(), String> {
         self.inner
             .delegate
             .journal_log(self.cell_id.clone(), message)
-            .await;
+            .await
     }
 
-    async fn replay_agent(&self, entry: codex_workflow_journal::AgentCallLine) {
+    async fn replay_agent(
+        &self,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
+        entry: codex_workflow_journal::AgentCallLine,
+    ) -> Result<(), String> {
         self.inner
             .delegate
-            .replay_agent(self.cell_id.clone(), entry)
+            .replay_agent(self.cell_id.clone(), node_id, parent_node_id, phase, entry)
+            .await
+    }
+
+    async fn workflow_progress(&self, progress: codex_code_mode_protocol::WorkflowHostProgress) {
+        self.inner
+            .delegate
+            .workflow_progress(self.cell_id.clone(), progress)
             .await;
     }
 

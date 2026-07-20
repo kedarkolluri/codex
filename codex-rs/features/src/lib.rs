@@ -1070,8 +1070,8 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "workflow",
         stage: Stage::Experimental {
             name: "Dynamic workflows",
-            menu_description: "Run JS-authored dynamic workflows that orchestrate code mode and multi-agent runs.",
-            announcement: "",
+            menu_description: "Run JS-authored dynamic workflows that orchestrate code mode and multi-agent runs. Changes take effect after restarting Codex.",
+            announcement: "NEW: Dynamic workflows are available in /experimental. Changes take effect after restarting Codex.",
         },
         default_enabled: false,
     },

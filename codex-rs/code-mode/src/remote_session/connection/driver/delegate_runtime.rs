@@ -65,6 +65,9 @@ enum DelegateTask {
     },
     SpawnAgent {
         cell_id: codex_code_mode_protocol::CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: codex_code_mode_protocol::AgentCallOpts,
@@ -73,6 +76,28 @@ enum DelegateTask {
         cell_id: codex_code_mode_protocol::CellId,
         name: String,
         args: Option<serde_json::Value>,
+    },
+    JournalPhase {
+        cell_id: codex_code_mode_protocol::CellId,
+        title: String,
+    },
+    JournalLog {
+        cell_id: codex_code_mode_protocol::CellId,
+        message: String,
+    },
+    ReplayAgent {
+        cell_id: codex_code_mode_protocol::CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
+        entry: serde_json::Value,
+    },
+    WorkflowProgress {
+        cell_id: codex_code_mode_protocol::CellId,
+        progress: codex_code_mode_protocol::WorkflowHostProgress,
+    },
+    WorkflowBudget {
+        cell_id: codex_code_mode_protocol::CellId,
     },
 }
 
@@ -141,11 +166,17 @@ impl DelegateRuntime {
             },
             DelegateRequest::SpawnAgent {
                 cell_id: _,
+                node_id,
+                parent_node_id,
+                phase,
                 prompt,
                 ordinal,
                 opts,
             } => DelegateTask::SpawnAgent {
                 cell_id: target.cell_id.clone(),
+                node_id,
+                parent_node_id,
+                phase,
                 prompt,
                 ordinal,
                 opts: *opts,
@@ -158,6 +189,40 @@ impl DelegateRuntime {
                 cell_id: target.cell_id.clone(),
                 name,
                 args,
+            },
+            DelegateRequest::JournalPhase { cell_id: _, title } => DelegateTask::JournalPhase {
+                cell_id: target.cell_id.clone(),
+                title,
+            },
+            DelegateRequest::JournalLog {
+                cell_id: _,
+                message,
+            } => DelegateTask::JournalLog {
+                cell_id: target.cell_id.clone(),
+                message,
+            },
+            DelegateRequest::ReplayAgent {
+                cell_id: _,
+                node_id,
+                parent_node_id,
+                phase,
+                entry,
+            } => DelegateTask::ReplayAgent {
+                cell_id: target.cell_id.clone(),
+                node_id,
+                parent_node_id,
+                phase,
+                entry,
+            },
+            DelegateRequest::WorkflowProgress {
+                cell_id: _,
+                progress,
+            } => DelegateTask::WorkflowProgress {
+                cell_id: target.cell_id.clone(),
+                progress: *progress,
+            },
+            DelegateRequest::WorkflowBudget { cell_id: _ } => DelegateTask::WorkflowBudget {
+                cell_id: target.cell_id.clone(),
             },
         };
         let delegate = target.delegate;
@@ -181,12 +246,24 @@ impl DelegateRuntime {
                 // host isolate settles the promise (value / null / throw).
                 DelegateTask::SpawnAgent {
                     cell_id,
+                    node_id,
+                    parent_node_id,
+                    phase,
                     prompt,
                     ordinal,
                     opts,
                 } => Ok(DelegateResponse::AgentSpawned {
                     outcome: delegate
-                        .spawn_agent(cell_id, prompt, ordinal, opts, task_cancellation)
+                        .spawn_agent(
+                            cell_id,
+                            node_id,
+                            parent_node_id,
+                            phase,
+                            prompt,
+                            ordinal,
+                            opts,
+                            task_cancellation,
+                        )
                         .await
                         .into(),
                 }),
@@ -203,6 +280,32 @@ impl DelegateRuntime {
                         .await
                         .into(),
                 }),
+                DelegateTask::JournalPhase { cell_id, title } => delegate
+                    .journal_phase(cell_id, title)
+                    .await
+                    .map(|()| DelegateResponse::NotificationDelivered),
+                DelegateTask::JournalLog { cell_id, message } => delegate
+                    .journal_log(cell_id, message)
+                    .await
+                    .map(|()| DelegateResponse::NotificationDelivered),
+                DelegateTask::ReplayAgent {
+                    cell_id,
+                    node_id,
+                    parent_node_id,
+                    phase,
+                    entry,
+                } => delegate
+                    .replay_agent(cell_id, node_id, parent_node_id, phase, entry)
+                    .await
+                    .map(|()| DelegateResponse::NotificationDelivered),
+                DelegateTask::WorkflowProgress { cell_id, progress } => delegate
+                    .workflow_progress(cell_id, progress)
+                    .await
+                    .map(|()| DelegateResponse::NotificationDelivered),
+                DelegateTask::WorkflowBudget { cell_id } => delegate
+                    .workflow_budget_snapshot(cell_id)
+                    .await
+                    .map(|snapshot| DelegateResponse::WorkflowBudget { snapshot }),
             }
         });
         let completion_stop = CancellationToken::new();
@@ -308,7 +411,12 @@ impl ConnectionDriver {
             DelegateRequest::InvokeTool { invocation } => &invocation.cell_id,
             DelegateRequest::Notify { cell_id, .. }
             | DelegateRequest::SpawnAgent { cell_id, .. }
-            | DelegateRequest::SpawnWorkflow { cell_id, .. } => cell_id,
+            | DelegateRequest::SpawnWorkflow { cell_id, .. }
+            | DelegateRequest::JournalPhase { cell_id, .. }
+            | DelegateRequest::JournalLog { cell_id, .. }
+            | DelegateRequest::ReplayAgent { cell_id, .. }
+            | DelegateRequest::WorkflowProgress { cell_id, .. }
+            | DelegateRequest::WorkflowBudget { cell_id } => cell_id,
         };
         let target = match self.sessions.delegate_target(&session_id, wire_cell_id) {
             Ok(target) => target,

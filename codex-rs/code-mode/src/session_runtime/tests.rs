@@ -154,6 +154,8 @@ async fn termination_rejects_a_waiting_store_commit_before_the_next_cell_can_loa
                 workflow: false,
                 args: None,
                 run_id: None,
+                replay_entries: Vec::new(),
+                workflow_budget: None,
             },
             ObserveMode::YieldAfter(Duration::from_secs(1)),
         )
@@ -179,6 +181,8 @@ fn execute_request(source: &str) -> CreateCellRequest {
         workflow: false,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 

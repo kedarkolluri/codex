@@ -1768,15 +1768,18 @@
           "type": "integer"
         },
         "multi_agent_mode_hint_text": {
+          "description": "Guidance appended when multi-agent mode is active. Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four prompt fields to 8,000 UTF-8 bytes combined.",
           "type": "string"
         },
         "non_code_mode_only": {
           "type": "boolean"
         },
         "root_agent_usage_hint_text": {
+          "description": "Developer guidance shown to root multi-agent sessions. Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four prompt fields to 8,000 UTF-8 bytes combined.",
           "type": "string"
         },
         "subagent_usage_hint_text": {
+          "description": "Developer guidance shown to child multi-agent sessions. Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four prompt fields to 8,000 UTF-8 bytes combined.",
           "type": "string"
         },
         "tool_namespace": {
@@ -1790,6 +1793,7 @@
           "type": "boolean"
         },
         "usage_hint_text": {
+          "description": "Additional guidance appended to the multi-agent tool descriptions. Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four prompt fields to 8,000 UTF-8 bytes combined.",
           "type": "string"
         }
       },

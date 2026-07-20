@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use super::CellId;
@@ -17,9 +18,15 @@ use crate::ExecuteRequest;
 use crate::ExecuteToPendingOutcome;
 use crate::FunctionCallOutputContentItem;
 use crate::ToolDefinition;
+use codex_code_mode_protocol::AgentCallOpts;
+use codex_code_mode_protocol::AgentSpawnFuture;
+use codex_code_mode_protocol::AgentSpawnOutcome;
+use codex_code_mode_protocol::WorkflowHostCompletion;
+use codex_code_mode_protocol::WorkflowHostProgress;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
+use serde_json::json;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -61,6 +68,146 @@ impl CodeModeSessionDelegate for ReleasableToolDelegate {
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
+#[derive(Default)]
+struct RejectingReplayDelegate {
+    spawn_count: Mutex<usize>,
+    completions: Mutex<Vec<WorkflowHostCompletion>>,
+}
+
+impl RejectingReplayDelegate {
+    fn spawn_count(&self) -> usize {
+        *self.spawn_count.lock().expect("spawn count lock")
+    }
+
+    fn completions(&self) -> Vec<WorkflowHostCompletion> {
+        self.completions.lock().expect("completion lock").clone()
+    }
+}
+
+const RAW_PHASE_JOURNAL_ERROR: &str =
+    "phase journal write failed at /host/private/workflows/run/journal.jsonl";
+const RAW_LOG_JOURNAL_ERROR: &str =
+    "log journal write failed at /host/private/workflows/run/journal.jsonl";
+const RAW_REPLAY_JOURNAL_ERROR: &str =
+    "replay journal write failed at /host/private/workflows/run/journal.jsonl";
+
+#[derive(Default)]
+struct RejectingJournalDelegate {
+    completions: Mutex<Vec<WorkflowHostCompletion>>,
+}
+
+impl RejectingJournalDelegate {
+    fn completions(&self) -> Vec<WorkflowHostCompletion> {
+        self.completions.lock().expect("completion lock").clone()
+    }
+}
+
+impl CodeModeSessionDelegate for RejectingJournalDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async { Err("unexpected tool call".to_string()) })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn journal_phase<'a>(&'a self, _cell_id: CellId, _title: String) -> NotificationFuture<'a> {
+        Box::pin(async { Err(RAW_PHASE_JOURNAL_ERROR.to_string()) })
+    }
+
+    fn journal_log<'a>(&'a self, _cell_id: CellId, _message: String) -> NotificationFuture<'a> {
+        Box::pin(async { Err(RAW_LOG_JOURNAL_ERROR.to_string()) })
+    }
+
+    fn workflow_progress<'a>(
+        &'a self,
+        _cell_id: CellId,
+        progress: WorkflowHostProgress,
+    ) -> NotificationFuture<'a> {
+        if let WorkflowHostProgress::Complete { status } = progress {
+            self.completions
+                .lock()
+                .expect("completion lock")
+                .push(status);
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+impl CodeModeSessionDelegate for RejectingReplayDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async { Err("unexpected tool call".to_string()) })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn spawn_agent<'a>(
+        &'a self,
+        _cell_id: CellId,
+        _node_id: u64,
+        _parent_node_id: Option<u64>,
+        _phase: Option<String>,
+        _prompt: String,
+        _ordinal: u64,
+        _opts: AgentCallOpts,
+        _cancellation_token: CancellationToken,
+    ) -> AgentSpawnFuture<'a> {
+        *self.spawn_count.lock().expect("spawn count lock") += 1;
+        Box::pin(async { AgentSpawnOutcome::Completed(json!("must not execute")) })
+    }
+
+    fn replay_agent<'a>(
+        &'a self,
+        _cell_id: CellId,
+        _node_id: u64,
+        _parent_node_id: Option<u64>,
+        _phase: Option<String>,
+        _entry: JsonValue,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Err(RAW_REPLAY_JOURNAL_ERROR.to_string()) })
+    }
+
+    fn workflow_progress<'a>(
+        &'a self,
+        _cell_id: CellId,
+        progress: WorkflowHostProgress,
+    ) -> NotificationFuture<'a> {
+        if let WorkflowHostProgress::Complete { status } = progress {
+            self.completions
+                .lock()
+                .expect("completion lock")
+                .push(status);
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
 fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
         tool_call_id: "call_1".to_string(),
@@ -71,6 +218,8 @@ fn execute_request(source: &str) -> ExecuteRequest {
         workflow: false,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 
@@ -1028,4 +1177,114 @@ async fn plain_exec_mode_omits_narrator_globals_end_to_end() {
         error_text.contains("phase is not defined"),
         "plain exec must not install `phase`; got: {error_text}"
     );
+}
+
+#[tokio::test]
+async fn replay_acknowledgement_failure_stops_caught_workflow_in_process() {
+    let delegate = Arc::new(RejectingReplayDelegate::default());
+    let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+    let replay_entry = json!({
+        "ordinal": 0,
+        "key": "blake3:991de39fb811986852f1ef2869b7957b2d33159ea3b6a33dc6154c0631b9c7d9",
+        "prompt_hash": "blake3:3f6ad07bbbec251dcafac8f42b026b6dae9a44dd81f9d01d115a3e42891cf234",
+        "opts": {
+            "model": null,
+            "effort": null,
+            "agentType": null,
+            "isolation": null,
+            "schema_hash": null
+        },
+        "phase": null,
+        "label": null,
+        "child_thread_id": "prior-thread",
+        "rollout_path": "/prior/rollout.jsonl",
+        "status": "completed",
+        "return": "cached-answer",
+        "tokens_spent": 17,
+        "completion_seq": 0
+    });
+    let response = execute(
+        &service,
+        ExecuteRequest {
+            source: concat!(
+                "try { await agent('cached'); } catch (_) {}\n",
+                "text('must not escape');\n",
+                "await agent('must not execute');\n",
+            )
+            .to_string(),
+            yield_time_ms: Some(60_000),
+            workflow: true,
+            run_id: Some("in-process-run".to_string()),
+            replay_entries: vec![replay_entry],
+            ..execute_request("")
+        },
+    )
+    .await;
+
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = response
+    else {
+        panic!("expected terminal Result, got {response:?}");
+    };
+    assert_eq!(content_items, Vec::new());
+    assert_eq!(
+        error_text.as_deref(),
+        Some("workflow journal is unavailable")
+    );
+    assert!(!format!("{error_text:?}").contains(RAW_REPLAY_JOURNAL_ERROR));
+    assert_eq!(delegate.spawn_count(), 0);
+    assert_eq!(
+        delegate.completions(),
+        vec![WorkflowHostCompletion::Errored(
+            "workflow journal is unavailable".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn journal_acknowledgement_failures_stop_in_process_workflows_without_exposing_host_details()
+{
+    for (source, raw_error) in [
+        (
+            r#"phase("persist me"); text("must not escape");"#,
+            RAW_PHASE_JOURNAL_ERROR,
+        ),
+        (
+            r#"log("persist me"); text("must not escape");"#,
+            RAW_LOG_JOURNAL_ERROR,
+        ),
+    ] {
+        let delegate = Arc::new(RejectingJournalDelegate::default());
+        let service = InProcessCodeModeSession::with_delegate(delegate.clone());
+        let response = execute(
+            &service,
+            ExecuteRequest {
+                source: source.to_string(),
+                yield_time_ms: Some(60_000),
+                workflow: true,
+                run_id: Some("in-process-journal-failure".to_string()),
+                ..execute_request("")
+            },
+        )
+        .await;
+
+        assert!(!format!("{response:?}").contains(raw_error));
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                cell_id: cell_id("1"),
+                content_items: Vec::new(),
+                error_text: Some("workflow journal is unavailable".to_string()),
+            }
+        );
+        assert_eq!(
+            delegate.completions(),
+            vec![WorkflowHostCompletion::Errored(
+                "workflow journal is unavailable".to_string()
+            )]
+        );
+    }
 }

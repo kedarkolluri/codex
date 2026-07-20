@@ -1,0 +1,41 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "format!(\"SKIPPED\\n{skipped}\\n\\nRETRY LIMIT\\n{retry_limit}\\n\\nFAILED\\n{failed_state}\\n\\nRETRIED\\n{retried}\")"
+---
+SKIPPED
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms · attempt 1 skipped
+
+  ↑↓ choose · Enter inspect agent · Esc exit
+
+RETRY LIMIT
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms · attempt 1 retry limit
+
+  ↑↓ choose · Enter inspect agent · Esc exit
+
+FAILED
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms · attempt 1 control failed: unavailable
+       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+       xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…
+
+  ↑↓ choose · x skip · r retry · Enter inspect agent · Esc exit
+
+RETRIED
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms · retrying…
+
+  ↑↓ choose · Enter inspect agent · Esc exit

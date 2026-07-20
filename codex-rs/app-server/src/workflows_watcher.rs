@@ -15,11 +15,12 @@
 //!   are registered once at construction time.
 //! * **Per-thread project roots** — `<thread cwd>/.codex/workflows` — depend on
 //!   the attaching thread's cwd, so they are registered per thread via
-//!   [`WorkflowsWatcher::register_thread_config`] (invoked from the same place
+//!   [`WorkflowsWatcher::register_thread_environments`] (invoked from the same place
 //!   the skills watcher's is: `ensure_listener_task_running`). The returned
 //!   [`WatchRegistration`] is held for the thread listener's lifetime and
 //!   unregisters on drop, exactly like the skills registration.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ use codex_app_server_protocol::WorkflowsChangedNotification;
 use codex_core::ThreadManager;
 use codex_core::config::Config;
 use codex_core_workflows::WorkflowRoot;
+use codex_core_workflows::WorkflowScope;
 use codex_core_workflows::workflow_roots;
 use codex_file_watcher::FileWatcher;
 use codex_file_watcher::FileWatcherSubscriber;
@@ -51,7 +53,7 @@ const WATCHER_THROTTLE_INTERVAL: Duration = Duration::from_millis(50);
 /// (`$HOME/.agents/workflows`) and `$CODEX_HOME/workflows` roots. The
 /// project-scoped `<cwd>/.codex/workflows` root is intentionally excluded here —
 /// it is registered per thread from the attaching thread's cwd (see
-/// [`WorkflowsWatcher::register_thread_config`]). Non-existent roots are
+/// [`WorkflowsWatcher::register_thread_environments`]). Non-existent roots are
 /// tolerated by discovery and by the file watcher (which falls back to the
 /// nearest existing ancestor).
 pub(crate) fn workflow_static_roots_from_config(config: &Config) -> Vec<WorkflowRoot> {
@@ -100,9 +102,20 @@ impl WorkflowsWatcher {
         let (subscriber, rx) = file_watcher.add_subscriber();
         let static_roots_registration =
             subscriber.register_paths(watch_paths_for_roots(&static_roots));
+        let ignored_run_state_roots = static_roots
+            .iter()
+            .filter(|root| root.scope == WorkflowScope::CodexHome)
+            .map(|root| root.path.join("runs"))
+            .collect();
         let shutdown_token = CancellationToken::new();
         let shutdown_drop_guard = shutdown_token.clone().drop_guard();
-        Self::spawn_event_loop(rx, service, outgoing, shutdown_token.child_token());
+        Self::spawn_event_loop(
+            rx,
+            service,
+            outgoing,
+            ignored_run_state_roots,
+            shutdown_token.child_token(),
+        );
         Arc::new(Self {
             subscriber,
             _static_roots_registration: static_roots_registration,
@@ -115,8 +128,8 @@ impl WorkflowsWatcher {
         self.shutdown_token.cancel();
     }
 
-    /// Register the attaching thread's project root
-    /// (`<thread cwd>/.codex/workflows`) for watching and return the RAII
+    /// Register the attaching thread's selected primary environment cwd as its
+    /// project root (`<cwd>/.codex/workflows`) and return the RAII
     /// registration. The caller holds it for the thread listener's lifetime so
     /// it unregisters on drop, mirroring [`SkillsWatcher::register_thread_config`].
     ///
@@ -125,9 +138,8 @@ impl WorkflowsWatcher {
     /// ancestor.
     ///
     /// [`SkillsWatcher::register_thread_config`]: crate::skills_watcher::SkillsWatcher::register_thread_config
-    pub(crate) fn register_thread_config(
+    pub(crate) fn register_thread_environments(
         &self,
-        config: &Config,
         thread_manager: &ThreadManager,
         environments: &[TurnEnvironmentSelection],
     ) -> WatchRegistration {
@@ -147,8 +159,15 @@ impl WorkflowsWatcher {
         if environment.is_remote() {
             return WatchRegistration::default();
         }
+        let Ok(project_cwd) = environment_selection.cwd.to_abs_path() else {
+            warn!(
+                "failed to register workflows watcher for non-native cwd `{}`",
+                environment_selection.cwd
+            );
+            return WatchRegistration::default();
+        };
         let roots = workflow_roots(
-            Some(config.cwd.as_path()),
+            Some(project_cwd.as_path()),
             /* home_dir */ None,
             /* codex_home */ None,
         );
@@ -160,6 +179,7 @@ impl WorkflowsWatcher {
         rx: Receiver,
         service: Arc<WorkflowsService>,
         outgoing: Arc<OutgoingMessageSender>,
+        ignored_run_state_roots: Vec<PathBuf>,
         shutdown_token: CancellationToken,
     ) {
         let mut rx = ThrottledWatchReceiver::new(rx, WATCHER_THROTTLE_INTERVAL);
@@ -173,8 +193,23 @@ impl WorkflowsWatcher {
                     _ = shutdown_token.cancelled() => break,
                     event = rx.recv() => event,
                 };
-                if event.is_none() {
+                let Some(event) = event else {
                     break;
+                };
+                // Durable run artifacts live inside the recursively watched
+                // Codex-home workflow root, but they are not saved-workflow
+                // definitions. Ignore batches that touch only that reserved
+                // subtree so journal/progress writes do not invalidate the
+                // registry or emit `workflows/changed`. Project and personal
+                // directories named `runs` are not present in this exclusion.
+                if !event.paths.is_empty()
+                    && event.paths.iter().all(|path| {
+                        ignored_run_state_roots
+                            .iter()
+                            .any(|root| path.starts_with(root))
+                    })
+                {
+                    continue;
                 }
                 // Invalidate the shared registry cache so the next reader
                 // re-discovers, then notify clients to invalidate theirs. No

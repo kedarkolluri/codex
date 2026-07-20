@@ -100,7 +100,11 @@ impl ChatWidget {
                     feature: spec.id,
                     name: name.to_string(),
                     description: description.to_string(),
-                    enabled: self.config.features.enabled(spec.id),
+                    enabled: if spec.id == Feature::Workflow {
+                        self.workflow_feature_configured_enabled
+                    } else {
+                        self.config.features.enabled(spec.id)
+                    },
                 })
             })
             .collect();

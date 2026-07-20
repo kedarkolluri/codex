@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "crate::chatwidget::tests::render_bottom_popup(&chat, 90)"
+---
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  save conflict  project workflow already exists
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+
+  Overwrite saved workflow?
+  Exact name: release-check · project scope
+
+  1. Overwrite existing workflow  Replace its script with the exact durable run script.
+› 2. Cancel                       Leave the existing saved workflow unchanged.
+
+  Press enter to confirm or esc to go back

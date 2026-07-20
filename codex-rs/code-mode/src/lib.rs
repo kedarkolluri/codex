@@ -4,6 +4,7 @@ mod runtime;
 mod service;
 mod session_runtime;
 mod v8_init;
+mod workflow_budget;
 
 pub(crate) type TaskFailureHandler = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 

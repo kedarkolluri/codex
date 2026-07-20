@@ -3,7 +3,10 @@ use crate::config::ConstraintResult;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::Codex;
 use crate::session::SessionSettingsUpdate;
+use crate::session::StartTurnIfIdleOutcome;
 use crate::session::SteerInputError;
+use crate::tools::code_mode::WorkflowAgentControlAction;
+use crate::tools::code_mode::WorkflowAgentControlDisposition;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
@@ -95,6 +98,28 @@ pub enum TryStartTurnIfIdleRejectionReason {
     /// Another turn or task is active, or the idle reservation was lost before
     /// the automatic turn could start.
     Busy,
+}
+
+/// Result of requesting cancellation for a session-owned Dynamic Workflow run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowStopDisposition {
+    /// This request initiated cancellation and awaited the run cleanup path.
+    Applied,
+    /// Another request had already initiated cancellation; this caller joined its cleanup.
+    AlreadyRequested,
+    /// No active run with this identifier belongs to the thread session.
+    NotRunning,
+}
+
+/// Result of requesting a checkpoint pause for a session-owned Dynamic Workflow run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowPauseDisposition {
+    /// This request initiated the pause and awaited child cleanup and durable publication.
+    Applied,
+    /// Another pause request had already started; this caller joined its cleanup.
+    AlreadyRequested,
+    /// No active run exists, or another terminal cause won first.
+    NotRunning,
 }
 
 /// Rejection returned when an extension asks to start automatic idle work but
@@ -201,6 +226,102 @@ impl CodexThread {
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.codex.submit(op).await
+    }
+
+    pub(crate) async fn submit_user_input_if_idle(
+        &self,
+        op: Op,
+    ) -> CodexResult<StartTurnIfIdleOutcome> {
+        self.codex.submit_user_input_if_idle(op).await
+    }
+
+    /// Resolve and durably start a saved dynamic workflow using this thread's
+    /// effective provider, router, environment, and agent-control services.
+    pub async fn start_saved_workflow(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> CodexResult<String> {
+        crate::tools::code_mode::workflow_entry::start_saved_workflow(
+            &self.codex.session,
+            name,
+            args,
+        )
+        .await
+    }
+
+    /// Resume a paused workflow from its immutable durable run artifacts.
+    pub async fn resume_workflow_run(&self, source_run_id: &str) -> CodexResult<String> {
+        crate::tools::code_mode::workflow_entry::resume_saved_workflow(
+            &self.codex.session,
+            source_run_id,
+        )
+        .await
+    }
+
+    /// Stop one Dynamic Workflow owned by this thread and wait for cleanup to finish.
+    pub async fn stop_workflow_run(&self, run_id: &str) -> WorkflowStopDisposition {
+        match self
+            .codex
+            .session
+            .services
+            .code_mode_service
+            .cancel_workflow_run(run_id)
+            .await
+        {
+            crate::tools::code_mode::WorkflowRunCancelOutcome::Applied => {
+                WorkflowStopDisposition::Applied
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::AlreadyRequested => {
+                WorkflowStopDisposition::AlreadyRequested
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::NotRunning => {
+                WorkflowStopDisposition::NotRunning
+            }
+        }
+    }
+
+    /// Pause one Dynamic Workflow owned by this thread and wait for its
+    /// checkpoint cleanup and durable publication to finish.
+    pub async fn pause_workflow_run(&self, run_id: &str) -> WorkflowPauseDisposition {
+        match self
+            .codex
+            .session
+            .services
+            .code_mode_service
+            .pause_workflow_run(run_id)
+            .await
+        {
+            crate::tools::code_mode::WorkflowRunCancelOutcome::Applied => {
+                WorkflowPauseDisposition::Applied
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::AlreadyRequested => {
+                WorkflowPauseDisposition::AlreadyRequested
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::NotRunning => {
+                WorkflowPauseDisposition::NotRunning
+            }
+        }
+    }
+
+    /// Apply `action` to one exact live workflow-agent generation owned by this thread.
+    ///
+    /// Malformed, foreign, stale, completed, and race-losing selections intentionally collapse to
+    /// [`WorkflowAgentControlDisposition::Unavailable`]. Applied responses are returned only after
+    /// the selected child, worktree, scheduler permit, and terminal journal barrier are clean.
+    pub async fn control_workflow_agent(
+        &self,
+        run_id: &str,
+        node_id: u64,
+        attempt: u32,
+        action: WorkflowAgentControlAction,
+    ) -> WorkflowAgentControlDisposition {
+        self.codex
+            .session
+            .services
+            .code_mode_service
+            .control_workflow_agent(run_id, node_id, attempt, action)
+            .await
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -480,6 +601,10 @@ impl CodexThread {
             return Err(CodexErr::InvalidRequest(
                 "items must not be empty".to_string(),
             ));
+        }
+        if self.codex.session.is_workflow_managed_agent().await {
+            crate::context::validate_workflow_child_client_injected_items(&items)
+                .map_err(|message| CodexErr::InvalidRequest(message.to_string()))?;
         }
 
         let turn_context = self.codex.session.new_default_turn().await;

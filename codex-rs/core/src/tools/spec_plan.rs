@@ -59,6 +59,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::override_tool_exposure;
+use crate::tools::router::CollaborationToolAccess;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use codex_features::Feature;
@@ -106,6 +107,7 @@ type PlannedRuntime = Arc<dyn CoreToolRuntime>;
 struct PlannedTools {
     runtimes: Vec<PlannedRuntime>,
     hosted_specs: Vec<ToolSpec>,
+    workflow_nested_tool_exclusions: HashSet<ToolName>,
 }
 
 impl PlannedTools {
@@ -155,6 +157,7 @@ struct CoreToolPlanContext<'a> {
     tool_search_handler_cache: &'a ToolSearchHandlerCache,
     default_agent_type_description: &'a str,
     wait_agent_timeouts: WaitAgentTimeoutOptions,
+    collaboration_tool_access: CollaborationToolAccess,
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -181,6 +184,7 @@ fn build_tool_specs_and_registry(
         tool_suggest_candidates,
         extension_tool_executors,
         dynamic_tools,
+        collaboration_tool_access,
     } = params;
     let default_agent_type_description =
         crate::agent::role::spawn_tool_spec::build(&std::collections::BTreeMap::new());
@@ -194,6 +198,7 @@ fn build_tool_specs_and_registry(
         tool_search_handler_cache,
         default_agent_type_description: &default_agent_type_description,
         wait_agent_timeouts: wait_agent_timeout_options(turn_context),
+        collaboration_tool_access,
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
@@ -240,6 +245,7 @@ fn build_model_visible_specs_and_registry(
     let PlannedTools {
         runtimes,
         hosted_specs,
+        ..
     } = planned_tools;
     let mut specs = Vec::new();
     let mut seen_tool_names = HashSet::new();
@@ -455,6 +461,7 @@ fn is_excluded_from_code_mode(turn_context: &TurnContext, tool_name: &ToolName) 
 fn build_code_mode_executors(
     turn_context: &TurnContext,
     executors: &[Arc<dyn CoreToolRuntime>],
+    workflow_nested_tool_exclusions: &HashSet<ToolName>,
 ) -> Vec<Arc<dyn CoreToolRuntime>> {
     let tool_mode = effective_tool_mode(turn_context);
     if !matches!(tool_mode, ToolMode::CodeMode | ToolMode::CodeModeOnly) {
@@ -462,6 +469,7 @@ fn build_code_mode_executors(
     }
 
     let mut code_mode_nested_tool_specs = Vec::new();
+    let mut workflow_nested_tool_specs = Vec::new();
     let mut exec_prompt_tool_specs = Vec::new();
     let mut deferred_exec_prompt_tool_specs = Vec::new();
     let deferred_tools_guidance_enabled = search_tool_enabled(turn_context);
@@ -479,6 +487,7 @@ fn build_code_mode_executors(
             continue;
         }
 
+        let tool_name = executor.tool_name();
         let spec = executor.spec();
 
         if exposure == ToolExposure::Deferred {
@@ -487,6 +496,9 @@ fn build_code_mode_executors(
             }
         } else {
             exec_prompt_tool_specs.push(spec.clone());
+        }
+        if !workflow_nested_tool_exclusions.contains(&tool_name) {
+            workflow_nested_tool_specs.push(spec.clone());
         }
         code_mode_nested_tool_specs.push(spec);
     }
@@ -517,7 +529,7 @@ fn build_code_mode_executors(
     if turn_context.config.features.enabled(Feature::Workflow) {
         executors.push(Arc::new(CodeModeWorkflowHandler::new(
             create_workflow_tool(),
-            code_mode_nested_tool_specs,
+            workflow_nested_tool_specs,
         )));
     }
 
@@ -799,7 +811,11 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
 #[instrument(level = "trace", skip_all)]
 fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut PlannedTools) {
+    if context.collaboration_tool_access == CollaborationToolAccess::Disabled {
+        return;
+    }
     let turn_context = context.step_context.turn.as_ref();
+    let first_collaboration_runtime = planned_tools.runtimes.len();
     if collab_tools_enabled(turn_context) {
         if multi_agent_v2_enabled(turn_context) {
             let exposure = if turn_context.config.multi_agent_v2.non_code_mode_only {
@@ -881,6 +897,11 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             planned_tools.add(ReportAgentJobResultHandler);
         }
     }
+    planned_tools.workflow_nested_tool_exclusions.extend(
+        planned_tools.runtimes[first_collaboration_runtime..]
+            .iter()
+            .map(|runtime| runtime.tool_name()),
+    );
 }
 
 #[instrument(
@@ -998,7 +1019,11 @@ fn prepend_code_mode_executors(
     planned_tools: &mut PlannedTools,
 ) {
     let turn_context = context.step_context.turn.as_ref();
-    let code_mode_executors = build_code_mode_executors(turn_context, planned_tools.runtimes());
+    let code_mode_executors = build_code_mode_executors(
+        turn_context,
+        planned_tools.runtimes(),
+        &planned_tools.workflow_nested_tool_exclusions,
+    );
     planned_tools.runtimes.splice(0..0, code_mode_executors);
 }
 

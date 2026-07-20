@@ -66,12 +66,24 @@ pub struct MultiAgentV2ConfigToml {
     /// Deprecated compatibility field. Its value is ignored.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_hint_enabled: Option<bool>,
+    /// Additional guidance appended to the multi-agent tool descriptions.
+    /// Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four
+    /// prompt fields to 8,000 UTF-8 bytes combined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_hint_text: Option<String>,
+    /// Developer guidance shown to root multi-agent sessions.
+    /// Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four
+    /// prompt fields to 8,000 UTF-8 bytes combined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub root_agent_usage_hint_text: Option<String>,
+    /// Developer guidance shown to child multi-agent sessions.
+    /// Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four
+    /// prompt fields to 8,000 UTF-8 bytes combined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subagent_usage_hint_text: Option<String>,
+    /// Guidance appended when multi-agent mode is active.
+    /// Workflow-enabled configurations limit this value to 4,000 UTF-8 bytes and all four
+    /// prompt fields to 8,000 UTF-8 bytes combined.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multi_agent_mode_hint_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

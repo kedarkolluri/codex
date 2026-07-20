@@ -13,6 +13,7 @@ use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::StartTurnIfIdleOutcome;
 use crate::session::resolve_multi_agent_version;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
@@ -1167,6 +1168,21 @@ impl ThreadManagerState {
             log.push((thread_id, op.clone()));
         }
         thread.submit(op).await
+    }
+
+    /// Submit user input whose fresh-turn admission is decided by the serialized session loop.
+    pub(crate) async fn send_user_input_if_idle(
+        &self,
+        thread_id: ThreadId,
+        op: Op,
+    ) -> CodexResult<StartTurnIfIdleOutcome> {
+        let thread = self.get_thread(thread_id).await?;
+        if let Some(ops_log) = &self.ops_log
+            && let Ok(mut log) = ops_log.lock()
+        {
+            log.push((thread_id, op.clone()));
+        }
+        thread.submit_user_input_if_idle(op).await
     }
 
     /// Remove a thread from the manager by ID, returning it when present.

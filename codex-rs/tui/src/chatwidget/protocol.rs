@@ -143,9 +143,37 @@ impl ChatWidget {
             ServerNotification::SkillsChanged(_) => {
                 self.refresh_skills_for_current_cwd(/*force_reload*/ true);
             }
-            // The live workflow monitor that consumes this lands in a later
-            // milestone (§9); until then the chat widget ignores it.
-            ServerNotification::WorkflowsChanged(_) => {}
+            ServerNotification::WorkflowsChanged(_) => self.on_workflows_changed(),
+            ServerNotification::WorkflowStarted(notification) => {
+                self.on_workflow_notification(WorkflowNotification::Started(notification))
+            }
+            ServerNotification::WorkflowPhaseChanged(notification) => {
+                self.on_workflow_notification(WorkflowNotification::PhaseChanged(notification))
+            }
+            ServerNotification::WorkflowGroupStarted(notification) => {
+                self.on_workflow_notification(WorkflowNotification::GroupStarted(notification))
+            }
+            ServerNotification::WorkflowGroupCompleted(notification) => {
+                self.on_workflow_notification(WorkflowNotification::GroupCompleted(notification))
+            }
+            ServerNotification::WorkflowAgentStarted(notification) => {
+                self.on_workflow_notification(WorkflowNotification::AgentStarted(notification))
+            }
+            ServerNotification::WorkflowAgentBound(notification) => {
+                self.on_workflow_notification(WorkflowNotification::AgentBound(notification))
+            }
+            ServerNotification::WorkflowAgentUpdated(notification) => {
+                self.on_workflow_notification(WorkflowNotification::AgentUpdated(notification))
+            }
+            ServerNotification::WorkflowAgentCompleted(notification) => {
+                self.on_workflow_notification(WorkflowNotification::AgentCompleted(notification))
+            }
+            ServerNotification::WorkflowLog(notification) => {
+                self.on_workflow_notification(WorkflowNotification::Log(notification))
+            }
+            ServerNotification::WorkflowCompleted(notification) => {
+                self.on_workflow_completed_notification(notification, from_replay)
+            }
             ServerNotification::ModelRerouted(_) => {}
             ServerNotification::ModelVerification(notification) => {
                 self.on_app_server_model_verification(&notification.verifications)

@@ -23,6 +23,7 @@ codex-utils-output-truncation = { workspace = true }
 codex-utils-template = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync", "time"] }
 tracing = { workspace = true, features = ["log"] }
 
@@ -30,3 +31,4 @@ tracing = { workspace = true, features = ["log"] }
 pretty_assertions = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+tiktoken-rs = { workspace = true }

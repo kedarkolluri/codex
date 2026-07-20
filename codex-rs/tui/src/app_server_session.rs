@@ -109,6 +109,10 @@ use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput;
+use codex_app_server_protocol::WorkflowListParams;
+use codex_app_server_protocol::WorkflowListResponse;
+use codex_app_server_protocol::WorkflowStartParams;
+use codex_app_server_protocol::WorkflowStartResponse;
 use codex_otel::TelemetryAuthMode;
 use codex_protocol::ThreadId;
 use codex_protocol::approvals::GuardianAssessmentEvent;
@@ -1122,6 +1126,28 @@ impl AppServerSession {
             .request_typed(ClientRequest::SkillsList { request_id, params })
             .await
             .wrap_err("skills/list failed in TUI")
+    }
+
+    pub(crate) async fn workflow_list(
+        &mut self,
+        params: WorkflowListParams,
+    ) -> Result<WorkflowListResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::WorkflowList { request_id, params })
+            .await
+            .wrap_err("workflow/list failed in TUI")
+    }
+
+    pub(crate) async fn workflow_start(
+        &mut self,
+        params: WorkflowStartParams,
+    ) -> Result<WorkflowStartResponse> {
+        let request_id = self.next_request_id();
+        self.client
+            .request_typed(ClientRequest::WorkflowStart { request_id, params })
+            .await
+            .wrap_err("workflow/start failed in TUI")
     }
 
     pub(crate) async fn reload_user_config(&mut self) -> Result<()> {

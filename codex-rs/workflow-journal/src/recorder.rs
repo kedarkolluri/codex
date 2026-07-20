@@ -14,14 +14,14 @@
 //! * A single background task owns the open file, so appends can never
 //!   interleave into a torn line even when many tasks append concurrently (a
 //!   parallel batch). The mpsc channel serializes them into append order.
-//! * Every line is newline-terminated and `flush()`ed before its append is
-//!   acknowledged, so when [`JournalRecorder::append`] returns, that line is on
-//!   disk. This is the durability boundary for the run→agent linkage (§7): a
+//! * Every line is newline-terminated and data-synced before its append is
+//!   acknowledged, so when [`JournalRecorder::append`] returns, that line has
+//!   crossed the filesystem durability barrier. This is the boundary for the run→agent linkage (§7): a
 //!   `completed` `agent_call` line is durable the instant its append resolves.
-//! * On open the file is repaired to end in a newline
-//!   ([`ensure_newline_terminated`]), so a crash mid-line never corrupts the
-//!   next append — mirroring `ensure_rollout_is_newline_terminated`
-//!   (`recorder.rs:1821`).
+//! * On open, a complete final record that merely lacks its newline is
+//!   terminated, while an unparsable crash tail is truncated
+//!   ([`repair_crash_tail`]). A crash mid-line therefore never corrupts the next
+//!   append or becomes a durable malformed record.
 //!
 //! ## Determinism
 //!
@@ -45,11 +45,13 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::AgentBoundLine;
 use crate::AgentCallLine;
 use crate::JournalLine;
 use crate::LogLine;
 use crate::PhaseLine;
 use crate::WorkflowRunMeta;
+use crate::storage::WorkflowJournalState;
 use crate::storage::WorkflowRunPaths;
 
 /// Bound on the writer's command queue. Matches the rollout recorder's channel
@@ -58,16 +60,16 @@ const CHANNEL_CAPACITY: usize = 256;
 
 /// Commands processed by the single background writer task.
 enum JournalCmd {
-    /// Append one pre-serialized, newline-terminated line and flush.
+    /// Append one pre-serialized, newline-terminated line and sync its data.
     Append {
         line: String,
         ack: oneshot::Sender<io::Result<()>>,
     },
-    /// Flush any buffered bytes to disk and acknowledge.
+    /// Flush and sync any buffered bytes to disk before acknowledging.
     Flush {
         ack: oneshot::Sender<io::Result<()>>,
     },
-    /// Flush, acknowledge, then stop the writer loop.
+    /// Flush, data-sync, acknowledge, then stop the writer loop.
     Shutdown {
         ack: oneshot::Sender<io::Result<()>>,
     },
@@ -96,23 +98,33 @@ impl JournalRecorder {
     /// The run directory is created if missing. `run_meta` is written only when
     /// the journal file is empty, so reopening an existing journal (crash
     /// recovery) neither duplicates nor rewrites line 0. The file is repaired to
-    /// end in a newline before any append, so a torn trailing line from a crash
-    /// cannot corrupt the next record.
+    /// have a repaired crash tail before any append, so a torn trailing line
+    /// cannot corrupt the next record or become durable corruption.
     pub async fn new(paths: &WorkflowRunPaths, meta: &WorkflowRunMeta) -> io::Result<Self> {
         paths.create_dir()?;
+        // A fixed-id resume may reopen a crash-partial successor. Authenticate
+        // line zero before appending so a claimed id can never adopt a journal
+        // belonging to different immutable metadata.
+        let journal_state = paths.journal_state(meta)?;
+        if journal_state == WorkflowJournalState::PartialHeader {
+            paths.repair_partial_journal_header(meta)?;
+        }
         let journal_path = paths.journal();
         let mut file = open_journal_for_append(&journal_path).await?;
 
         // Line 0 = run_meta, written exactly once (only for a fresh journal).
         if file.metadata().await?.len() == 0 {
             let mut json = serde_json::to_string(meta).map_err(io::Error::other)?;
+            ensure_record_within_bounds(&json)?;
             json.push('\n');
             file.write_all(json.as_bytes()).await?;
-            file.flush().await?;
+            sync_file_data(&mut file).await?;
         }
 
+        let journal_len = file.metadata().await?.len();
+        let journal_record_count = count_journal_records(&mut file).await?;
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let handle = tokio::spawn(journal_writer(file, rx));
+        let handle = tokio::spawn(journal_writer(file, journal_len, journal_record_count, rx));
         Ok(Self {
             tx,
             handle: Mutex::new(Some(handle)),
@@ -123,6 +135,11 @@ impl JournalRecorder {
     /// before it is written.
     pub async fn record_agent_call(&self, line: AgentCallLine) -> io::Result<()> {
         self.append(JournalLine::AgentCall(Box::new(line))).await
+    }
+
+    /// Persist a child binding before the child's first turn starts.
+    pub async fn record_agent_bound(&self, line: AgentBoundLine) -> io::Result<()> {
+        self.append(JournalLine::AgentBound(line)).await
     }
 
     /// Append a `phase` narration line.
@@ -146,6 +163,7 @@ impl JournalRecorder {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         stamp_timestamp_if_absent(&mut line);
         let mut json = serde_json::to_string(&line).map_err(io::Error::other)?;
+        ensure_record_within_bounds(&json)?;
         json.push('\n');
 
         let (ack, ack_rx) = oneshot::channel();
@@ -158,7 +176,7 @@ impl JournalRecorder {
             .map_err(|e| io::Error::other(format!("journal writer dropped ack: {e}")))?
     }
 
-    /// Flush any buffered bytes to disk. Redundant with the per-line flush, but
+    /// Sync any buffered bytes to disk. Redundant with the per-line sync, but
     /// mirrors the rollout API and provides an explicit barrier.
     pub async fn flush(&self) -> io::Result<()> {
         let (ack, ack_rx) = oneshot::channel();
@@ -199,6 +217,19 @@ impl JournalRecorder {
     }
 }
 
+fn ensure_record_within_bounds(record: &str) -> io::Result<()> {
+    if record.len() > crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workflow journal record exceeds the {}-byte cap",
+                crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Stamp a host-side timestamp on a line that lacks one; preserve any existing
 /// (already host-supplied) timestamp untouched.
 fn stamp_timestamp_if_absent(line: &mut JournalLine) {
@@ -206,6 +237,11 @@ fn stamp_timestamp_if_absent(line: &mut JournalLine) {
         JournalLine::AgentCall(call) => {
             if call.timestamp.is_none() {
                 call.timestamp = Some(host_timestamp());
+            }
+        }
+        JournalLine::AgentBound(bound) => {
+            if bound.timestamp.is_none() {
+                bound.timestamp = Some(host_timestamp());
             }
         }
         JournalLine::Phase(phase) => {
@@ -232,62 +268,257 @@ fn host_timestamp() -> String {
 /// The background writer loop: owns the open file and serializes every append,
 /// flush, and shutdown through a single task. Mirrors `rollout_writer`
 /// (`recorder.rs:1726`).
-async fn journal_writer(mut file: tokio::fs::File, mut rx: mpsc::Receiver<JournalCmd>) {
+async fn journal_writer(
+    mut file: tokio::fs::File,
+    mut journal_len: u64,
+    mut journal_record_count: usize,
+    mut rx: mpsc::Receiver<JournalCmd>,
+) {
     while let Some(cmd) = rx.recv().await {
         match cmd {
             JournalCmd::Append { line, ack } => {
-                let _ = ack.send(write_line(&mut file, line.as_bytes()).await);
+                let result = write_line(
+                    &mut file,
+                    &mut journal_len,
+                    &mut journal_record_count,
+                    line.as_bytes(),
+                )
+                .await;
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
+                    break;
+                }
             }
             JournalCmd::Flush { ack } => {
-                let _ = ack.send(file.flush().await);
+                let result = sync_file_data(&mut file).await;
+                let failed = result.is_err();
+                let _ = ack.send(result);
+                if failed {
+                    break;
+                }
             }
             JournalCmd::Shutdown { ack } => {
-                let _ = ack.send(file.flush().await);
+                let _ = ack.send(sync_file_data(&mut file).await);
                 break;
             }
         }
     }
 }
 
-/// Write one already-newline-terminated line and flush it to disk. Mirrors
+/// Write one already-newline-terminated line and sync it to disk. Mirrors
 /// `JsonlWriter::write_line` (`recorder.rs:1869`).
-async fn write_line(file: &mut tokio::fs::File, bytes: &[u8]) -> io::Result<()> {
+async fn write_line(
+    file: &mut tokio::fs::File,
+    journal_len: &mut u64,
+    journal_record_count: &mut usize,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let next_record_count = journal_record_count
+        .checked_add(1)
+        .filter(|count| *count <= crate::WORKFLOW_JOURNAL_MAX_RECORDS)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "workflow journal exceeds the {}-record cap",
+                    crate::WORKFLOW_JOURNAL_MAX_RECORDS
+                ),
+            )
+        })?;
+    let next_len = journal_len
+        .checked_add(bytes.len() as u64)
+        .filter(|len| *len <= crate::WORKFLOW_JOURNAL_MAX_BYTES)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "workflow journal exceeds the {}-byte run cap",
+                    crate::WORKFLOW_JOURNAL_MAX_BYTES
+                ),
+            )
+        })?;
     file.write_all(bytes).await?;
-    file.flush().await?;
+    sync_file_data(file).await?;
+    *journal_len = next_len;
+    *journal_record_count = next_record_count;
     Ok(())
 }
 
-/// Open the journal for append (creating it if missing) and repair it to end in
-/// a newline. The file is opened with `O_APPEND`, so every write lands at the
-/// end regardless of the seek used for the newline check. Mirrors
-/// `open_rollout_for_append` + `ensure_rollout_is_newline_terminated`
-/// (`recorder.rs:1802,1821`).
+/// Count and validate existing nonblank records before reopening the append writer.
+///
+/// The replay reader enforces the same record, per-line, and total-byte limits. Recounting on
+/// reopen keeps crash recovery from bypassing the writer-side count admission without holding the
+/// full journal in memory.
+async fn count_journal_records(file: &mut tokio::fs::File) -> io::Result<usize> {
+    file.seek(SeekFrom::Start(0)).await?;
+    let mut chunk = [0u8; 8 * 1024];
+    let mut count = 0usize;
+    let mut record_len = 0usize;
+    let mut record_nonblank = false;
+
+    loop {
+        let read = file.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        for byte in &chunk[..read] {
+            if *byte == b'\n' {
+                if record_nonblank {
+                    count = count.checked_add(1).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "workflow journal record count overflow",
+                        )
+                    })?;
+                    ensure_record_count_within_bounds(count)?;
+                }
+                record_len = 0;
+                record_nonblank = false;
+                continue;
+            }
+
+            record_len = record_len.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow journal record length overflow",
+                )
+            })?;
+            if record_len > crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "workflow journal record exceeds the {}-byte cap",
+                        crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES
+                    ),
+                ));
+            }
+            record_nonblank |= !byte.is_ascii_whitespace();
+        }
+    }
+
+    if record_nonblank {
+        count = count.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow journal record count overflow",
+            )
+        })?;
+        ensure_record_count_within_bounds(count)?;
+    }
+    file.seek(SeekFrom::End(0)).await?;
+    Ok(count)
+}
+
+fn ensure_record_count_within_bounds(count: usize) -> io::Result<()> {
+    if count > crate::WORKFLOW_JOURNAL_MAX_RECORDS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workflow journal exceeds the {}-record cap",
+                crate::WORKFLOW_JOURNAL_MAX_RECORDS
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn sync_file_data(file: &mut tokio::fs::File) -> io::Result<()> {
+    file.flush().await?;
+    file.sync_data().await
+}
+
+/// Open the journal for append (creating it if missing) and repair any crash
+/// tail. The file is opened with `O_APPEND`, so every write lands at the end
+/// regardless of the seeks used while inspecting the tail.
 async fn open_journal_for_append(path: &std::path::Path) -> io::Result<tokio::fs::File> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(true)
-        .open(path)
-        .await?;
-    ensure_newline_terminated(&mut file).await?;
+    let file = crate::private_fs::open_private_for_append(path)?;
+    let mut file = tokio::fs::File::from_std(file);
+    repair_crash_tail(&mut file).await?;
     Ok(file)
 }
 
-/// If the file is non-empty and does not already end in `\n`, append one so a
-/// crash-truncated trailing line can never fuse with the next record. Mirrors
-/// `ensure_rollout_is_newline_terminated` (`recorder.rs:1821`).
-async fn ensure_newline_terminated(file: &mut tokio::fs::File) -> io::Result<()> {
+/// Repair a final record without a newline before the writer starts appending.
+///
+/// A complete, structurally valid record is preserved and terminated. A suffix
+/// that cannot parse as a journal record is a torn crash append and is removed
+/// back to the preceding newline. Parsed metadata or structurally invalid body
+/// records are corruption rather than partial appends and fail closed.
+async fn repair_crash_tail(file: &mut tokio::fs::File) -> io::Result<()> {
     let len = file.metadata().await?.len();
+    if len > crate::WORKFLOW_JOURNAL_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workflow journal exceeds the {}-byte run cap",
+                crate::WORKFLOW_JOURNAL_MAX_BYTES
+            ),
+        ));
+    }
     if len == 0 {
         return Ok(());
     }
     file.seek(SeekFrom::End(-1)).await?;
     let mut last = [0u8; 1];
     file.read_exact(&mut last).await?;
-    if last[0] != b'\n' {
-        file.write_all(b"\n").await?;
-        file.flush().await?;
+    if last[0] == b'\n' {
+        return Ok(());
     }
+
+    let max_tail_bytes = crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES as u64 + 1;
+    let tail_window_len = len.min(max_tail_bytes);
+    let tail_window_start = len - tail_window_len;
+    file.seek(SeekFrom::Start(tail_window_start)).await?;
+    let mut tail_window = vec![0; tail_window_len as usize];
+    file.read_exact(&mut tail_window).await?;
+    let Some(relative_record_start) = tail_window.iter().rposition(|byte| *byte == b'\n') else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workflow journal record exceeds the {}-byte cap",
+                crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES
+            ),
+        ));
+    };
+    let record_start = tail_window_start + relative_record_start as u64 + 1;
+    let record = &tail_window[relative_record_start + 1..];
+
+    if let Ok(line) = serde_json::from_slice::<JournalLine>(record) {
+        line.validate()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if len == crate::WORKFLOW_JOURNAL_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workflow journal has no room for crash-tail repair",
+            ));
+        }
+        file.write_all(b"\n").await?;
+    } else if serde_json::from_slice::<WorkflowRunMeta>(record).is_ok() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "workflow journal contains more than one run_meta record",
+        ));
+    } else {
+        match serde_json::from_slice::<serde_json::Value>(record) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow journal contains an unrecognized complete final record",
+                ));
+            }
+            Err(error) if error.is_eof() => {
+                file.set_len(record_start).await?;
+                file.seek(SeekFrom::End(0)).await?;
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow journal contains a malformed final record",
+                ));
+            }
+        }
+    }
+    sync_file_data(file).await?;
     Ok(())
 }
 
@@ -311,7 +542,7 @@ mod tests {
             "blake3:script".to_string(),
             "blake3:args".to_string(),
             "triage".to_string(),
-            500_000,
+            Some(500_000),
             1,
             "2026-07-17T00:00:00Z".to_string(),
         )
@@ -321,6 +552,7 @@ mod tests {
         AgentCallLine {
             timestamp: None,
             ordinal,
+            attempt: 0,
             key: format!("blake3:k{ordinal}"),
             prompt_hash: "ph".to_string(),
             opts: AgentCallOpts {
@@ -335,8 +567,10 @@ mod tests {
             child_thread_id: Some(format!("th_{ordinal}")),
             rollout_path: Some(format!("/home/u/.codex/sessions/rollout-{ordinal}.jsonl")),
             status: Some(AgentStatus::Completed),
+            control_reason: None,
             ret: json!({"ok": true, "n": ordinal}),
             tokens_spent: Some(1000 + ordinal),
+            progress: None,
             completion_seq: None,
         }
     }
@@ -400,6 +634,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopening_rejects_a_journal_over_the_record_cap() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = mint_run_id();
+        let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+        let meta = sample_meta(&run_id);
+        JournalRecorder::new(&paths, &meta)
+            .await
+            .expect("create journal")
+            .shutdown()
+            .await
+            .expect("shutdown journal");
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.journal())
+            .expect("open journal for raw append");
+        let extra_records = "{}\n".repeat(crate::WORKFLOW_JOURNAL_MAX_RECORDS);
+        file.write_all(extra_records.as_bytes())
+            .expect("write over-cap record set");
+        file.sync_all().expect("sync over-cap record set");
+
+        let Err(error) = JournalRecorder::new(&paths, &meta).await else {
+            panic!("over-cap journal must not reopen");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "workflow journal exceeds the {}-record cap",
+                crate::WORKFLOW_JOURNAL_MAX_RECORDS
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn reopening_accepts_a_journal_at_the_record_cap() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = mint_run_id();
+        let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+        let meta = sample_meta(&run_id);
+        JournalRecorder::new(&paths, &meta)
+            .await
+            .expect("create journal")
+            .shutdown()
+            .await
+            .expect("shutdown journal");
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.journal())
+            .expect("open journal for raw append");
+        let extra_records = "{}\n".repeat(crate::WORKFLOW_JOURNAL_MAX_RECORDS - 1);
+        file.write_all(extra_records.as_bytes())
+            .expect("write records through cap");
+        file.sync_all().expect("sync records through cap");
+
+        JournalRecorder::new(&paths, &meta)
+            .await
+            .expect("journal at cap reopens")
+            .shutdown()
+            .await
+            .expect("shutdown journal at cap");
+    }
+
+    #[tokio::test]
+    async fn append_accepts_the_record_at_the_count_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("journal.jsonl");
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .expect("create journal");
+        let mut journal_len = 0;
+        let mut record_count = crate::WORKFLOW_JOURNAL_MAX_RECORDS - 1;
+
+        write_line(&mut file, &mut journal_len, &mut record_count, b"{}\n")
+            .await
+            .expect("record at cap must succeed");
+
+        assert_eq!(journal_len, 3);
+        assert_eq!(record_count, crate::WORKFLOW_JOURNAL_MAX_RECORDS);
+        assert_eq!(file.metadata().await.expect("journal metadata").len(), 3);
+    }
+
+    #[tokio::test]
+    async fn append_rejects_the_record_after_the_count_cap_without_writing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("journal.jsonl");
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .expect("create journal");
+        let mut journal_len = 0;
+        let mut record_count = crate::WORKFLOW_JOURNAL_MAX_RECORDS;
+
+        let error = write_line(&mut file, &mut journal_len, &mut record_count, b"{}\n")
+            .await
+            .expect_err("record past cap must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(journal_len, 0);
+        assert_eq!(record_count, crate::WORKFLOW_JOURNAL_MAX_RECORDS);
+        assert_eq!(file.metadata().await.expect("journal metadata").len(), 0);
+    }
+
+    #[tokio::test]
     async fn appends_land_in_order_newline_terminated() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run_id = mint_run_id();
@@ -451,11 +793,47 @@ mod tests {
         for line in &rest {
             let has_ts = match line {
                 JournalLine::AgentCall(c) => c.timestamp.is_some(),
+                JournalLine::AgentBound(bound) => bound.timestamp.is_some(),
                 JournalLine::Phase(p) => p.timestamp.is_some(),
                 JournalLine::Log(l) => l.timestamp.is_some(),
             };
             assert!(has_ts, "recorder stamps a host timestamp");
         }
+    }
+
+    #[tokio::test]
+    async fn agent_binding_is_flushed_before_a_terminal_call() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = mint_run_id();
+        let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+        let recorder = JournalRecorder::new(&paths, &sample_meta(&run_id))
+            .await
+            .expect("new");
+        let child_thread_id = uuid::Uuid::now_v7().to_string();
+        let rollout_path = tmp.path().join("rollout.jsonl");
+
+        recorder
+            .record_agent_bound(AgentBoundLine {
+                timestamp: None,
+                ordinal: 0,
+                attempt: 0,
+                child_thread_id: child_thread_id.clone(),
+                rollout_path: rollout_path.display().to_string(),
+            })
+            .await
+            .expect("binding append");
+        let mut completed = completed_agent_call(0);
+        completed.child_thread_id = Some(child_thread_id);
+        completed.rollout_path = Some(rollout_path.display().to_string());
+        recorder
+            .record_agent_call(completed)
+            .await
+            .expect("terminal append");
+        recorder.shutdown().await.expect("shutdown");
+
+        let (_, lines) = read_journal(&paths.journal());
+        assert!(matches!(lines[0], JournalLine::AgentBound(_)));
+        assert!(matches!(lines[1], JournalLine::AgentCall(_)));
     }
 
     #[tokio::test]
@@ -539,6 +917,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_rejects_an_oversized_serialized_record_without_writing_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = mint_run_id();
+        let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+        let recorder = JournalRecorder::new(&paths, &sample_meta(&run_id))
+            .await
+            .expect("new");
+
+        let before = std::fs::metadata(paths.journal()).expect("metadata").len();
+        let error = recorder
+            .record_log(LogLine {
+                timestamp: None,
+                ordinal: NullOrdinal,
+                message: "x".repeat(crate::WORKFLOW_JOURNAL_RECORD_MAX_BYTES),
+            })
+            .await
+            .expect_err("oversized record must reject");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            std::fs::metadata(paths.journal()).expect("metadata").len(),
+            before
+        );
+        recorder.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn reopening_rejects_a_journal_over_the_run_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = mint_run_id();
+        let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+        paths.create_dir().expect("mkdir");
+        let file = std::fs::File::create(paths.journal()).expect("create sparse journal");
+        file.set_len(crate::WORKFLOW_JOURNAL_MAX_BYTES + 1)
+            .expect("set sparse length");
+
+        let error = JournalRecorder::new(&paths, &sample_meta(&run_id))
+            .await
+            .err()
+            .expect("oversized journal must reject");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
     async fn flush_and_shutdown_are_durable_and_idempotent() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let run_id = mint_run_id();
@@ -555,9 +976,13 @@ mod tests {
             })
             .await
             .expect("append");
+        // The append acknowledgement itself is the durability boundary; no
+        // explicit flush or shutdown is needed before the complete line is visible.
+        let (_, appended) = read_journal(&paths.journal());
+        assert_eq!(appended.len(), 1);
         recorder.flush().await.expect("flush");
 
-        // After flush the line is already readable on disk.
+        // The explicit sync barrier preserves the same complete journal.
         let (_, rest) = read_journal(&paths.journal());
         assert_eq!(rest.len(), 1);
 
@@ -580,8 +1005,8 @@ mod tests {
         seed.push_str(r#"{"type":"log","ordinal":null,"message":"torn"#);
         std::fs::write(paths.journal(), &seed).expect("seed");
 
-        // Reopening must repair the missing newline before appending, so the new
-        // line does not fuse onto the torn one.
+        // Reopening must remove the incomplete record before appending, so it
+        // cannot be promoted into durable newline-terminated corruption.
         let recorder = JournalRecorder::new(&paths, &meta).await.expect("reopen");
         recorder
             .record_log(LogLine {
@@ -602,9 +1027,86 @@ mod tests {
             JournalLine::Log(l) => assert_eq!(l.message, "after recovery"),
             other => panic!("expected log, got {other:?}"),
         }
-        // The torn line is preserved verbatim on its own line (not fused).
-        let torn = text.lines().nth(1).expect("torn line");
-        assert_eq!(torn, r#"{"type":"log","ordinal":null,"message":"torn"#);
+        assert_eq!(text.lines().count(), 2, "the torn record was truncated");
+        assert!(!text.contains("torn"));
+    }
+
+    #[tokio::test]
+    async fn reopening_preserves_a_complete_record_missing_only_its_newline() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let run_id = mint_run_id();
+        let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+        paths.create_dir().expect("mkdir");
+        let meta = sample_meta(&run_id);
+        let final_line = JournalLine::Log(LogLine {
+            timestamp: None,
+            ordinal: NullOrdinal,
+            message: "complete before crash".to_string(),
+        });
+        let seed = format!(
+            "{}\n{}",
+            serde_json::to_string(&meta).expect("meta"),
+            serde_json::to_string(&final_line).expect("final line"),
+        );
+        std::fs::write(paths.journal(), seed).expect("seed");
+
+        let recorder = JournalRecorder::new(&paths, &meta).await.expect("reopen");
+        recorder.shutdown().await.expect("shutdown");
+
+        let (_, lines) = read_journal(&paths.journal());
+        assert_eq!(lines, vec![final_line]);
+    }
+
+    #[tokio::test]
+    async fn reopening_rejects_complete_unrecognized_final_json_without_modifying_it() {
+        for tail in [r#"{"type":"future_record"}"#, r#"{"type":"log"}"#] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let run_id = mint_run_id();
+            let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+            paths.create_dir().expect("mkdir");
+            let meta = sample_meta(&run_id);
+            let seed = format!(
+                "{}\n{tail}",
+                serde_json::to_string(&meta).expect("serialize metadata")
+            );
+            std::fs::write(paths.journal(), &seed).expect("seed journal");
+
+            let Err(error) = JournalRecorder::new(&paths, &meta).await else {
+                panic!("complete unknown final record must not be truncated");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("complete final record"));
+            assert_eq!(
+                std::fs::read(paths.journal()).expect("read unchanged journal"),
+                seed.as_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reopening_rejects_non_eof_invalid_final_json_without_modifying_it() {
+        for tail in ["garbage", "{]"] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let run_id = mint_run_id();
+            let paths = WorkflowRunPaths::new(tmp.path(), &run_id);
+            paths.create_dir().expect("mkdir");
+            let meta = sample_meta(&run_id);
+            let seed = format!(
+                "{}\n{tail}",
+                serde_json::to_string(&meta).expect("serialize metadata")
+            );
+            std::fs::write(paths.journal(), &seed).expect("seed journal");
+
+            let Err(error) = JournalRecorder::new(&paths, &meta).await else {
+                panic!("malformed final record must not be truncated");
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("malformed final record"));
+            assert_eq!(
+                std::fs::read(paths.journal()).expect("read unchanged journal"),
+                seed.as_bytes()
+            );
+        }
     }
 
     #[tokio::test]

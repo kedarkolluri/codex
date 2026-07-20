@@ -2893,6 +2893,44 @@ async fn experimental_features_popup_snapshot() {
     assert_chatwidget_snapshot!("experimental_features_popup", popup);
 }
 
+fn open_experimental_popup_with_workflow_selected(chat: &mut ChatWidget) {
+    let workflow_index = FEATURES
+        .iter()
+        .filter(|spec| spec.stage.experimental_menu_name().is_some())
+        .position(|spec| spec.id == Feature::Workflow)
+        .expect("workflow should appear in /experimental");
+    chat.open_experimental_popup();
+    for _ in 0..workflow_index {
+        chat.handle_key_event(KeyEvent::from(KeyCode::Down));
+    }
+}
+
+#[tokio::test]
+async fn experimental_popup_shows_pending_workflow_enable_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    assert!(!chat.config.features.enabled(Feature::Workflow));
+    chat.set_workflow_feature_configured_enabled(/*enabled*/ true);
+
+    open_experimental_popup_with_workflow_selected(&mut chat);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("[x] Dynamic workflows"));
+    assert_chatwidget_snapshot!("experimental_popup_workflow_pending_enable", popup);
+}
+
+#[tokio::test]
+async fn experimental_popup_shows_pending_workflow_disable_snapshot() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.set_feature_enabled(Feature::Workflow, /*enabled*/ true);
+    chat.set_workflow_feature_configured_enabled(/*enabled*/ false);
+
+    open_experimental_popup_with_workflow_selected(&mut chat);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 100);
+    assert!(popup.contains("[ ] Dynamic workflows"));
+    assert_chatwidget_snapshot!("experimental_popup_workflow_pending_disable", popup);
+}
+
 #[tokio::test]
 async fn experimental_features_toggle_saves_on_exit() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;

@@ -28,8 +28,13 @@ use codex_code_mode::ToolDefinition;
 use codex_code_mode::ToolInvocationFuture;
 use codex_code_mode::WaitOutcome;
 use codex_code_mode::WaitRequest;
+use codex_code_mode::WorkflowBudgetSnapshot;
+use codex_code_mode::WorkflowBudgetSnapshotFuture;
+use codex_code_mode::WorkflowHostCompletion;
+use codex_code_mode::WorkflowHostProgress;
 use codex_code_mode::host::MAX_FRAME_BYTES;
 use codex_protocol::ToolName;
+use codex_protocol::protocol::WorkflowEvent;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
 use serde_json::json;
@@ -220,6 +225,8 @@ fn execute_request(source: &str) -> ExecuteRequest {
         workflow: false,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 
@@ -891,9 +898,14 @@ struct SpawningDelegate {
     spawn_calls: AtomicUsize,
     barrier: Option<Arc<Barrier>>,
     seen_ordinals: Mutex<Vec<u64>>,
+    seen_topology: Mutex<Vec<(u64, Option<u64>, Option<String>, u64)>>,
     seen_schema_ordinals: Mutex<Vec<u64>>,
     workflow_calls: AtomicUsize,
     seen_workflow_names: Mutex<Vec<String>>,
+    phases: Mutex<Vec<(CellId, String)>>,
+    logs: Mutex<Vec<(CellId, String)>>,
+    replayed_agents: Mutex<Vec<(CellId, JsonValue)>>,
+    progress: Mutex<Vec<(CellId, WorkflowHostProgress)>>,
 }
 
 impl SpawningDelegate {
@@ -902,9 +914,14 @@ impl SpawningDelegate {
             spawn_calls: AtomicUsize::new(0),
             barrier: None,
             seen_ordinals: Mutex::new(Vec::new()),
+            seen_topology: Mutex::new(Vec::new()),
             seen_schema_ordinals: Mutex::new(Vec::new()),
             workflow_calls: AtomicUsize::new(0),
             seen_workflow_names: Mutex::new(Vec::new()),
+            phases: Mutex::new(Vec::new()),
+            logs: Mutex::new(Vec::new()),
+            replayed_agents: Mutex::new(Vec::new()),
+            progress: Mutex::new(Vec::new()),
         }
     }
 
@@ -920,6 +937,10 @@ impl SpawningDelegate {
 
     fn seen_ordinals(&self) -> Vec<u64> {
         self.seen_ordinals.lock().expect("ordinals lock").clone()
+    }
+
+    fn seen_topology(&self) -> Vec<(u64, Option<u64>, Option<String>, u64)> {
+        self.seen_topology.lock().expect("topology lock").clone()
     }
 
     fn seen_schema_ordinals(&self) -> Vec<u64> {
@@ -938,6 +959,25 @@ impl SpawningDelegate {
             .lock()
             .expect("workflow names lock")
             .clone()
+    }
+
+    fn phases(&self) -> Vec<(CellId, String)> {
+        self.phases.lock().expect("phases lock").clone()
+    }
+
+    fn logs(&self) -> Vec<(CellId, String)> {
+        self.logs.lock().expect("logs lock").clone()
+    }
+
+    fn replayed_agents(&self) -> Vec<(CellId, JsonValue)> {
+        self.replayed_agents
+            .lock()
+            .expect("replayed agents lock")
+            .clone()
+    }
+
+    fn progress(&self) -> Vec<(CellId, WorkflowHostProgress)> {
+        self.progress.lock().expect("progress lock").clone()
     }
 }
 
@@ -963,6 +1003,9 @@ impl CodeModeSessionDelegate for SpawningDelegate {
     fn spawn_agent<'a>(
         &'a self,
         _cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: AgentCallOpts,
@@ -973,6 +1016,12 @@ impl CodeModeSessionDelegate for SpawningDelegate {
             .lock()
             .expect("ordinals lock")
             .push(ordinal);
+        self.seen_topology.lock().expect("topology lock").push((
+            node_id,
+            parent_node_id,
+            phase,
+            ordinal,
+        ));
         // Prove `opts.schema` was forwarded across the wire (not dropped by the bridge).
         let has_schema = opts.schema.is_some();
         if has_schema {
@@ -1039,6 +1088,135 @@ impl CodeModeSessionDelegate for SpawningDelegate {
         })
     }
 
+    fn workflow_budget_snapshot<'a>(
+        &'a self,
+        _cell_id: CellId,
+    ) -> WorkflowBudgetSnapshotFuture<'a> {
+        let spent = (self.spawn_calls() as u64).saturating_mul(40).min(100);
+        Box::pin(async move {
+            Ok(Some(WorkflowBudgetSnapshot {
+                total: Some(100),
+                spent,
+                remaining: Some(100 - spent),
+            }))
+        })
+    }
+
+    fn journal_phase<'a>(&'a self, cell_id: CellId, title: String) -> NotificationFuture<'a> {
+        self.phases
+            .lock()
+            .expect("phases lock")
+            .push((cell_id, title));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn journal_log<'a>(&'a self, cell_id: CellId, message: String) -> NotificationFuture<'a> {
+        self.logs
+            .lock()
+            .expect("logs lock")
+            .push((cell_id, message));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn replay_agent<'a>(
+        &'a self,
+        cell_id: CellId,
+        _node_id: u64,
+        _parent_node_id: Option<u64>,
+        _phase: Option<String>,
+        entry: JsonValue,
+    ) -> NotificationFuture<'a> {
+        self.replayed_agents
+            .lock()
+            .expect("replayed agents lock")
+            .push((cell_id, entry));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn workflow_progress<'a>(
+        &'a self,
+        cell_id: CellId,
+        progress: WorkflowHostProgress,
+    ) -> NotificationFuture<'a> {
+        self.progress
+            .lock()
+            .expect("progress lock")
+            .push((cell_id, progress));
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+struct RejectingReplayDelegate;
+
+const RAW_PHASE_JOURNAL_ERROR: &str =
+    "phase journal write failed at /host/private/workflows/run/journal.jsonl";
+const RAW_LOG_JOURNAL_ERROR: &str =
+    "log journal write failed at /host/private/workflows/run/journal.jsonl";
+
+struct RejectingJournalDelegate;
+
+impl CodeModeSessionDelegate for RejectingJournalDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async { Err("unexpected tool call".to_string()) })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn journal_phase<'a>(&'a self, _cell_id: CellId, _title: String) -> NotificationFuture<'a> {
+        Box::pin(async { Err(RAW_PHASE_JOURNAL_ERROR.to_string()) })
+    }
+
+    fn journal_log<'a>(&'a self, _cell_id: CellId, _message: String) -> NotificationFuture<'a> {
+        Box::pin(async { Err(RAW_LOG_JOURNAL_ERROR.to_string()) })
+    }
+
+    fn cell_closed(&self, _cell_id: &CellId) {}
+}
+
+impl CodeModeSessionDelegate for RejectingReplayDelegate {
+    fn invoke_tool<'a>(
+        &'a self,
+        _invocation: CodeModeNestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> ToolInvocationFuture<'a> {
+        Box::pin(async { Err("unexpected tool call".to_string()) })
+    }
+
+    fn notify<'a>(
+        &'a self,
+        _call_id: String,
+        _cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn replay_agent<'a>(
+        &'a self,
+        _cell_id: CellId,
+        _node_id: u64,
+        _parent_node_id: Option<u64>,
+        _phase: Option<String>,
+        _entry: JsonValue,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async { Err("replay accounting unavailable".to_string()) })
+    }
+
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
@@ -1047,6 +1225,7 @@ fn workflow_request(source: &str) -> ExecuteRequest {
     // Workflow mode installs the `agent()` global; a large yield window lets the cell run straight to
     // its terminal `Result` (the `agent()` promises resolve promptly).
     request.workflow = true;
+    request.run_id = Some("remote-run".to_string());
     request.yield_time_ms = Some(60_000);
     request
 }
@@ -1068,6 +1247,252 @@ fn result_texts(response: &RuntimeResponse) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+/// The process host observes the same initial and post-agent budget values as
+/// the in-process host, proving the snapshot refresh crosses stdio before the
+/// `agent()` promise settles.
+#[tokio::test]
+async fn remote_workflow_budget_refreshes_after_agent_over_stdio() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(SpawningDelegate::new());
+    let session = provider
+        .create_session(delegate)
+        .await
+        .expect("create remote session");
+    let source = r#"
+text(String(budget.spent()));
+text(String(budget.remaining()));
+await agent("p");
+text(String(budget.spent()));
+text(String(budget.remaining()));
+"#;
+    let mut request = workflow_request(source);
+    request.workflow_budget = Some(WorkflowBudgetSnapshot {
+        total: Some(100),
+        spent: 0,
+        remaining: Some(100),
+    });
+
+    let response = tokio::time::timeout(Duration::from_secs(30), execute(&session, request))
+        .await
+        .expect("workflow completed before timeout");
+    assert_eq!(
+        result_texts(&response),
+        vec![
+            "0".to_string(),
+            "100".to_string(),
+            "40".to_string(),
+            "60".to_string(),
+        ]
+    );
+    session.shutdown().await.expect("shutdown remote session");
+}
+
+fn replay_entry() -> JsonValue {
+    // These hashes are the workflow-journal v1 KeyInputs key and prompt hash for
+    // the default-opts prompt `cached`. Keeping the wire fixture explicit makes
+    // these tests independent of a test-only dependency on the journal crate.
+    json!({
+        "ordinal": 0,
+        "key": "blake3:991de39fb811986852f1ef2869b7957b2d33159ea3b6a33dc6154c0631b9c7d9",
+        "prompt_hash": "blake3:3f6ad07bbbec251dcafac8f42b026b6dae9a44dd81f9d01d115a3e42891cf234",
+        "opts": {
+            "model": null,
+            "effort": null,
+            "agentType": null,
+            "isolation": null,
+            "schema_hash": null
+        },
+        "phase": null,
+        "label": null,
+        "child_thread_id": "prior-thread",
+        "rollout_path": "/prior/rollout.jsonl",
+        "status": "completed",
+        "return": "cached-answer",
+        "tokens_spent": 17,
+        "completion_seq": 0
+    })
+}
+
+/// Process-owned workflow execution must carry the replay seed to the host
+/// before the isolate starts, then route narration and the replay-accounting
+/// callback back to the client-owned delegate. This is the full stdio proof for
+/// the callbacks that cannot be represented by an in-process-only handle.
+#[tokio::test]
+async fn remote_workflow_replays_and_journals_over_the_wire() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(SpawningDelegate::new());
+    let session = provider
+        .create_session(delegate.clone())
+        .await
+        .expect("create remote session");
+
+    let replay_entry = replay_entry();
+    let source = r#"
+phase("resume");
+log("using cache");
+text(String(await agent("cached")));
+"#;
+    let mut request = workflow_request(source);
+    request.replay_entries = vec![replay_entry.clone()];
+    let response = tokio::time::timeout(Duration::from_secs(30), execute(&session, request))
+        .await
+        .expect("workflow completed before timeout");
+
+    assert_eq!(result_texts(&response), vec!["cached-answer".to_string()]);
+    assert_eq!(delegate.spawn_calls(), 0, "replay must not spawn a child");
+    let RuntimeResponse::Result { cell_id: cell, .. } = &response else {
+        panic!("expected terminal Result, got {response:?}");
+    };
+    let cell = cell.clone();
+    assert_eq!(
+        delegate.phases(),
+        vec![(cell.clone(), "resume".to_string())]
+    );
+    assert_eq!(
+        delegate.logs(),
+        vec![(cell.clone(), "using cache".to_string())]
+    );
+    assert_eq!(delegate.replayed_agents(), vec![(cell, replay_entry)]);
+    assert!(matches!(
+        delegate.progress().as_slice(),
+        [
+            (_, WorkflowHostProgress::Event { event: phase_begin }),
+            (_, WorkflowHostProgress::Event { event: log }),
+            (_, WorkflowHostProgress::Event { event: phase_end }),
+            (
+                _,
+                WorkflowHostProgress::Complete {
+                    status: WorkflowHostCompletion::Completed
+                }
+            ),
+        ] if matches!(phase_begin.as_ref(), WorkflowEvent::PhaseBegin(_))
+            && matches!(log.as_ref(), WorkflowEvent::Log(_))
+            && matches!(phase_end.as_ref(), WorkflowEvent::PhaseEnd(_))
+    ));
+
+    session.shutdown().await.expect("shutdown remote session");
+}
+
+#[tokio::test]
+async fn remote_replay_acknowledgement_failure_rejects_cached_result_over_stdio() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let session = provider
+        .create_session(Arc::new(RejectingReplayDelegate))
+        .await
+        .expect("create remote session");
+    let mut request = workflow_request(r#"text(String(await agent("cached")));"#);
+    request.replay_entries = vec![replay_entry()];
+
+    let response = tokio::time::timeout(Duration::from_secs(30), execute(&session, request))
+        .await
+        .expect("workflow completed before timeout");
+    let RuntimeResponse::Result {
+        content_items,
+        error_text,
+        ..
+    } = response
+    else {
+        panic!("expected terminal Result, got {response:?}");
+    };
+    assert_eq!(content_items, Vec::new());
+    assert_eq!(
+        error_text,
+        Some("workflow journal is unavailable".to_string())
+    );
+
+    session.shutdown().await.expect("shutdown remote session");
+}
+
+#[tokio::test]
+async fn remote_journal_acknowledgement_failures_stop_workflows_without_leaking_host_details() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let session = provider
+        .create_session(Arc::new(RejectingJournalDelegate))
+        .await
+        .expect("create remote session");
+
+    for (cell, source, raw_error) in [
+        (
+            "1",
+            r#"phase("persist me"); text("must not escape");"#,
+            RAW_PHASE_JOURNAL_ERROR,
+        ),
+        (
+            "2",
+            r#"log("persist me"); text("must not escape");"#,
+            RAW_LOG_JOURNAL_ERROR,
+        ),
+    ] {
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            execute(&session, workflow_request(source)),
+        )
+        .await
+        .expect("workflow completed before timeout");
+
+        assert!(!format!("{response:?}").contains(raw_error));
+        assert_eq!(
+            response,
+            RuntimeResponse::Result {
+                cell_id: cell_id(cell),
+                content_items: Vec::new(),
+                error_text: Some("workflow journal is unavailable".to_string()),
+            }
+        );
+    }
+
+    // The first failed acknowledgement must not poison the process-host connection; the second
+    // callback and orderly session shutdown travel over the same stdio channel.
+    session.shutdown().await.expect("shutdown remote session");
+}
+
+#[tokio::test]
+async fn remote_workflow_error_reports_terminal_progress_over_the_wire() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let delegate = Arc::new(SpawningDelegate::new());
+    let session = provider
+        .create_session(delegate.clone())
+        .await
+        .expect("create remote session");
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(30),
+        execute(
+            &session,
+            workflow_request("throw new Error('remote boom');"),
+        ),
+    )
+    .await
+    .expect("workflow completed before timeout");
+    let RuntimeResponse::Result { error_text, .. } = response else {
+        panic!("expected terminal workflow result");
+    };
+    assert!(
+        error_text
+            .as_deref()
+            .is_some_and(|error| error.contains("remote boom")),
+        "unexpected runtime error: {error_text:?}"
+    );
+    assert!(matches!(
+        delegate.progress().last(),
+        Some((_, WorkflowHostProgress::Complete {
+            status: WorkflowHostCompletion::Errored(error),
+        })) if error.contains("remote boom")
+    ));
+
+    session.shutdown().await.expect("shutdown remote session");
 }
 
 /// The real process-host bridge round-trips all three `AgentSpawnOutcome` variants end-to-end: a
@@ -1147,9 +1572,10 @@ text(typeof structured + ":" + structured.answer + ":" + structured.score);
     );
 }
 
-/// 16 concurrent `agent()` calls in one `Promise.all` each cross the real host bridge and resolve by
-/// id independently: the client-side barrier only fills if all 16 wire round-trips are in flight at
-/// once, so nothing serializes them, and `Promise.all` preserves input order.
+/// 16 concurrent `agent()` calls in one `parallel()` group each cross the real host bridge with
+/// their source-ordered node ID and explicit group parent, then resolve by id independently. The
+/// client-side barrier only fills if all 16 wire round-trips are in flight at once, so nothing
+/// serializes them, and `parallel()` preserves input order.
 #[tokio::test]
 async fn remote_sixteen_concurrent_agents_resolve_by_id_without_serialization() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
@@ -1162,8 +1588,8 @@ async fn remote_sixteen_concurrent_agents_resolve_by_id_without_serialization() 
         .expect("create remote session");
 
     let source = r#"
-const results = await Promise.all(
-  Array.from({ length: 16 }, (_, i) => agent("a" + i)),
+const results = await parallel(
+  Array.from({ length: 16 }, (_, i) => () => agent("a" + i)),
 );
 text(results.join(","));
 "#;
@@ -1191,6 +1617,13 @@ text(results.join(","));
         ordinals.len(),
         16,
         "each of the 16 agent() calls carried a distinct ordinal"
+    );
+    assert_eq!(
+        delegate.seen_topology(),
+        (0..16)
+            .map(|ordinal| (ordinal + 1, Some(0), None, ordinal))
+            .collect::<Vec<_>>(),
+        "workflow-v1 must carry source-order node IDs and the parallel group parent",
     );
 }
 

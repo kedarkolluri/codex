@@ -6,7 +6,8 @@ use std::sync::Mutex;
 
 use codex_code_mode_protocol::AgentCallOpts;
 use codex_code_mode_protocol::AgentSpawnOutcome;
-use codex_code_mode_protocol::WorkflowBudgetHandle;
+use codex_code_mode_protocol::WorkflowBudgetSnapshot;
+use codex_code_mode_protocol::WorkflowHostProgress;
 use codex_workflow_journal::AgentCallLine;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -62,12 +63,23 @@ pub(crate) trait CellHost: Send + Sync + 'static {
     /// so hosts without workflow spawning need no changes.
     fn spawn_agent(
         &self,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: AgentCallOpts,
         cancellation_token: CancellationToken,
     ) -> impl Future<Output = AgentSpawnOutcome> + Send {
-        let _ = (prompt, ordinal, opts, cancellation_token);
+        let _ = (
+            node_id,
+            parent_node_id,
+            phase,
+            prompt,
+            ordinal,
+            opts,
+            cancellation_token,
+        );
         async { AgentSpawnOutcome::Failed }
     }
 
@@ -85,43 +97,48 @@ pub(crate) trait CellHost: Send + Sync + 'static {
         async { AgentSpawnOutcome::Failed }
     }
 
-    /// The live shared token-budget handle backing the workflow `budget` global, or `None` when this
-    /// cell runs no budgeted workflow. The cell actor threads the returned handle into the isolate
-    /// so `budget.spent()` / `budget.remaining()` forward to the shared budget rather than reporting
-    /// static values. The default returns `None` so hosts without a budget need no changes.
-    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
-        None
+    /// Refresh the runtime-owned run-local budget mirror after a callback that
+    /// can change spend. The default keeps non-workflow hosts unchanged.
+    fn workflow_budget_snapshot(
+        &self,
+    ) -> impl Future<Output = Result<Option<WorkflowBudgetSnapshot>, String>> + Send {
+        async { Ok(None) }
     }
 
-    /// Prior-run journal `agent_call` lines seeding this cell's prefix-replay for a
-    /// resumed run (spec §7, `P3-resume-entry`). The cell actor seeds the isolate's
-    /// `ReplayState` with these before evaluating the body. The default returns an
-    /// empty vec so a fresh (non-resume) cell seeds no replay state.
-    fn replay_entries(&self) -> Vec<codex_workflow_journal::AgentCallLine> {
-        Vec::new()
-    }
-
-    /// Journal a workflow `phase(title)` marker for this cell's run (§7 `phase` line). The default is
-    /// a no-op so hosts that do not journal need no changes.
-    fn journal_phase(&self, title: String) -> impl Future<Output = ()> + Send {
+    /// Journal a workflow `phase(title)` marker for this cell's run (§7 `phase` line). An error
+    /// stops the workflow; the default is a successful no-op for hosts that do not journal.
+    fn journal_phase(&self, title: String) -> impl Future<Output = Result<(), String>> + Send {
         let _ = title;
-        async {}
+        async { Ok(()) }
     }
 
-    /// Journal a workflow `log(message)` marker for this cell's run (§7 `log` line). The default is a
-    /// no-op so hosts that do not journal need no changes.
-    fn journal_log(&self, message: String) -> impl Future<Output = ()> + Send {
+    /// Journal a workflow `log(message)` marker for this cell's run (§7 `log` line). An error stops
+    /// the workflow; the default is a successful no-op for hosts that do not journal.
+    fn journal_log(&self, message: String) -> impl Future<Output = Result<(), String>> + Send {
         let _ = message;
-        async {}
+        async { Ok(()) }
     }
 
     /// Handle a prefix-replay cache hit (§7 resume step 3): re-append `entry` to the NEW run's
-    /// journal and re-add its `tokens_spent` to the shared budget, WITHOUT spawning a subagent. The
-    /// cell actor awaits this before draining the next runtime event, so the budget re-add is ordered
-    /// ahead of any later divergent live `agent()` call's pre-admission ceiling check. The default is
-    /// a no-op so hosts that do not journal/meter need no changes.
-    fn replay_agent(&self, entry: AgentCallLine) -> impl Future<Output = ()> + Send {
-        let _ = entry;
+    /// journal and charge its `tokens_spent` to this run's workflow meter, WITHOUT spawning a
+    /// subagent. The cell actor awaits this before draining the next runtime event, so the charge is
+    /// ordered ahead of any later divergent live `agent()` call's pre-admission check. The cached
+    /// promise is resolved only after this acknowledgement succeeds; an error rejects it. The
+    /// default is a successful no-op so hosts that do not journal/meter need no changes.
+    fn replay_agent(
+        &self,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
+        entry: AgentCallLine,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        let _ = (node_id, parent_node_id, phase, entry);
+        async { Ok(()) }
+    }
+
+    /// Forward renderer-neutral workflow progress through the owning session delegate.
+    fn workflow_progress(&self, progress: WorkflowHostProgress) -> impl Future<Output = ()> + Send {
+        let _ = progress;
         async {}
     }
 

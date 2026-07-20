@@ -36,6 +36,7 @@ use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::router::CollaborationToolAccess;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
@@ -50,6 +51,7 @@ struct ToolPlanInputs {
     tool_suggest_candidates: Option<ToolSuggestCandidates>,
     extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     dynamic_tools: Vec<DynamicToolSpec>,
+    collaboration_tool_access: CollaborationToolAccess,
 }
 
 struct ToolPlanProbe {
@@ -191,6 +193,7 @@ async fn probe_with(
             deferred_mcp_tools: inputs.deferred_mcp_tools,
             extension_tool_executors: inputs.extension_tool_executors,
             dynamic_tools: inputs.dynamic_tools.as_slice(),
+            collaboration_tool_access: inputs.collaboration_tool_access,
         },
         &Default::default(),
     );
@@ -682,6 +685,7 @@ async fn environment_tools_follow_the_step_context() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            collaboration_tool_access: Default::default(),
         },
         &Default::default(),
     ));
@@ -842,6 +846,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            collaboration_tool_access: Default::default(),
         },
         &cache,
     );
@@ -859,6 +864,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            collaboration_tool_access: Default::default(),
         },
         &cache,
     );
@@ -1282,6 +1288,34 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+}
+
+#[tokio::test]
+async fn disabled_collaboration_access_omits_v2_specs_and_runtimes() {
+    let plan = probe_with(
+        |turn| set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true),
+        ToolPlanInputs {
+            collaboration_tool_access: CollaborationToolAccess::Disabled,
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE]);
+    for tool_name in [
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+        "list_agents",
+    ] {
+        let registered_name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool_name).to_string();
+        assert!(
+            !plan.registered_names.contains(&registered_name),
+            "expected workflow-managed tool `{registered_name}` to be absent"
+        );
+    }
 }
 
 #[tokio::test]

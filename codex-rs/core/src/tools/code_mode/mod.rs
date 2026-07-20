@@ -1,3 +1,4 @@
+pub(crate) mod cli_entry;
 mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
@@ -5,8 +6,14 @@ mod response_adapter;
 mod scheduler;
 mod wait_handler;
 pub(crate) mod wait_spec;
+mod workflow_agent_controls;
+mod workflow_context_bounds;
+pub(crate) mod workflow_entry;
 mod workflow_handler;
+pub(crate) mod workflow_progress;
+mod workflow_replay_fingerprint;
 pub(crate) mod workflow_spec;
+mod workflow_tasks;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -46,25 +53,37 @@ use codex_utils_output_truncation::formatted_truncate_text_content_items_with_po
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 
 use delegate::CodeModeDispatchBroker;
+use delegate::CodeModeDispatchOrigin;
 use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
 pub(crate) use wait_handler::CodeModeWaitHandler;
+pub use workflow_agent_controls::WorkflowAgentControlAction;
+pub use workflow_agent_controls::WorkflowAgentControlDisposition;
+use workflow_agent_controls::WorkflowAgentControlRegistry;
 pub(crate) use workflow_handler::CodeModeWorkflowHandler;
 use workflow_handler::WorkflowRunLedger;
+use workflow_tasks::WorkflowTaskManager;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
 pub(crate) const WAIT_TOOL_NAME: &str = codex_code_mode::WAIT_TOOL_NAME;
 pub(crate) const DEFAULT_WAIT_YIELD_TIME_MS: u64 = codex_code_mode::DEFAULT_WAIT_YIELD_TIME_MS;
-/// Un-namespaced name of the workflow host tool (P0-host-tool-skeleton).
-pub(crate) const WORKFLOW_TOOL_NAME: &str = "workflow";
+/// Un-namespaced name of the model-callable saved-workflow launcher.
+pub(crate) const WORKFLOW_TOOL_NAME: &str = "workflow_run";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkflowRunCancelOutcome {
+    Applied,
+    AlreadyRequested,
+    NotRunning,
+}
 
 /// Returns true for the un-namespaced code-mode `exec` tool.
 pub(crate) fn is_exec_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none() && tool_name.name == PUBLIC_TOOL_NAME
 }
 
-/// Returns true for the un-namespaced `workflow` host tool.
+/// Returns true for the un-namespaced `workflow_run` host tool.
 pub(crate) fn is_workflow_tool_name(tool_name: &ToolName) -> bool {
     tool_name.namespace.is_none() && tool_name.name == WORKFLOW_TOOL_NAME
 }
@@ -83,6 +102,11 @@ pub(crate) struct CodeModeService {
     /// call can recover its parent run id (and the broker can forget a closed
     /// cell). See [`WorkflowRunLedger`].
     workflow_run_ledger: Arc<WorkflowRunLedger>,
+    /// Exact live-attempt controls, scoped to this root thread's code-mode service.
+    workflow_agent_controls: Arc<WorkflowAgentControlRegistry>,
+    /// Owns detached workflow lifetimes so callers may drop their result handle
+    /// without cancelling the run.
+    workflow_tasks: WorkflowTaskManager,
     shutting_down: AtomicBool,
 }
 
@@ -97,6 +121,8 @@ impl CodeModeService {
             session_provider,
             dispatch_broker,
             workflow_run_ledger,
+            workflow_agent_controls: Arc::new(WorkflowAgentControlRegistry::default()),
+            workflow_tasks: WorkflowTaskManager::default(),
             shutting_down: AtomicBool::new(false),
         }
     }
@@ -106,14 +132,20 @@ impl CodeModeService {
         &self.workflow_run_ledger
     }
 
-    /// Stage the prior run's journal `agent_call` lines (serialized to JSON) as the
-    /// prefix-replay seed for the NEXT cell this service spawns — the resumed top-level
-    /// run (`P3-resume-entry`, spec §7 steps 1-3). Must be called immediately before
-    /// that run's [`execute`](Self::execute) so the top-level cell (never a nested
-    /// `workflow()` cell) consumes it; the seed is taken exactly once. An empty vec
-    /// clears any prior staging.
-    pub(crate) fn stage_replay_entries(&self, entries: Vec<serde_json::Value>) {
-        self.dispatch_broker.stage_replay_entries(entries);
+    fn workflow_agent_controls(&self) -> &Arc<WorkflowAgentControlRegistry> {
+        &self.workflow_agent_controls
+    }
+
+    pub(crate) async fn control_workflow_agent(
+        &self,
+        run_id: &str,
+        node_id: u64,
+        attempt: u32,
+        action: WorkflowAgentControlAction,
+    ) -> WorkflowAgentControlDisposition {
+        self.workflow_agent_controls
+            .control(run_id, node_id, attempt, action)
+            .await
     }
 
     pub(crate) fn session_provider(&self) -> Arc<dyn CodeModeSessionProvider> {
@@ -123,8 +155,13 @@ impl CodeModeService {
     pub(crate) async fn execute(
         &self,
         request: codex_code_mode::ExecuteRequest,
+        origin: CodeModeDispatchOrigin,
     ) -> Result<codex_code_mode::StartedCell, String> {
-        self.session().await?.execute(request).await
+        let pending_cell = self.dispatch_broker.begin_cell_execution(origin).await?;
+        let session = self.session().await?;
+        let started_cell = session.execute(request).await?;
+        pending_cell.bind(started_cell.cell_id.clone()).await?;
+        Ok(started_cell)
     }
 
     pub(crate) async fn wait(
@@ -141,10 +178,40 @@ impl CodeModeService {
         self.session().await?.terminate(cell_id).await
     }
 
+    pub(crate) async fn cancel_workflow_run(&self, run_id: &str) -> WorkflowRunCancelOutcome {
+        match self.workflow_tasks.cancel_run(run_id).await {
+            workflow_tasks::WorkflowTaskCancelOutcome::Applied => WorkflowRunCancelOutcome::Applied,
+            workflow_tasks::WorkflowTaskCancelOutcome::AlreadyRequested => {
+                WorkflowRunCancelOutcome::AlreadyRequested
+            }
+            workflow_tasks::WorkflowTaskCancelOutcome::NotRunning => {
+                WorkflowRunCancelOutcome::NotRunning
+            }
+        }
+    }
+
+    /// Request a checkpoint pause and wait until child cleanup and durable
+    /// terminal publication have completed.
+    pub(crate) async fn pause_workflow_run(&self, run_id: &str) -> WorkflowRunCancelOutcome {
+        match self.workflow_tasks.pause_run(run_id).await {
+            workflow_tasks::WorkflowTaskCancelOutcome::Applied => WorkflowRunCancelOutcome::Applied,
+            workflow_tasks::WorkflowTaskCancelOutcome::AlreadyRequested => {
+                WorkflowRunCancelOutcome::AlreadyRequested
+            }
+            workflow_tasks::WorkflowTaskCancelOutcome::NotRunning => {
+                WorkflowRunCancelOutcome::NotRunning
+            }
+        }
+    }
+
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.shutting_down.store(true, Ordering::Release);
+        // Stop admitting new turn owners/cells while preserving already-bound cell routes long
+        // enough for the runtime to deliver interrupted terminal callbacks during shutdown.
+        self.dispatch_broker.begin_shutdown().await;
+        self.workflow_tasks.shutdown().await;
         // Join any initialization already in progress without initializing an unused service.
-        match self
+        let result = match self
             .session
             .get_or_try_init(|| async {
                 Err::<Arc<dyn CodeModeSession>, String>(
@@ -155,7 +222,9 @@ impl CodeModeService {
         {
             Ok(session) => session.shutdown().await,
             Err(_) => Ok(()),
-        }
+        };
+        self.dispatch_broker.finish_shutdown().await;
+        result
     }
 
     pub(crate) fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId) {
@@ -166,7 +235,7 @@ impl CodeModeService {
         self.dispatch_broker.close_cell(cell_id);
     }
 
-    pub(crate) fn start_turn_worker(
+    pub(crate) async fn start_turn_worker(
         &self,
         session: &Arc<Session>,
         step_context: Arc<StepContext>,
@@ -183,10 +252,10 @@ impl CodeModeService {
             session: Arc::clone(session),
             turn: Arc::clone(turn),
         };
-        Some(
-            self.dispatch_broker
-                .start_turn_worker(exec, router, step_context, tracker),
-        )
+        self.dispatch_broker
+            .start_turn_worker(exec, router, step_context, tracker)
+            .await
+            .ok()
     }
 
     async fn session(&self) -> Result<Arc<dyn CodeModeSession>, String> {
@@ -398,6 +467,7 @@ mod tests {
 
     use super::CodeModeService;
     use super::build_nested_tool_payload;
+    use super::delegate::CodeModeDispatchOrigin;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
     use codex_code_mode::CodeModeToolKind;
@@ -493,7 +563,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_meta_only_body_runs_once_end_to_end() {
-        use super::workflow_handler::run_workflow_source;
+        use super::workflow_handler::run_workflow_source_to_terminal;
         use codex_features::Feature;
         use codex_features::Features;
 
@@ -512,7 +582,7 @@ mod tests {
         );
 
         let scratch = tempfile::tempdir().expect("scratch codex home");
-        let output = run_workflow_source(
+        let output = run_workflow_source_to_terminal(
             &features,
             &service,
             "wf-call-1".to_string(),
@@ -524,8 +594,9 @@ mod tests {
                 depth: 0,
             },
             scratch.path(),
-            0,
             None,
+            super::workflow_progress::WorkflowEventTarget::Disabled,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("valid workflow runs its body once");
@@ -545,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_args_and_run_id_reach_the_isolate() {
-        use super::workflow_handler::run_workflow_source;
+        use super::workflow_handler::run_workflow_source_to_terminal;
         use codex_features::Feature;
         use codex_features::Features;
 
@@ -560,7 +631,7 @@ mod tests {
 
         // The invocation JSON reaches the fresh isolate as the read-only `args`
         // global, and the host-minted `workflow.runId` is a non-empty uuid the
-        // body can read (minted in Rust by `run_workflow_source`, never in JS).
+        // body can read (minted in Rust by the terminal runner, never in JS).
         let source = concat!(
             "export const meta = { name: 'demo', description: 'demo' };\n",
             "text(String(args.foo));\n",
@@ -568,7 +639,7 @@ mod tests {
         );
 
         let scratch = tempfile::tempdir().expect("scratch codex home");
-        let output = run_workflow_source(
+        let output = run_workflow_source_to_terminal(
             &features,
             &service,
             "wf-call-args".to_string(),
@@ -580,8 +651,9 @@ mod tests {
                 depth: 0,
             },
             scratch.path(),
-            0,
             None,
+            super::workflow_progress::WorkflowEventTarget::Disabled,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("workflow with args runs its body once");
@@ -606,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_phase_and_log_body_runs_end_to_end() {
-        use super::workflow_handler::run_workflow_source;
+        use super::workflow_handler::run_workflow_source_to_terminal;
         use codex_features::Feature;
         use codex_features::Features;
 
@@ -630,7 +702,7 @@ mod tests {
         );
 
         let scratch = tempfile::tempdir().expect("scratch codex home");
-        let output = run_workflow_source(
+        let output = run_workflow_source_to_terminal(
             &features,
             &service,
             "wf-call-phase-log".to_string(),
@@ -642,8 +714,9 @@ mod tests {
                 depth: 0,
             },
             scratch.path(),
-            0,
             None,
+            super::workflow_progress::WorkflowEventTarget::Disabled,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect("phase/log workflow runs its body once");
@@ -663,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_invalid_meta_never_reaches_isolate() {
-        use super::workflow_handler::run_workflow_source;
+        use super::workflow_handler::run_workflow_source_to_terminal;
         use codex_features::Feature;
         use codex_features::Features;
 
@@ -679,7 +752,7 @@ mod tests {
         // No `meta` manifest: rejected before the isolate ever runs. If it had run,
         // `text(...)` would have produced a `Result` output instead of an error.
         let scratch = tempfile::tempdir().expect("scratch codex home");
-        let err = run_workflow_source(
+        let err = run_workflow_source_to_terminal(
             &features,
             &service,
             "wf-call-2".to_string(),
@@ -691,8 +764,9 @@ mod tests {
                 depth: 0,
             },
             scratch.path(),
-            0,
             None,
+            super::workflow_progress::WorkflowEventTarget::Disabled,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect_err("invalid meta must be rejected");
@@ -710,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_disabled_feature_skips_execution() {
-        use super::workflow_handler::run_workflow_source;
+        use super::workflow_handler::run_workflow_source_to_terminal;
         use codex_features::Features;
 
         let service = CodeModeService::new(Arc::new(
@@ -725,7 +799,7 @@ mod tests {
         );
 
         let scratch = tempfile::tempdir().expect("scratch codex home");
-        run_workflow_source(
+        run_workflow_source_to_terminal(
             &Features::default(),
             &service,
             "wf-call-3".to_string(),
@@ -737,8 +811,9 @@ mod tests {
                 depth: 0,
             },
             scratch.path(),
-            0,
             None,
+            super::workflow_progress::WorkflowEventTarget::Disabled,
+            tokio_util::sync::CancellationToken::new(),
         )
         .await
         .expect_err("workflow is unreachable when the feature is disabled");
@@ -754,16 +829,21 @@ mod tests {
         ));
 
         let response = service
-            .execute(ExecuteRequest {
-                tool_call_id: "call-1".to_string(),
-                enabled_tools: Vec::new(),
-                source: "text('fallback')".to_string(),
-                yield_time_ms: None,
-                max_output_tokens: None,
-                workflow: false,
-                args: None,
-                run_id: None,
-            })
+            .execute(
+                ExecuteRequest {
+                    tool_call_id: "call-1".to_string(),
+                    enabled_tools: Vec::new(),
+                    source: "text('fallback')".to_string(),
+                    yield_time_ms: None,
+                    max_output_tokens: None,
+                    workflow: false,
+                    args: None,
+                    run_id: None,
+                    replay_entries: Vec::new(),
+                    workflow_budget: None,
+                },
+                CodeModeDispatchOrigin::Disabled,
+            )
             .await
             .expect("missing host should fall back to an in-process session")
             .initial_response()
@@ -786,34 +866,54 @@ mod tests {
     /// Drive [`super::CodeModeWorkflowHandler`] end-to-end through its
     /// [`crate::tools::registry::ToolExecutor`] surface — the same path that
     /// `build_code_mode_executors` registers the tool on. Unlike the
-    /// `run_workflow_source` tests, this exercises payload matching, the
+    /// direct terminal-runner tests, this exercises payload matching, the
     /// per-session `code_mode_service`, and the model-facing response adapter
     /// (`to_response_item`), so a registration/gating/adaptation regression that
-    /// leaves `run_workflow_source` intact would still be caught. Returns the
+    /// leaves the terminal runner intact would still be caught. Returns the
     /// model-facing [`ResponseInputItem`] the tool would emit.
     async fn dispatch_workflow_via_handler(
         workflow_enabled: bool,
         source: &str,
+        arguments: serde_json::Value,
     ) -> Result<codex_protocol::models::ResponseInputItem, crate::function_tool::FunctionCallError>
     {
         use super::CodeModeWorkflowHandler;
         use super::workflow_spec::create_workflow_tool;
         use crate::session::step_context::StepContext;
         use crate::session::tests::make_session_and_context;
+        use crate::tools::ToolRouter;
         use crate::tools::context::ToolCallSource;
         use crate::tools::context::ToolInvocation;
         use crate::tools::context::ToolOutput;
         use crate::tools::registry::ToolExecutor;
+        use crate::tools::registry::ToolRegistry;
         use crate::turn_diff_tracker::TurnDiffTracker;
         use codex_features::Feature;
 
         let (session, mut turn) = make_session_and_context().await;
+        let codex_home = tempfile::tempdir().expect("create temporary Codex home");
+        let workflows_dir = codex_home.path().join("workflows");
+        tokio::fs::create_dir_all(&workflows_dir)
+            .await
+            .expect("create saved workflow directory");
+        tokio::fs::write(workflows_dir.join("model-tool-demo.js"), source)
+            .await
+            .expect("write saved workflow");
         let mut config = (*turn.config).clone();
+        config.codex_home = codex_home
+            .path()
+            .to_path_buf()
+            .try_into()
+            .expect("temporary Codex home is absolute");
         if workflow_enabled {
             config
                 .features
                 .enable(Feature::Workflow)
                 .expect("test feature should be enableable in config");
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("test code-mode feature should be enableable in config");
         } else {
             config
                 .features
@@ -825,20 +925,38 @@ mod tests {
         let session = Arc::new(session);
         let turn = Arc::new(turn);
         let step_context = StepContext::for_test(Arc::clone(&turn));
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let _dispatch_worker = if workflow_enabled {
+            session
+                .services
+                .code_mode_service
+                .start_turn_worker(
+                    &session,
+                    Arc::clone(&step_context),
+                    Arc::new(ToolRouter::from_parts(
+                        ToolRegistry::empty_for_test(),
+                        Vec::new(),
+                    )),
+                    Arc::clone(&tracker),
+                )
+                .await
+        } else {
+            None
+        };
 
         // Register the handler exactly as `build_code_mode_executors` does: the
         // model-visible spec plus the (here empty) nested-tool specs.
         let handler = CodeModeWorkflowHandler::new(create_workflow_tool(), Vec::new());
 
-        let payload = ToolPayload::Custom {
-            input: source.to_string(),
+        let payload = ToolPayload::Function {
+            arguments: serde_json::to_string(&arguments).expect("serialize workflow_run arguments"),
         };
         let invocation = ToolInvocation {
             session: Arc::clone(&session),
             turn: Arc::clone(&turn),
             step_context,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            tracker,
             call_id: "wf-handler-call".to_string(),
             tool_name: ToolName::plain(super::WORKFLOW_TOOL_NAME),
             source: ToolCallSource::Direct,
@@ -855,42 +973,52 @@ mod tests {
         result.map(|output| output.to_response_item("wf-handler-call", &payload))
     }
 
-    /// Pull the `(text, success)` out of the custom-tool output the workflow tool
+    /// Pull the `(text, success)` out of the function-tool output the workflow tool
     /// emits, so a test can assert on the model-facing rendering.
-    fn custom_tool_output(
+    fn function_tool_output(
         item: codex_protocol::models::ResponseInputItem,
     ) -> (String, Option<bool>) {
         match item {
-            codex_protocol::models::ResponseInputItem::CustomToolCallOutput { output, .. } => {
+            codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } => {
                 (output.body.to_text().unwrap_or_default(), output.success)
             }
-            other => panic!("expected a custom-tool call output, got {other:?}"),
+            other => panic!("expected a function-tool call output, got {other:?}"),
         }
     }
 
     #[tokio::test]
     async fn workflow_handler_dispatches_valid_script_through_model_adapter() {
-        // (a) With the feature enabled, a trivial meta-valid script dispatched
-        // through the registered tool surface runs its body once and returns the
-        // isolate result via the model-facing adapter.
+        // (a) With the feature enabled, the structured tool resolves a saved
+        // workflow and returns only after its background run is durably admitted.
         let source = concat!(
-            "export const meta = { name: 'demo', description: 'demo workflow' };\n",
+            "export const meta = { name: 'model-tool-demo', description: 'demo workflow' };\n",
             "text('workflow-ran');",
         );
 
-        let item = dispatch_workflow_via_handler(/*workflow_enabled=*/ true, source)
-            .await
-            .expect("enabled workflow tool dispatches a valid script");
-        let (text, success) = custom_tool_output(item);
+        let item = dispatch_workflow_via_handler(
+            /*workflow_enabled=*/ true,
+            source,
+            serde_json::json!({
+                "name": "model-tool-demo",
+                "args": {"requestedBy": "model"}
+            }),
+        )
+        .await
+        .expect("enabled workflow tool dispatches a saved workflow");
+        let (text, success) = function_tool_output(item);
+        let result: serde_json::Value =
+            serde_json::from_str(&text).expect("workflow_run returns JSON");
 
         assert_eq!(success, Some(true), "model-facing success flag");
-        assert!(
-            text.contains("workflow-ran"),
-            "model-facing output should carry the isolate result, got: {text}"
-        );
-        assert!(
-            text.contains("Script completed"),
-            "model-facing output should carry the adapter status header, got: {text}"
+        assert_eq!(result["status"], "running");
+        let run_id = result["runId"]
+            .as_str()
+            .expect("workflow_run returns a runId");
+        assert_eq!(
+            uuid::Uuid::parse_str(run_id)
+                .expect("runId is a UUID")
+                .to_string(),
+            run_id
         );
     }
 
@@ -899,13 +1027,17 @@ mod tests {
         // (b) With the feature disabled the tool is unreachable: even a valid
         // script is rejected at the handler surface instead of dispatching.
         let source = concat!(
-            "export const meta = { name: 'demo', description: 'demo workflow' };\n",
+            "export const meta = { name: 'model-tool-demo', description: 'demo workflow' };\n",
             "text('workflow-ran');",
         );
 
-        let err = dispatch_workflow_via_handler(/*workflow_enabled=*/ false, source)
-            .await
-            .expect_err("disabled workflow tool must be unreachable");
+        let err = dispatch_workflow_via_handler(
+            /*workflow_enabled=*/ false,
+            source,
+            serde_json::json!({"name": "model-tool-demo"}),
+        )
+        .await
+        .expect_err("disabled workflow tool must be unreachable");
         match err {
             crate::function_tool::FunctionCallError::RespondToModel(message) => {
                 assert!(
@@ -919,24 +1051,39 @@ mod tests {
 
     #[tokio::test]
     async fn workflow_handler_rejects_invalid_meta_before_isolate() {
-        // (c) With the feature enabled, an invalid-meta script is rejected at the
-        // handler surface before the isolate runs. If it had reached the isolate,
-        // `text(...)` would have produced a successful custom-tool output.
+        // (c) Discovery statically rejects an invalid-meta saved script before
+        // the handler can start an isolate.
         let err = dispatch_workflow_via_handler(
             /*workflow_enabled=*/ true,
             "text('should-not-run');",
+            serde_json::json!({"name": "model-tool-demo"}),
         )
         .await
         .expect_err("invalid meta must be rejected before isolate execution");
         match err {
             crate::function_tool::FunctionCallError::RespondToModel(message) => {
                 assert!(
-                    message.contains("meta"),
-                    "expected a meta rejection, got: {message}"
+                    message.contains("did not resolve"),
+                    "expected a saved-workflow resolution rejection, got: {message}"
                 );
             }
             other => panic!("expected RespondToModel, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workflow_handler_does_not_claim_raw_custom_payloads() {
+        use super::CodeModeWorkflowHandler;
+        use super::workflow_spec::create_workflow_tool;
+        use crate::tools::registry::CoreToolRuntime;
+
+        let handler = CodeModeWorkflowHandler::new(create_workflow_tool(), Vec::new());
+        assert!(handler.matches_kind(&ToolPayload::Function {
+            arguments: r#"{"name":"model-tool-demo"}"#.to_string(),
+        }));
+        assert!(!handler.matches_kind(&ToolPayload::Custom {
+            input: "export const meta = {};".to_string(),
+        }));
     }
 
     /// Drive the real tool-planning path (`build_code_mode_executors` via
@@ -976,6 +1123,7 @@ mod tests {
                 tool_suggest_candidates: None,
                 extension_tool_executors: Vec::new(),
                 dynamic_tools: &[],
+                collaboration_tool_access: Default::default(),
             },
             &Default::default(),
         );

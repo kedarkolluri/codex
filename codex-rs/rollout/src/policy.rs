@@ -99,6 +99,10 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::TurnComplete(_)
         | EventMsg::ThreadSettingsApplied(_) => true,
 
+        // Workflow progress is durable state. Persist it in both history modes so rollout replay
+        // and completed-run observers retain the emitted topology alongside the workflow journal.
+        EventMsg::Workflow(_) => true,
+
         // Only persist these legacy events when the thread's history mode is Legacy.
         // New, paginated rollouts persist ItemCompleted events with TurnItems.
         EventMsg::UserMessage(_)
@@ -174,3 +178,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabResumeBegin(_) => false,
     }
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod tests;

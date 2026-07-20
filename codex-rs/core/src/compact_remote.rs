@@ -256,7 +256,6 @@ async fn run_remote_compact_task_inner_impl(
         new_history,
         trace_input_history,
     } = attempt;
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (new_history, world_state_baseline) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
@@ -264,6 +263,10 @@ async fn run_remote_compact_task_inner_impl(
         &initial_context_injection,
     )
     .await;
+    let new_history = sess
+        .bound_workflow_child_compacted_history(new_history)
+        .await?;
+    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -293,7 +296,7 @@ async fn run_remote_compact_task_inner_impl(
         world_state_baseline,
         compacted_item,
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)

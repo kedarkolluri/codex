@@ -611,12 +611,14 @@ async fn doc_larger_than_limit_is_truncated() {
     let huge = "A".repeat(LIMIT * 2); // 2 KiB
     fs::write(tmp.path().join("AGENTS.md"), &huge).unwrap();
 
-    let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
+    let loaded = load_agents_md(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
+    let res = loaded.text();
 
-    assert_eq!(res.len(), LIMIT, "doc should be truncated to LIMIT bytes");
-    assert_eq!(res, huge[..LIMIT]);
+    assert!(res.len() < huge.len(), "oversized doc should be truncated");
+    assert!(huge.starts_with(&res));
+    assert!(loaded.contextual_user_fragment().render().len() <= LIMIT);
 }
 
 #[tokio::test]
@@ -628,8 +630,19 @@ async fn total_byte_limit_truncates_later_project_docs() {
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("AGENTS.md"), "abcdef").unwrap();
 
-    let mut config = make_config(&repo, /*limit*/ 7, /*instructions*/ None).await;
+    let mut config = make_config(&repo, /*limit*/ usize::MAX, /*instructions*/ None).await;
     config.cwd = nested.abs();
+    let cwd = PathUri::from_abs_path(&config.cwd);
+    let mut budget = ProjectDocContextBudget::new(usize::MAX, /*has_user_instructions*/ false);
+    let root_overhead =
+        budget.next_entry_overhead("local", &cwd, /*environment_has_entry*/ false);
+    budget.commit_entry(root_overhead, "root".len());
+    let nested_overhead =
+        budget.next_entry_overhead("local", &cwd, /*environment_has_entry*/ true);
+    config.project_doc_max_bytes = root_overhead
+        .saturating_add("root".len())
+        .saturating_add(nested_overhead)
+        .saturating_add(3);
 
     let loaded = load_agents_md(&config).await.expect("project instructions");
     let expected = LoadedAgentsMd {
@@ -665,9 +678,19 @@ async fn read_agents_md_propagates_metadata_errors() {
     };
 
     let cwd = config.cwd.clone();
-    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect_err("metadata error");
+    let mut project_doc_budget = ProjectDocContextBudget::new(
+        config.project_doc_max_bytes,
+        /*has_user_instructions*/ false,
+    );
+    let err = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&cwd),
+        &mut project_doc_budget,
+    )
+    .await
+    .expect_err("metadata error");
 
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }
@@ -684,9 +707,19 @@ async fn read_agents_md_propagates_read_errors() {
     };
 
     let cwd = config.cwd.clone();
-    let err = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect_err("read error");
+    let mut project_doc_budget = ProjectDocContextBudget::new(
+        config.project_doc_max_bytes,
+        /*has_user_instructions*/ false,
+    );
+    let err = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&cwd),
+        &mut project_doc_budget,
+    )
+    .await
+    .expect_err("read error");
 
     assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }
@@ -703,9 +736,19 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
     };
 
     let cwd = config.cwd.clone();
-    let loaded = read_agents_md(&config.config, &fs, "local", &PathUri::from_abs_path(&cwd))
-        .await
-        .expect("removed file is recoverable");
+    let mut project_doc_budget = ProjectDocContextBudget::new(
+        config.project_doc_max_bytes,
+        /*has_user_instructions*/ false,
+    );
+    let loaded = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&cwd),
+        &mut project_doc_budget,
+    )
+    .await
+    .expect("removed file is recoverable");
 
     assert_eq!(loaded, None);
 }
@@ -1165,12 +1208,35 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
 }
 
 #[tokio::test]
-async fn project_doc_byte_limit_is_applied_independently_per_environment() {
+async fn project_doc_byte_limit_is_aggregate_across_environments() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
     fs::write(primary.path().join("AGENTS.md"), "ABCDE").unwrap();
     fs::write(secondary.path().join("AGENTS.md"), "VWXYZ").unwrap();
-    let config = make_config(&primary, /*limit*/ 3, /*instructions*/ None).await;
+    let mut config = make_config(
+        &primary,
+        /*limit*/ usize::MAX,
+        /*instructions*/ None,
+    )
+    .await;
+    let primary_cwd = PathUri::from_abs_path(&config.cwd);
+    let secondary_cwd = PathUri::from_host_native_path(secondary.path()).expect("secondary cwd");
+    let mut budget = ProjectDocContextBudget::new(usize::MAX, /*has_user_instructions*/ false);
+    let primary_overhead = budget.next_entry_overhead(
+        "primary",
+        &primary_cwd,
+        /*environment_has_entry*/ false,
+    );
+    budget.commit_entry(primary_overhead, "ABCDE".len());
+    let secondary_overhead = budget.next_entry_overhead(
+        "secondary",
+        &secondary_cwd,
+        /*environment_has_entry*/ false,
+    );
+    config.project_doc_max_bytes = primary_overhead
+        .saturating_add("ABCDE".len())
+        .saturating_add(secondary_overhead)
+        .saturating_add(3);
     let environments = resolved_local_environments([
         ("primary", config.cwd.clone()),
         ("secondary", secondary.abs()),
@@ -1184,48 +1250,49 @@ async fn project_doc_byte_limit_is_applied_independently_per_environment() {
     assert_eq!(
         loaded.text(),
         format!(
-            "for `primary` with root {}\n\nABC\n\nfor `secondary` with root {}\n\nVWX",
+            "for `primary` with root {}\n\nABCDE\n\nfor `secondary` with root {}\n\nVWX",
             primary.path().display(),
             secondary.path().display()
         )
     );
+    assert!(loaded.contextual_user_fragment().render().len() <= config.project_doc_max_bytes);
 }
 
 #[tokio::test]
-async fn multiple_environments_can_exceed_single_environment_project_doc_limit() {
-    // TODO(anp): Add an aggregate cap across environments instead of allowing the combined
-    // project instructions to grow by one full per-environment budget for every binding.
-    const LIMIT: usize = 8;
+async fn aggregate_project_doc_budget_includes_labels_wrapper_and_utf8_text() {
+    const LIMIT: usize = crate::config::AGENTS_MD_MAX_BYTES;
+    const USER_INSTRUCTIONS: &str = "global instructions";
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
-    let primary_doc = "P".repeat(LIMIT);
-    let secondary_doc = "S".repeat(LIMIT);
+    let primary_doc = "P".repeat(LIMIT / 3);
+    let secondary_doc = "é".repeat(LIMIT);
     fs::write(primary.path().join("AGENTS.md"), &primary_doc).unwrap();
     fs::write(secondary.path().join("AGENTS.md"), &secondary_doc).unwrap();
-    let config = make_config(&primary, LIMIT, /*instructions*/ None).await;
+    let config = make_config(&primary, LIMIT, Some(USER_INSTRUCTIONS)).await;
+    let primary_environment_id = format!("primary-{}", "p".repeat(256));
+    let secondary_environment_id = format!("secondary-{}", "s".repeat(256));
     let environments = resolved_local_environments([
-        ("primary", config.cwd.clone()),
-        ("secondary", secondary.abs()),
+        (primary_environment_id.as_str(), config.cwd.clone()),
+        (secondary_environment_id.as_str(), secondary.abs()),
     ]);
 
     let loaded = load_project_instructions(
         &config.config,
-        /*user_instructions*/ None,
+        config.user_instructions.clone(),
         &environments,
     )
     .await
     .expect("instructions expected");
-    let project_bytes = loaded
-        .entries
-        .iter()
-        .filter(|entry| matches!(&entry.provenance, InstructionProvenance::Project { .. }))
-        .map(|entry| entry.contents.len())
-        .sum::<usize>();
+    let text = loaded.text();
+    assert!(text.contains(&primary_environment_id));
+    assert!(text.contains(&secondary_environment_id));
+    assert!(text.contains(&primary_doc));
+    assert!(!text.contains(&secondary_doc));
 
-    assert_eq!(project_bytes, LIMIT * 2);
-    assert!(project_bytes > config.project_doc_max_bytes);
-    assert!(loaded.text().contains(&primary_doc));
-    assert!(loaded.text().contains(&secondary_doc));
+    let rendered = loaded.contextual_user_fragment().render();
+    let project_contribution_bytes = rendered.len().saturating_sub(USER_INSTRUCTIONS.len());
+    assert!(project_contribution_bytes <= LIMIT);
+    assert!(codex_utils_output_truncation::approx_token_count(&rendered) < 10_000);
 }
 
 #[tokio::test]

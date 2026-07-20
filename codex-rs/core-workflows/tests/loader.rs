@@ -163,6 +163,78 @@ async fn discovers_nested_files_and_preserves_phases() {
     assert_eq!(phased.phases, vec!["plan", "build", "ship"]);
 }
 
+/// Durable run scripts live below the reserved Codex-home `workflows/runs`
+/// subtree and must not be offered as saved workflows. The same directory name
+/// is legitimate in project/personal scopes, and below a non-reserved nested
+/// Codex-home directory.
+#[tokio::test]
+async fn excludes_only_the_reserved_codex_home_runs_subtree() {
+    let tmp = TempDir::new().unwrap();
+    let project = tmp.path().join("project").join("workflows");
+    let personal = tmp.path().join("personal").join("workflows");
+    let codex_home = tmp.path().join("codex-home").join("workflows");
+
+    write_workflow(
+        &project.join("runs"),
+        "project.js",
+        &meta("project-runs", "project"),
+    );
+    write_workflow(
+        &personal.join("runs"),
+        "personal.js",
+        &meta("personal-runs", "personal"),
+    );
+    write_workflow(
+        &codex_home.join("runs").join("run-id"),
+        "script.js",
+        &meta("historical-run", "durable state"),
+    );
+    write_workflow(
+        &codex_home.join("group").join("runs"),
+        "nested.js",
+        &meta("codex-nested", "ordinary nested directory"),
+    );
+    write_workflow(&codex_home, "saved.js", &meta("codex-saved", "saved"));
+
+    let registry = load_workflows_from_roots(vec![
+        WorkflowRoot::new(&project, WorkflowScope::Project),
+        WorkflowRoot::new(&personal, WorkflowScope::Personal),
+        WorkflowRoot::new(&codex_home, WorkflowScope::CodexHome),
+    ])
+    .await;
+    let discovered = registry
+        .workflows()
+        .iter()
+        .map(|workflow| (workflow.name.clone(), workflow.scope, workflow.path.clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        discovered,
+        vec![
+            (
+                "codex-nested".to_string(),
+                WorkflowScope::CodexHome,
+                codex_home.join("group/runs/nested.js"),
+            ),
+            (
+                "codex-saved".to_string(),
+                WorkflowScope::CodexHome,
+                codex_home.join("saved.js"),
+            ),
+            (
+                "personal-runs".to_string(),
+                WorkflowScope::Personal,
+                personal.join("runs/personal.js"),
+            ),
+            (
+                "project-runs".to_string(),
+                WorkflowScope::Project,
+                project.join("runs/project.js"),
+            ),
+        ]
+    );
+    assert!(registry.errors().is_empty());
+}
+
 /// Missing roots are tolerated silently (fail-open at the directory level).
 #[tokio::test]
 async fn missing_roots_are_tolerated() {

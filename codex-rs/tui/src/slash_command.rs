@@ -26,6 +26,7 @@ pub enum SlashCommand {
     AutoReview,
     Memories,
     Skills,
+    Workflow,
     Import,
     Hooks,
     Review,
@@ -100,6 +101,7 @@ impl SlashCommand {
             SlashCommand::Diff => "show git diff (including untracked files)",
             SlashCommand::Mention => "mention a file",
             SlashCommand::Skills => "use skills to improve how Codex performs specific tasks",
+            SlashCommand::Workflow => "start a saved workflow",
             SlashCommand::Import => "import setup, this project, and recent chats from Claude Code",
             SlashCommand::Hooks => "view and manage lifecycle hooks",
             SlashCommand::Status => "show current session configuration and token usage",
@@ -163,6 +165,7 @@ impl SlashCommand {
                 | SlashCommand::Raw
                 | SlashCommand::Usage
                 | SlashCommand::Pets
+                | SlashCommand::Workflow
                 | SlashCommand::Side
                 | SlashCommand::Btw
                 | SlashCommand::Resume
@@ -216,6 +219,7 @@ impl SlashCommand {
             | SlashCommand::Rename
             | SlashCommand::Mention
             | SlashCommand::Skills
+            | SlashCommand::Workflow
             | SlashCommand::Hooks
             | SlashCommand::Status
             | SlashCommand::Usage

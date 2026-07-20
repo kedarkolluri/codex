@@ -2222,13 +2222,6 @@
       ],
       "type": "object"
     },
-    "RealtimeConversationVersion": {
-      "enum": [
-        "v1",
-        "v2"
-      ],
-      "type": "string"
-    },
     "RealtimeOutputModality": {
       "enum": [
         "text",
@@ -4046,44 +4039,6 @@
       },
       "required": [
         "threadId"
-      ],
-      "type": "object"
-    },
-    "ThreadRealtimeAudioChunk": {
-      "description": "EXPERIMENTAL - thread realtime audio chunk.",
-      "properties": {
-        "data": {
-          "type": "string"
-        },
-        "itemId": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "numChannels": {
-          "format": "uint16",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "sampleRate": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": "integer"
-        },
-        "samplesPerChannel": {
-          "format": "uint32",
-          "minimum": 0.0,
-          "type": [
-            "integer",
-            "null"
-          ]
-        }
-      },
-      "required": [
-        "data",
-        "numChannels",
-        "sampleRate"
       ],
       "type": "object"
     },

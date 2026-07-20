@@ -585,6 +585,24 @@ impl Session {
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
+        if self.is_workflow_managed_agent().await
+            && let Some(schema) = updates
+                .final_output_json_schema
+                .as_ref()
+                .and_then(Option::as_ref)
+            && codex_code_mode::ensure_workflow_agent_schema(schema).is_err()
+        {
+            let message = "workflow child output schema exceeds model-context limits".to_string();
+            self.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message: message.clone(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return Err(CodexErr::InvalidRequest(message));
+        }
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let update_result: CodexResult<_> = {
             let mut state = self.state.lock().await;

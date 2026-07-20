@@ -40,6 +40,7 @@ use crate::request_processors::ThreadGoalRequestProcessor;
 use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
+use crate::request_processors::WorkflowRequestProcessor;
 use crate::request_serialization::QueuedInitializedRequest;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
@@ -131,6 +132,7 @@ pub(crate) struct MessageProcessor {
     thread_processor: ThreadRequestProcessor,
     turn_processor: TurnRequestProcessor,
     windows_sandbox_processor: WindowsSandboxRequestProcessor,
+    workflow_processor: WorkflowRequestProcessor,
     request_serialization_queues: RequestSerializationQueues,
 }
 
@@ -315,10 +317,13 @@ impl MessageProcessor {
         // Gate the workflows watcher on the experimental feature: when disabled,
         // no watcher is constructed, so no repo is watched and no untrusted
         // workflow files are parsed.
+        // The request processor and watcher share one cache owner. Constructing
+        // the service itself performs no filesystem work; discovery remains
+        // gated by `workflow/list`, while the watcher remains feature-gated.
+        let workflows_service = Arc::new(WorkflowsService::new());
         let workflows_watcher = if config.features.enabled(Feature::Workflow) {
-            let workflows_service = Arc::new(WorkflowsService::new());
             Some(WorkflowsWatcher::new(
-                workflows_service,
+                Arc::clone(&workflows_service),
                 workflow_static_roots_from_config(&config),
                 outgoing.clone(),
             ))
@@ -482,7 +487,7 @@ impl MessageProcessor {
                 thread_store: Arc::clone(&thread_store),
                 config_manager: config_manager.clone(),
                 config_processor: config_processor.clone(),
-                state_db,
+                state_db: state_db.clone(),
                 analytics_events_client,
                 arg0_paths,
                 codex_home: config.codex_home.to_path_buf(),
@@ -497,6 +502,13 @@ impl MessageProcessor {
             outgoing.clone(),
             Arc::clone(&config),
             config_manager,
+        );
+        let workflow_processor = WorkflowRequestProcessor::new(
+            Arc::clone(&thread_manager),
+            workflows_service,
+            workflows_watcher.is_some(),
+            config.codex_home.to_path_buf(),
+            state_db.clone(),
         );
 
         Self {
@@ -525,6 +537,7 @@ impl MessageProcessor {
             thread_processor,
             turn_processor,
             windows_sandbox_processor,
+            workflow_processor,
             request_serialization_queues,
         }
     }
@@ -1195,6 +1208,30 @@ impl MessageProcessor {
             }
             ClientRequest::SkillsList { params, .. } => {
                 self.catalog_processor.skills_list(params).await
+            }
+            ClientRequest::WorkflowList { params, .. } => {
+                self.workflow_processor.workflow_list(params).await
+            }
+            ClientRequest::WorkflowStart { params, .. } => {
+                self.workflow_processor.workflow_start(params).await
+            }
+            ClientRequest::WorkflowRead { params, .. } => {
+                self.workflow_processor.workflow_read(params).await
+            }
+            ClientRequest::WorkflowSave { params, .. } => {
+                self.workflow_processor.workflow_save(params).await
+            }
+            ClientRequest::WorkflowStop { params, .. } => {
+                self.workflow_processor.workflow_stop(params).await
+            }
+            ClientRequest::WorkflowPause { params, .. } => {
+                self.workflow_processor.workflow_pause(params).await
+            }
+            ClientRequest::WorkflowResume { params, .. } => {
+                self.workflow_processor.workflow_resume(params).await
+            }
+            ClientRequest::WorkflowAgentControl { params, .. } => {
+                self.workflow_processor.workflow_agent_control(params).await
             }
             ClientRequest::SkillsExtraRootsSet { params, .. } => {
                 self.catalog_processor.skills_extra_roots_set(params).await

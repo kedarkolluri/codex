@@ -35,6 +35,10 @@ pub(super) async fn maybe_record(
         &config.reminder_message_template,
         tokens_until_compaction,
     ));
-    sess.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
-        .await;
+    let items = if sess.is_workflow_managed_agent().await {
+        crate::context::bound_workflow_child_context_items(vec![response_item])
+    } else {
+        vec![response_item]
+    };
+    sess.record_conversation_items(turn_context, &items).await;
 }

@@ -37,6 +37,12 @@ pub(super) fn runtime_request(request: CellRequest) -> ExecuteRequest {
         workflow: request.workflow,
         args: request.args,
         run_id: request.run_id,
+        replay_entries: request
+            .replay_entries
+            .into_iter()
+            .filter_map(|entry| serde_json::to_value(entry).ok())
+            .collect(),
+        workflow_budget: request.workflow_budget,
     }
 }
 

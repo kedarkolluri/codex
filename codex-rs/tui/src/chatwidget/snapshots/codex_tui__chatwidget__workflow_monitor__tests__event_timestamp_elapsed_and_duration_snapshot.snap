@@ -1,0 +1,25 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"RUNNING\\n{running}\\n\\nCOMPLETED\\n{completed}\")"
+---
+RUNNING
+◆ Workflow timed release  run-timi  running · elapsed ≥ 3m 35s
+  1.7K tokens · 6 tools
+  ✓ plan · 1/1 agents · duration 1m 10s
+    └─ ✓ planner  gpt-5.5 · high  completed · attempt 1 · 500 tok · 2 tools · 0ms
+  ● execute · 0/1 agents · elapsed ≥ 2m 05s
+    └─ ● executor  gpt-5.5 · medium  running · attempt 1 · 1.2K tok · 4 tools · ≥0ms
+
+  Enter inspect agents
+
+COMPLETED
+◆ Workflow timed release  run-timi  completed · duration 4m 20s
+  2K tokens · 7 tools
+  ✓ plan · 1/1 agents · duration 1m 10s
+    └─ ✓ planner  gpt-5.5 · high  completed · attempt 1 · 500 tok · 2 tools · 0ms
+  ✓ execute · 1/1 agents · duration 2m 35s
+    └─ ✓ executor  gpt-5.5 · medium  completed · attempt 1 · 1.5K tok · 5 tools · 0ms
+  budget  2.1K / 4K weighted tokens
+  ↳ released
+
+  Enter inspect agents

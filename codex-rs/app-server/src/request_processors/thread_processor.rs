@@ -2815,6 +2815,8 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
+        let workflow_replay_enabled =
+            self.workflows_watcher.is_some() && config.features.enabled(Feature::Workflow);
 
         let response_history = thread_history.clone();
 
@@ -2977,6 +2979,19 @@ impl ThreadRequestProcessor {
                         &token_usage_thread,
                         codex_thread.as_ref(),
                         token_usage_turn_id,
+                    )
+                    .await;
+                }
+                if workflow_replay_enabled {
+                    // Workflow progress is durable but is not part of `thread.turns`. Re-project a
+                    // bounded, connection-scoped stream after the resume response so a reconnecting
+                    // monitor restores its run topology without duplicating rollout records or
+                    // notifying already-attached clients.
+                    super::workflow_event_replay::send_workflow_replay_to_connection(
+                        &self.outgoing,
+                        connection_id,
+                        thread_id,
+                        response_history.get_rollout_items(),
                     )
                     .await;
                 }

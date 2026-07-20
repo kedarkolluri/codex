@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use super::RemoteCompactionV2Output;
 use super::run_remote_compaction_request_v2;
-use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
@@ -10,6 +9,7 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::session::turn::build_prompt;
 use crate::session::turn::built_tools;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ResponseItem;
@@ -65,6 +65,13 @@ pub(super) async fn run_remote_compact_v2_attempt(
 
     let trace_input_history = history.raw_items().to_vec();
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    if sess.is_workflow_managed_agent().await {
+        crate::context::validate_workflow_child_model_history(&prompt_input).map_err(|_| {
+            codex_protocol::error::CodexErr::InvalidRequest(
+                "workflow child history exceeds model-context limits".to_string(),
+            )
+        })?;
+    }
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),
@@ -73,14 +80,14 @@ pub(super) async fn run_remote_compact_v2_attempt(
     .await?;
     let mut input = prompt_input.clone();
     input.push(ResponseItem::CompactionTrigger {});
-    let prompt = Prompt {
+    let mut prompt = build_prompt(
         input,
-        tools: tool_router.model_visible_specs(),
-        parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
+        tool_router.as_ref(),
+        turn_context.as_ref(),
         base_instructions,
-        output_schema: None,
-        output_schema_strict: true,
-    };
+    );
+    prompt.output_schema = None;
+    prompt.output_schema_strict = true;
 
     let window_id = sess.current_window_id().await;
     let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(

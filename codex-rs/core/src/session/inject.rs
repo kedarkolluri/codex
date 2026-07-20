@@ -20,9 +20,15 @@ impl Session {
         &self,
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
+        let workflow_managed_agent = self.is_workflow_managed_agent().await;
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(active_turn) => {
+                let input = if workflow_managed_agent {
+                    crate::context::bound_workflow_child_injected_messages(input)
+                } else {
+                    input
+                };
                 self.input_queue
                     .extend_pending_input_for_turn_state(
                         active_turn.turn_state.as_ref(),
@@ -46,6 +52,7 @@ impl Session {
         self: &Arc<Self>,
         input: Vec<ResponseItem>,
     ) -> Result<(), TryStartTurnIfIdleError> {
+        let workflow_managed_agent = self.is_workflow_managed_agent().await;
         if input.is_empty() {
             return Ok(());
         }
@@ -118,6 +125,11 @@ impl Session {
             ));
         }
 
+        let input = if workflow_managed_agent {
+            crate::context::bound_workflow_child_injected_messages(input)
+        } else {
+            input
+        };
         self.input_queue
             .extend_pending_input_for_turn_state(
                 turn_state.as_ref(),
@@ -145,7 +157,7 @@ impl Session {
         items: Vec<ResponseItem>,
         current_turn_context: Option<&TurnContext>,
     ) {
-        let Err(items) = self.inject_if_running(items).await else {
+        let Err(mut items) = self.inject_if_running(items).await else {
             return;
         };
         let default_turn_context;
@@ -156,6 +168,9 @@ impl Session {
                 default_turn_context.as_ref()
             }
         };
+        if self.is_workflow_managed_agent().await {
+            items = crate::context::bound_workflow_child_injected_messages(items);
+        }
         self.record_conversation_items(turn_context, &items).await;
     }
 }

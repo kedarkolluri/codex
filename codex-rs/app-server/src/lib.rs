@@ -60,6 +60,7 @@ use codex_core::check_execpolicy_for_warnings;
 use codex_core::config::find_codex_home;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerRuntimePaths;
+use codex_features::Feature;
 use codex_feedback::CodexFeedback;
 use codex_protocol::protocol::SessionSource;
 use codex_rollout::state_db as rollout_state_db;
@@ -115,6 +116,7 @@ mod skills_watcher;
 mod thread_state;
 mod thread_status;
 mod transport;
+mod workflow_event_mapping;
 mod workflows_service;
 mod workflows_watcher;
 
@@ -581,7 +583,6 @@ pub async fn run_main_with_transport_options(
             range: None,
         });
     }
-
     if let Ok(Some(err)) = check_execpolicy_for_warnings(&config.config_layer_stack).await {
         config_warnings.push(exec_policy_config_warning(&err));
     }
@@ -643,6 +644,22 @@ pub async fn run_main_with_transport_options(
         .with(otel_logger_layer)
         .with(otel_tracing_layer)
         .try_init();
+    if config.features.enabled(Feature::Workflow) {
+        let report = codex_core::workflow_recovery::reconcile_stale_workflow_runs(
+            config.codex_home.as_path(),
+            state_db.as_deref(),
+        )
+        .await;
+        if report.reconciled > 0 {
+            info!(
+                reconciled = report.reconciled,
+                "reconciled workflow runs whose former process owners exited"
+            );
+        }
+        for diagnostic in report.diagnostics {
+            warn!("workflow stale-run recovery: {diagnostic}");
+        }
+    }
     for warning in &config_warnings {
         match &warning.details {
             Some(details) => error!("{} {}", warning.summary, details),

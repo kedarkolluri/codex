@@ -116,6 +116,14 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::WindowsSandboxSetupStartParams;
+use codex_app_server_protocol::WorkflowAgentControlParams;
+use codex_app_server_protocol::WorkflowListParams;
+use codex_app_server_protocol::WorkflowPauseParams;
+use codex_app_server_protocol::WorkflowReadParams;
+use codex_app_server_protocol::WorkflowResumeParams;
+use codex_app_server_protocol::WorkflowSaveParams;
+use codex_app_server_protocol::WorkflowStartParams;
+use codex_app_server_protocol::WorkflowStopParams;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR;
@@ -171,6 +179,15 @@ impl TestAppServer {
     }
 
     pub async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
+        self.process.wait().await
+    }
+
+    /// Terminates the app-server without first closing stdin, then waits for it to exit.
+    ///
+    /// This simulates a process crash for restart-recovery tests; ordinary test cleanup should
+    /// continue to rely on [`Drop`].
+    pub async fn force_kill_and_wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.process.start_kill()?;
         self.process.wait().await
     }
 
@@ -799,6 +816,103 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("skills/list", params).await
+    }
+
+    /// Send a `workflow/list` JSON-RPC request.
+    pub async fn send_workflow_list_request(
+        &mut self,
+        params: WorkflowListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/list", params).await
+    }
+
+    /// Send a `workflow/start` JSON-RPC request.
+    pub async fn send_workflow_start_request(
+        &mut self,
+        params: WorkflowStartParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/start", params).await
+    }
+
+    /// Send a `workflow/read` JSON-RPC request.
+    pub async fn send_workflow_read_request(
+        &mut self,
+        params: WorkflowReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/read", params).await
+    }
+
+    /// Send a `workflow/save` JSON-RPC request.
+    pub async fn send_workflow_save_request(
+        &mut self,
+        params: WorkflowSaveParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/save", params).await
+    }
+
+    /// Send a `workflow/stop` JSON-RPC request.
+    pub async fn send_workflow_stop_request(
+        &mut self,
+        params: WorkflowStopParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/stop", params).await
+    }
+
+    /// Send a `workflow/pause` JSON-RPC request.
+    pub async fn send_workflow_pause_request(
+        &mut self,
+        params: WorkflowPauseParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/pause", params).await
+    }
+
+    /// Send an untyped `workflow/pause` request for boundary-validation tests.
+    pub async fn send_workflow_pause_raw_request(
+        &mut self,
+        params: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.send_request("workflow/pause", Some(params)).await
+    }
+
+    /// Send a `workflow/resume` JSON-RPC request.
+    pub async fn send_workflow_resume_request(
+        &mut self,
+        params: WorkflowResumeParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/resume", params).await
+    }
+
+    /// Send an untyped `workflow/resume` request for boundary-validation tests.
+    pub async fn send_workflow_resume_raw_request(
+        &mut self,
+        params: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.send_request("workflow/resume", Some(params)).await
+    }
+
+    /// Send a `workflow/agent/control` JSON-RPC request.
+    pub async fn send_workflow_agent_control_request(
+        &mut self,
+        params: WorkflowAgentControlParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/agent/control", params).await
+    }
+
+    /// Send an untyped `workflow/agent/control` request for boundary-validation tests.
+    pub async fn send_workflow_agent_control_raw_request(
+        &mut self,
+        params: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.send_request("workflow/agent/control", Some(params))
+            .await
     }
 
     /// Send a `skills/extraRoots/set` JSON-RPC request.

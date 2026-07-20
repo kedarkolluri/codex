@@ -1,0 +1,25 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "format!(\"FOOTER\\n{footer}\\n\\nCONFIRMATION\\n{popup}\")"
+---
+FOOTER
+› ◆ Workflow release-check  …456789ab  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc exit
+
+CONFIRMATION
+› ◆ Workflow release-check  …456789ab  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc exit
+
+
+  Pause workflow?
+  release-check · 019f78be-1234-7abc-8def-0123456789ab
+
+  1. Pause selected workflow  Cancel active work after publishing its durable resume
+                              checkpoint.
+› 2. Cancel                   Keep the workflow running.
+
+  Press enter to confirm or esc to go back

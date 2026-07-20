@@ -47,6 +47,7 @@ async fn handle_spawn_agent(
         call_id,
         ..
     } = invocation;
+    ensure_collaboration_sender_allowed(session.as_ref()).await?;
     let arguments = function_arguments(payload)?;
     let args: SpawnAgentArgs = parse_arguments(&arguments)?;
     let fork_mode = args.fork_mode()?;
@@ -124,9 +125,13 @@ async fn handle_spawn_agent(
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
                     environments: Some(turn.environments.to_selections()),
+                    spawn_workspace: None,
                     // The V2 `spawn_agent` tool keeps the registry's random nickname pool pick; only
                     // deterministic-replay workflows supply an ordinal-derived preference.
                     preferred_agent_nickname: None,
+                    // This path already carries the role in its explicit `spawn_source` above.
+                    agent_role: None,
+                    parent_completion_delivery: Default::default(),
                 },
             ),
     )

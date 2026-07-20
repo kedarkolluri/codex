@@ -33,6 +33,7 @@ async fn handle_interrupt_agent(
         call_id,
         ..
     } = invocation;
+    ensure_collaboration_sender_allowed(session.as_ref()).await?;
     let arguments = function_arguments(payload)?;
     let args: InterruptAgentArgs = parse_arguments(&arguments)?;
     let agent_id = resolve_agent_target(&session, &turn, &args.target).await?;

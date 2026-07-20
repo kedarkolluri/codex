@@ -1539,6 +1539,7 @@ impl App {
                 self.active_non_primary_shutdown_target(notification)
         {
             self.mark_agent_picker_thread_closed(closed_thread_id);
+            self.clear_workflow_monitor_returns();
             if self.side_threads.contains_key(&closed_thread_id) {
                 self.discard_closed_side_thread(closed_thread_id).await;
                 self.select_agent_thread(tui, app_server, primary_thread_id)

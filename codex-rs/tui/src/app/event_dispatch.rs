@@ -780,6 +780,75 @@ impl App {
                     "failed to load skills on startup",
                 );
             }
+            AppEvent::LoadSavedWorkflows { thread_id } => {
+                self.load_saved_workflows(app_server, thread_id).await;
+            }
+            AppEvent::StartSavedWorkflow {
+                thread_id,
+                name,
+                args,
+            } => {
+                self.start_saved_workflow(app_server, thread_id, name, args)
+                    .await;
+            }
+            AppEvent::RequestWorkflowRead {
+                thread_id,
+                run_id,
+                revision,
+            } => {
+                self.request_workflow_read(app_server, thread_id, run_id, revision);
+            }
+            AppEvent::WorkflowReadFinished {
+                thread_id,
+                run_id,
+                revision,
+                result,
+            } => {
+                self.chat_widget
+                    .on_workflow_read_finished(thread_id, &run_id, revision, result);
+            }
+            AppEvent::RequestWorkflowStop { thread_id, run_id } => {
+                self.request_workflow_stop(app_server, thread_id, run_id);
+            }
+            AppEvent::WorkflowStopFinished {
+                thread_id,
+                run_id,
+                result,
+            } => {
+                self.chat_widget
+                    .on_workflow_stop_finished(thread_id, &run_id, result);
+            }
+            AppEvent::RequestWorkflowPause { target } => {
+                self.request_workflow_pause(app_server, target);
+            }
+            AppEvent::WorkflowPauseFinished { target, result } => {
+                self.chat_widget.on_workflow_pause_finished(target, result);
+            }
+            AppEvent::RequestWorkflowResume { target } => {
+                self.request_workflow_resume(app_server, target);
+            }
+            AppEvent::WorkflowResumeFinished { target, result } => {
+                self.chat_widget.on_workflow_resume_finished(target, result);
+            }
+            AppEvent::RequestWorkflowAgentControl { request } => {
+                self.request_workflow_agent_control(app_server, request);
+            }
+            AppEvent::WorkflowAgentControlFinished { request, result } => {
+                self.chat_widget
+                    .on_workflow_agent_control_finished(request, result);
+            }
+            AppEvent::OpenWorkflowSaveScope { target } => {
+                self.chat_widget.open_workflow_save_scope_picker(target);
+            }
+            AppEvent::RequestWorkflowSave { request } => {
+                self.request_workflow_save(app_server, request);
+            }
+            AppEvent::CancelWorkflowSaveConflict { target } => {
+                self.chat_widget.cancel_workflow_save_conflict(target);
+            }
+            AppEvent::WorkflowSaveFinished { request, result } => {
+                self.chat_widget.on_workflow_save_finished(request, result);
+            }
             AppEvent::StartFileSearch(query) => {
                 self.file_search.on_user_query(query);
             }
@@ -1904,6 +1973,14 @@ impl App {
             }
             AppEvent::SelectAgentThread(thread_id) => {
                 self.select_agent_thread_and_discard_side(tui, app_server, thread_id)
+                    .await?;
+            }
+            AppEvent::SelectWorkflowAgentThread {
+                thread_id,
+                run_id,
+                node_id,
+            } => {
+                self.select_workflow_agent_thread(tui, app_server, thread_id, run_id, node_id)
                     .await?;
             }
             AppEvent::StartSide {

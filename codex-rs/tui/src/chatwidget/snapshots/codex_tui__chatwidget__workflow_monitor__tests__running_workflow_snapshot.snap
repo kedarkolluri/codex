@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 80)"
+---
+◆ Workflow release-check  run-runn  running · elapsed ≥ 7s
+  1.24K tokens · 3 tools
+  ● plan · 0/1 agents · elapsed ≥ 6s
+    └─ ● planner  gpt-5.5 · high  running · attempt 1 · 1.24K tok · 3 tools ·
+       ≥0ms
+  ○ execute
+  ↳ drafting rollout
+  ↳ checking dependencies
+  ↳ ready for review
+
+  Enter inspect agents

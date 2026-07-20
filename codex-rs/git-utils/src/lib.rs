@@ -6,6 +6,7 @@ mod fsmonitor;
 mod info;
 mod operations;
 mod platform;
+mod worktree;
 
 pub use apply::ApplyGitRequest;
 pub use apply::ApplyGitResult;
@@ -43,3 +44,6 @@ pub use info::local_git_branches;
 pub use info::recent_commits;
 pub use info::resolve_root_git_project_for_trust;
 pub use platform::create_symlink;
+pub use worktree::WorktreeCleanupOutcome;
+pub use worktree::WorktreeGuard;
+pub use worktree::worktree_add;
