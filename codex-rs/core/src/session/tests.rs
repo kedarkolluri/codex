@@ -210,6 +210,8 @@ impl StepContext {
 }
 
 mod guardian_tests;
+#[path = "pending_input_recording_tests.rs"]
+mod pending_input_recording_tests;
 
 struct InstructionsTestCase {
     slug: &'static str,
