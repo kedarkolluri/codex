@@ -190,10 +190,12 @@ collaboration operations reject exact workflow targets while preserving their
 existing UUID-only argument behavior; and generic close/resume validate and
 consume one immutable subtree snapshot behind a manager-wide spawn-registration
 barrier. App-server archive/delete now reject an ordinary ancestor containing an
-in-flight exact workflow descendant before any mutation. Two P2 follow-ups stay
-explicit rather than being promoted to passes: app-server archive/delete still
-need to share Core's lifecycle semaphore to exclude a child registered after
-capture, and config-refresh exclusion needs one focused endpoint regression.
+in-flight exact workflow descendant before any mutation. The two recorded P2
+follow-ups are now closed: archive/delete hold Core's manager-wide lifecycle
+gate across capture, preflight, and mutation so a later child cannot escape the
+snapshot; and config plus MCP refresh skip sticky workflow ownership. The
+focused config regression proves that ordinary refreshable state changes while
+the workflow child's exact config allocation remains unchanged.
 
 ### Rescue validation snapshot
 
@@ -223,6 +225,13 @@ The following gates are green in the active tree:
   resume-tree, 2/2 shutdown-tree, 1/1 cascade, and 1/1 direct workflow target;
 - 1/1 app-server archive/delete regression proving that an in-flight exact
   workflow descendant prevents all ancestor-subtree mutation and notification;
+- 1/1 deterministic Core barrier regression proving a workflow child cannot
+  register after an app-server/generic lifecycle operation captures its subtree;
+- 2/2 ordinary app-server archive/delete success paths, 2/2 ordinary generic
+  ancestor guards, and 1/1 generic close/resume cascade remain green behind the
+  shared lifecycle gate;
+- 1/1 app-server `config/batchWrite` reload regression proving an ordinary
+  loaded thread refreshes while a workflow-owned thread retains its exact config;
 - 196 focused core workflow tests, including ownership, recovery, CLI, nested
   execution, budgets, worktrees, and selected-agent controls;
 - 26/26 Python fixture-manifest, mock-server, and transcript-verifier tests;
@@ -241,12 +250,11 @@ The following gates are green in the active tree:
 
 These are the latest focused results, not a final release certificate. Scoped
 fix passes are clean for `core-workflows`, workflow-journal, state,
-app-server-protocol, app-server, and TUI. `just fix -p codex-core` exits successfully
-but still reports seven production and two test warnings in the broader rescue,
-including large broker enum variants, adapter argument counts, and four
-lock/guard-across-await findings; those warnings still require resolution or a
-reviewed narrow rationale. Recent TUI and documentation work also requires one
-coordinated final format/diff pass. The complete workspace `just test` was not
+app-server-protocol, app-server, and TUI. `just fix -p codex-core` exits
+successfully with four unrelated pre-existing broader-rescue warnings; the
+previous lock/guard-across-await findings in the lifecycle path were removed by
+the shared Tokio semaphore design rather than suppressed. The final coordinated
+`just fmt` and diff checks are green. The complete workspace `just test` was not
 authorized after it was offered, so only repository-sanctioned changed-crate
 and focused suites are in scope for the final local certificate.
 
@@ -384,6 +392,21 @@ The remote ref, commit object, tree object, and bundle checksum were verified
 after publication. This is a disaster-recovery snapshot of the exact inherited
 dirty tree, not a review, merge, or upstream-delivery unit. The implementation
 must still be reconstructed as the dependency-ordered tested series below.
+
+The subsequent context/security closure is independently recoverable off-machine:
+
+- GitHub branch: `rescue/dynamic-workflows-wip-20260720-security-closure`;
+- local ref: `refs/rescue/dynamic-workflows/checkpoint/20-security-context-closure-20260720`;
+- commit: `8affa91f076a16069fd4c4cc2caea1ee7dd2bf49`;
+- tree: `3c58cc679e5009bcf676747188b9cbc568217c36`;
+- local complete-history bundle:
+  `/home/kedar/projects/codex/dynamic-workflows-security-context-closure-20260720.bundle`;
+- bundle SHA-256:
+  `ed73507878211a8fb5cda4ee0dd58cb6f92fa357a23f0b3c5f526c66bfda5219`.
+
+Its remote ref and bundle were verified, and the alternate-index capture left
+the real index unchanged. It remains an archival checkpoint rather than a
+reviewable implementation commit.
 
 Do not remove those rescue refs until the delivery series and bundle are safely
 published. Do not cherry-pick the detached M2 snapshot wholesale; the active

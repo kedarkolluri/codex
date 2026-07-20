@@ -1422,7 +1422,10 @@ impl ThreadRequestProcessor {
         params: ThreadArchiveParams,
     ) -> Result<(ThreadArchiveResponse, Vec<String>), JSONRPCErrorError> {
         let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-        self.thread_archive_response(params).await
+        self.thread_manager
+            .run_with_agent_subtree_mutation(self.thread_archive_response(params))
+            .await
+            .map_err(|err| core_thread_write_error("coordinate agent subtree mutation", err))?
     }
 
     async fn thread_archive_response(

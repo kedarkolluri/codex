@@ -7,12 +7,12 @@ rebased as one implementation change.
 
 ## Recovery baseline
 
-- archival branch: `rescue/dynamic-workflows-wip-20260719`
-- archival commit: `97f03385584f8685fb6ef8dd798d6cc8a25f6d57`
-- archival tree: `37d0f9fb2ebd47eda71d58f364258eb24a6df0ef`
-- verified bundle: `../../dynamic-workflows-wip-20260719.bundle`
+- archival branch: `rescue/dynamic-workflows-wip-20260720-security-closure`
+- archival commit: `8affa91f076a16069fd4c4cc2caea1ee7dd2bf49`
+- archival tree: `3c58cc679e5009bcf676747188b9cbc568217c36`
+- verified bundle: `../../dynamic-workflows-security-context-closure-20260720.bundle`
 - bundle SHA-256:
-  `c2b868f7724ffedbe7f03f7daa865ff5aa8eb727bfa5053b9b5efabd1c6638a8`
+  `ed73507878211a8fb5cda4ee0dd58cb6f92fa357a23f0b3c5f526c66bfda5219`
 
 The working tree contains behavior changes, tests, generated files, evidence,
 and large module extractions. Those categories must be reconstructed in

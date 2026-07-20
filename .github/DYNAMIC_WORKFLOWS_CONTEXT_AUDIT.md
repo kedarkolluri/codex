@@ -42,13 +42,15 @@ exact-snapshot mutation, while concurrent spawns each retain one permit through 
 registration. This closes the generic collaboration late-spawn race across distinct `AgentControl`
 handles without holding a lock type forbidden across async suspension.
 
-The app-server archive/delete subtree check remains fail-closed for every descendant present in the
-captured live/persisted graph, but those endpoints do not yet acquire the Core semaphore. A workflow
-child registered after app-server capture is not included in the immutable archive/delete list and
-therefore is not archived, deleted, or notified; the residual P2 race is a possible late-spawn orphan
-or cancellation caused by root shutdown. Final delivery should expose the same lifecycle gate through
-`ThreadManager`, hold it across app-server capture, preflight, and mutation, and add a deterministic
-barrier regression. A post-prepare recheck alone is insufficient.
+App-server archive/delete now use the same Core lifecycle gate across subtree capture, preflight,
+and the complete mutation. The operation future is not polled until every in-flight spawn has
+persisted its edge, and fresh spawns remain excluded until mutation completes. The deterministic
+`agent_subtree_mutation_rejects_workflow_child_spawn_after_capture` barrier regression proves that a
+late workflow-child registration cannot escape the captured subtree, while
+`thread_archive_and_delete_reject_in_flight_workflow_subtree_without_mutation` proves that an
+already registered exact descendant rejects both endpoints before mutation or notification. This
+closes the previously recorded app-server late-spawn P2 race without exposing a semaphore guard
+across the crate boundary.
 
 Role-selected context and the MultiAgentV2 context forced by the workflow dependency are bounded:
 each role-authored base/developer/compact lane is at most 4 KiB and their combined overridden
@@ -160,6 +162,11 @@ retroactively cap arbitrary invalid model output.
   planning and rejected again by their runtime handlers. Direct external injection, global MCP
   refresh, and global user-config reload also exclude workflow children. Persisted sticky ownership
   keeps those rules after resume/restart even when live and durable metadata disagree.
+- `config_batch_write_reload_skips_workflow_managed_thread` drives the app-server config endpoint
+  handler with `reload_user_config: true`: an ordinary loaded thread receives the new refreshable
+  `tool_suggest` state and a new config `Arc`, while the workflow-owned thread retains the exact
+  prior config `Arc`. `MessageProcessor`'s JSON-RPC branch is a typed direct forward to this handler;
+  the public `thread/read` shape intentionally exposes no per-thread runtime config.
 - The only parent-history mutation is the ordinary incremental `workflow_run` call/result. Resume
   reconstructs isolate promises from a durable prefix and never rewrites prior items.
 

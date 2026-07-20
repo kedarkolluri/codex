@@ -579,6 +579,10 @@ fn config_write_error(code: ConfigWriteErrorCode, message: impl Into<String>) ->
 }
 
 #[cfg(test)]
+#[path = "config_processor_runtime_tests.rs"]
+mod runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use super::map_requirements_toml_to_api;
     use codex_app_server_protocol::WindowsSandboxSetupMode;

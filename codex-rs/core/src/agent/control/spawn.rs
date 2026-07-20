@@ -330,12 +330,11 @@ impl AgentControl {
     ) -> CodexResult<LiveAgent> {
         let gate_state = self.upgrade()?;
         let _subtree_guard = gate_state
-            .generic_collaboration_subtree_gate()
+            .agent_subtree_mutation_gate()
             .try_acquire()
             .map_err(|_| {
                 CodexErr::InvalidRequest(
-                    "agent spawn is unavailable during a recursive collaboration mutation"
-                        .to_string(),
+                    "agent spawn is unavailable during a recursive subtree mutation".to_string(),
                 )
             })?;
         if let Some(spawn_workspace) = options.spawn_workspace.as_ref() {

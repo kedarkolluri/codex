@@ -1,5 +1,4 @@
 use super::*;
-use crate::thread_manager::GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS;
 use std::collections::HashSet;
 
 impl AgentControl {
@@ -13,22 +12,19 @@ impl AgentControl {
         agent_id: ThreadId,
     ) -> CodexResult<String> {
         let gate_state = self.upgrade()?;
-        let _subtree_guard = gate_state
-            .generic_collaboration_subtree_gate()
-            .acquire_many(GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS)
-            .await
-            .map_err(|_| {
-                CodexErr::Fatal("generic collaboration subtree gate is closed".to_string())
-            })?;
-        let descendant_ids = self.live_thread_spawn_descendants(agent_id).await?;
-        let mut subtree_thread_ids = Vec::with_capacity(descendant_ids.len() + 1);
-        subtree_thread_ids.push(agent_id);
-        subtree_thread_ids.extend(descendant_ids.iter().copied());
-        self.ensure_generic_collaboration_agents_allowed(&subtree_thread_ids)
-            .await?;
+        gate_state
+            .run_with_agent_subtree_mutation(async {
+                let descendant_ids = self.live_thread_spawn_descendants(agent_id).await?;
+                let mut subtree_thread_ids = Vec::with_capacity(descendant_ids.len() + 1);
+                subtree_thread_ids.push(agent_id);
+                subtree_thread_ids.extend(descendant_ids.iter().copied());
+                self.ensure_generic_collaboration_agents_allowed(&subtree_thread_ids)
+                    .await?;
 
-        self.close_agent_with_captured_descendants(agent_id, descendant_ids)
-            .await
+                self.close_agent_with_captured_descendants(agent_id, descendant_ids)
+                    .await
+            })
+            .await?
     }
 
     /// Resume an ordinary collaboration subtree without crossing into workflow-owned agents.
@@ -43,25 +39,22 @@ impl AgentControl {
         session_source: SessionSource,
     ) -> CodexResult<ThreadId> {
         let gate_state = self.upgrade()?;
-        let _subtree_guard = gate_state
-            .generic_collaboration_subtree_gate()
-            .acquire_many(GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS)
-            .await
-            .map_err(|_| {
-                CodexErr::Fatal("generic collaboration subtree gate is closed".to_string())
-            })?;
-        let (children_by_parent, subtree_thread_ids) =
-            self.capture_open_persisted_agent_subtree(thread_id).await?;
-        self.ensure_generic_collaboration_agents_allowed(&subtree_thread_ids)
-            .await?;
+        gate_state
+            .run_with_agent_subtree_mutation(async {
+                let (children_by_parent, subtree_thread_ids) =
+                    self.capture_open_persisted_agent_subtree(thread_id).await?;
+                self.ensure_generic_collaboration_agents_allowed(&subtree_thread_ids)
+                    .await?;
 
-        Box::pin(self.resume_agent_from_rollout_with_captured_descendants(
-            config,
-            thread_id,
-            session_source,
-            children_by_parent,
-        ))
-        .await
+                Box::pin(self.resume_agent_from_rollout_with_captured_descendants(
+                    config,
+                    thread_id,
+                    session_source,
+                    children_by_parent,
+                ))
+                .await
+            })
+            .await?
     }
 
     async fn capture_open_persisted_agent_subtree(
