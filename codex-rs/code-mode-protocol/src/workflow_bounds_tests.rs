@@ -75,7 +75,8 @@ fn exported_text_validators_apply_their_exact_contracts() {
     let label = ensure_workflow_agent_label;
     let max = WORKFLOW_AGENT_LABEL_MAX_BYTES;
     assert_bound("workflow agent label", max, label);
-    let option = |value| ensure_workflow_agent_option("opts.model", value);
+    let option: fn(&str) -> Result<(), String> =
+        |value| ensure_workflow_agent_option("opts.model", value);
     assert_bound("opts.model", WORKFLOW_AGENT_OPTION_MAX_BYTES, option);
     let phase = ensure_workflow_phase_title;
     let max = WORKFLOW_PHASE_TITLE_MAX_BYTES;
