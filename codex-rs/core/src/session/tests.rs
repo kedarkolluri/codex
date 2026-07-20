@@ -1012,6 +1012,47 @@ async fn new_turn_refreshes_managed_network_proxy_for_sandbox_change() -> anyhow
 }
 
 #[tokio::test]
+async fn invalid_turn_settings_still_emit_bad_request_and_error_status() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let mut builder = test_codex().with_config(|config| {
+        config.permissions.approval_policy =
+            codex_config::Constrained::allow_only(AskForApproval::OnRequest);
+    });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "ordinary prompt".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                ..Default::default()
+            },
+        })
+        .await?;
+    let EventMsg::Error(error) =
+        wait_for_event(&test.codex, |event| matches!(event, EventMsg::Error(_))).await
+    else {
+        unreachable!();
+    };
+    assert_eq!(
+        (error.codex_error_info, test.codex.agent_status().await,),
+        (
+            Some(CodexErrorInfo::BadRequest),
+            AgentStatus::Errored(error.message),
+        )
+    );
+
+    test.codex.submit(Op::Shutdown).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn danger_full_access_turns_do_not_expose_managed_network_proxy() -> anyhow::Result<()> {
     let network_spec = crate::config::NetworkProxySpec::from_config_and_constraints(
         NetworkProxyConfig::default(),

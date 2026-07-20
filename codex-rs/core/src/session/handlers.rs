@@ -214,9 +214,20 @@ pub(super) async fn user_input_or_turn_inner(
     };
     updates.final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
-        // new_turn_with_sub_id already emits the error event.
-        return;
+    let current_context = match sess.new_turn_with_sub_id(sub_id.clone(), updates).await {
+        Ok(current_context) => current_context,
+        Err(error) => {
+            let message = error.to_string();
+            sess.send_event_raw(Event {
+                id: sub_id,
+                msg: EventMsg::Error(ErrorEvent {
+                    message,
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return;
+        }
     };
     if emit_thread_settings_applied {
         sess.send_event_raw_without_materializing_rollout(Event {
