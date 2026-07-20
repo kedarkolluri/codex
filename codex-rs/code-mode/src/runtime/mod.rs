@@ -1,6 +1,8 @@
 mod callbacks;
+mod events;
 mod globals;
 mod module_loader;
+mod state;
 mod timers;
 mod value;
 
@@ -10,65 +12,21 @@ use std::panic::catch_unwind;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
-use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::EnabledToolMetadata;
 use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::enabled_tool_metadata;
-use codex_protocol::ToolName;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
 use crate::TaskFailureHandler;
 use crate::v8_init::ensure_v8_initialized;
+pub(crate) use events::PendingRuntimeMode;
+pub(crate) use events::RuntimeCommand;
+pub(crate) use events::RuntimeControlCommand;
+pub(crate) use events::RuntimeEvent;
+pub(super) use state::RuntimeState;
 
 const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
-
-#[derive(Debug)]
-pub(crate) enum RuntimeCommand {
-    ToolResponse { id: String, result: JsonValue },
-    ToolError { id: String, error_text: String },
-    TimeoutFired { id: u64 },
-    ObservePendingFrontier,
-    Terminate,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum PendingRuntimeMode {
-    #[cfg(test)]
-    Continue,
-    PauseUntilResumed,
-}
-
-#[derive(Debug)]
-pub(crate) enum RuntimeControlCommand {
-    Continue,
-    Resume,
-    Terminate,
-}
-
-#[derive(Debug)]
-pub(crate) enum RuntimeEvent {
-    Started,
-    Pending,
-    ContentItem(FunctionCallOutputContentItem),
-    YieldRequested,
-    ToolCall {
-        id: String,
-        name: ToolName,
-        kind: CodeModeToolKind,
-        input: Option<JsonValue>,
-    },
-    Notify {
-        call_id: String,
-        text: String,
-    },
-    Result {
-        stored_value_writes: HashMap<String, JsonValue>,
-        error_text: Option<String>,
-    },
-    ThreadPanicked,
-}
 
 pub(crate) fn spawn_runtime(
     stored_values: HashMap<String, JsonValue>,
@@ -141,20 +99,6 @@ struct RuntimeConfig {
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
     stored_values: HashMap<String, JsonValue>,
-}
-
-pub(super) struct RuntimeState {
-    event_tx: mpsc::UnboundedSender<RuntimeEvent>,
-    pending_tool_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
-    pending_timeouts: HashMap<u64, timers::ScheduledTimeout>,
-    stored_values: HashMap<String, JsonValue>,
-    stored_value_writes: HashMap<String, JsonValue>,
-    enabled_tools: Vec<EnabledToolMetadata>,
-    next_tool_call_id: u64,
-    next_timeout_id: u64,
-    tool_call_id: String,
-    runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
-    exit_requested: bool,
 }
 
 pub(super) enum CompletionState {
