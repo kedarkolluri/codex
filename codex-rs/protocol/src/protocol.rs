@@ -3039,6 +3039,18 @@ pub enum MultiAgentVersion {
     V2,
 }
 
+/// Versioned marker assigning durable child-completion ownership to a workflow supervisor.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, TS)]
+pub struct WorkflowSupervisorOwnership {
+    /// Ownership contract version interpreted by the workflow runtime.
+    pub version: u32,
+}
+
+impl WorkflowSupervisorOwnership {
+    /// The initial workflow-supervisor ownership contract.
+    pub const V1: Self = Self { version: 1 };
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, TS)]
 pub struct SessionContextWindow {
     /// UUIDv7 identity of this context window.
@@ -3083,6 +3095,11 @@ pub struct SessionMeta {
     /// Optional analytics source classification for this thread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_source: Option<ThreadSource>,
+    /// Codex-authored durable completion ownership for workflow-managed child sessions.
+    ///
+    /// This field controls completion delivery; `thread_source` remains analytics-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_supervisor_ownership: Option<WorkflowSupervisorOwnership>,
     /// Optional random unique nickname assigned to an AgentControl-spawned sub-agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_nickname: Option<String>,
@@ -3140,6 +3157,7 @@ impl Default for SessionMeta {
             cli_version: String::new(),
             source: SessionSource::default(),
             thread_source: None,
+            workflow_supervisor_ownership: None,
             agent_nickname: None,
             agent_role: None,
             agent_path: None,
@@ -5876,6 +5894,37 @@ mod tests {
         let mut unknown = serialized;
         unknown["history_mode"] = json!("future");
         assert!(serde_json::from_value::<SessionMeta>(unknown).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn session_meta_workflow_supervisor_ownership_is_versioned_and_backward_compatible()
+    -> Result<()> {
+        let serialized = serde_json::to_value(SessionMeta::default())?;
+        assert_eq!(serialized.get("workflow_supervisor_ownership"), None);
+
+        let legacy_meta: SessionMeta = serde_json::from_value(serialized.clone())?;
+        assert_eq!(legacy_meta.workflow_supervisor_ownership, None);
+
+        let mut known = serialized.clone();
+        known["workflow_supervisor_ownership"] = json!({ "version": 1 });
+        let workflow_meta: SessionMeta = serde_json::from_value(known)?;
+        assert_eq!(
+            workflow_meta.workflow_supervisor_ownership,
+            Some(WorkflowSupervisorOwnership::V1)
+        );
+        assert_eq!(
+            serde_json::to_value(workflow_meta)?["workflow_supervisor_ownership"],
+            json!({ "version": 1 })
+        );
+
+        let mut future = serialized;
+        future["workflow_supervisor_ownership"] = json!({ "version": 2 });
+        let future_meta: SessionMeta = serde_json::from_value(future)?;
+        assert_eq!(
+            future_meta.workflow_supervisor_ownership,
+            Some(WorkflowSupervisorOwnership { version: 2 })
+        );
         Ok(())
     }
 

@@ -18,6 +18,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::protocol::WorkflowSupervisorOwnership;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::fs::File;
@@ -169,6 +170,7 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
             cli_version: "test".to_string(),
             source: SessionSource::Cli,
             thread_source: None,
+            workflow_supervisor_ownership: None,
             agent_path: None,
             agent_nickname: None,
             agent_role: None,
@@ -587,6 +589,45 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
 
     recorder.shutdown().await?;
     Ok(())
+}
+
+#[tokio::test]
+async fn recorder_round_trips_workflow_supervisor_ownership() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        )
+        .with_workflow_supervisor_ownership(Some(WorkflowSupervisorOwnership::V1)),
+    )
+    .await?;
+
+    recorder.persist().await?;
+
+    let first_line = fs::read_to_string(recorder.rollout_path())?
+        .lines()
+        .next()
+        .expect("session metadata line")
+        .to_string();
+    let line: RolloutLine = serde_json::from_str(&first_line)?;
+    let RolloutItem::SessionMeta(session_meta) = line.item else {
+        panic!("expected session metadata");
+    };
+    assert_eq!(
+        session_meta.meta.workflow_supervisor_ownership,
+        Some(WorkflowSupervisorOwnership::V1)
+    );
+
+    recorder.shutdown().await
 }
 
 #[tokio::test]

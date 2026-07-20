@@ -69,6 +69,7 @@ use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
+use codex_protocol::protocol::WorkflowSupervisorOwnership;
 use codex_state::StateRuntime;
 use codex_utils_path as path_utils;
 
@@ -97,6 +98,7 @@ pub enum RolloutRecorderParams {
         parent_thread_id: Option<ThreadId>,
         source: Box<SessionSource>,
         thread_source: Option<ThreadSource>,
+        workflow_supervisor_ownership: Option<WorkflowSupervisorOwnership>,
         originator: String,
         base_instructions: BaseInstructions,
         dynamic_tools: Vec<DynamicToolSpec>,
@@ -191,6 +193,7 @@ impl RolloutRecorderParams {
             parent_thread_id,
             source: Box::new(source),
             thread_source,
+            workflow_supervisor_ownership: None,
             originator,
             base_instructions,
             dynamic_tools,
@@ -205,6 +208,20 @@ impl RolloutRecorderParams {
     pub fn with_session_id(mut self, session_id: SessionId) -> Self {
         if let Self::Create { session_id: id, .. } = &mut self {
             *id = session_id;
+        }
+        self
+    }
+
+    pub fn with_workflow_supervisor_ownership(
+        mut self,
+        workflow_supervisor_ownership: Option<WorkflowSupervisorOwnership>,
+    ) -> Self {
+        if let Self::Create {
+            workflow_supervisor_ownership: ownership,
+            ..
+        } = &mut self
+        {
+            *ownership = workflow_supervisor_ownership;
         }
         self
     }
@@ -784,6 +801,7 @@ impl RolloutRecorder {
                 parent_thread_id,
                 source,
                 thread_source,
+                workflow_supervisor_ownership,
                 originator,
                 base_instructions,
                 dynamic_tools,
@@ -821,6 +839,7 @@ impl RolloutRecorder {
                     agent_path: source.get_agent_path().map(Into::into),
                     source: *source,
                     thread_source,
+                    workflow_supervisor_ownership,
                     model_provider: Some(config.model_provider_id().to_string()),
                     base_instructions: Some(base_instructions),
                     dynamic_tools: if dynamic_tools.is_empty() {

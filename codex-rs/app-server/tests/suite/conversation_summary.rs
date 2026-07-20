@@ -133,6 +133,7 @@ async fn get_conversation_summary_by_thread_id_reads_pathless_store_thread() -> 
             parent_thread_id: None,
             source: SessionSource::Cli,
             thread_source: None,
+            workflow_supervisor_ownership: None,
             originator: "test_originator".to_string(),
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
