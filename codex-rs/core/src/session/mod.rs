@@ -26,6 +26,7 @@ use crate::context::ApprovedCommandPrefixSaved;
 use crate::context::AvailableSkillsInstructions;
 use crate::context::ContextualUserFragment;
 use crate::context::MultiAgentModeInstructions;
+use crate::context::MultiAgentUsageHint;
 use crate::context::NetworkRuleSaved;
 use crate::context::PersonalitySpecInstructions;
 use crate::context::RecommendedPluginsInstructions;
@@ -3406,13 +3407,18 @@ impl Session {
                 items.push(developer_message);
             }
         }
-        if let Some(usage_hint_text) = multi_agent_v2_usage_hint_text
-            && let Some(usage_hint_message) =
+        if let Some(usage_hint_text) = multi_agent_v2_usage_hint_text {
+            if turn_context.config.features.enabled(Feature::Workflow) {
+                items.push(ContextualUserFragment::into(MultiAgentUsageHint::new(
+                    usage_hint_text,
+                )));
+            } else if let Some(usage_hint_message) =
                 crate::context_manager::updates::build_developer_update_item(vec![
                     usage_hint_text.to_string(),
                 ])
-        {
-            items.push(usage_hint_message);
+            {
+                items.push(usage_hint_message);
+            }
         }
         if let Some(multi_agent_mode) = multi_agents::effective_multi_agent_mode(turn_context)
             && let Some(instructions) = MultiAgentModeInstructions::from_mode(multi_agent_mode)

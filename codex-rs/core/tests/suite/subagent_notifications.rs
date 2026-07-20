@@ -999,6 +999,10 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
 ) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    const ROOT_USAGE_HINT: &str = "Parent root usage hint sentinel.";
+    const CHILD_USAGE_HINT: &str = "Child subagent usage hint sentinel.";
+    const MODE_HINT: &str = "Preserve this forked multi-agent mode sentinel.";
+
     let server = start_mock_server().await;
     let seed_turn = mount_sse_once_match(
         &server,
@@ -1078,6 +1082,17 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
             .features
             .enable(Feature::MultiAgentV2)
             .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::CodeMode)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::Workflow)
+            .expect("test config should allow feature update");
+        config.multi_agent_v2.root_agent_usage_hint_text = Some(ROOT_USAGE_HINT.to_string());
+        config.multi_agent_v2.subagent_usage_hint_text = Some(CHILD_USAGE_HINT.to_string());
+        config.multi_agent_v2.multi_agent_mode_hint_text = Some(MODE_HINT.to_string());
         config.model = Some(INHERITED_MODEL.to_string());
         config.model_reasoning_effort = Some(INHERITED_REASONING_EFFORT);
         config.agent_default_subagent_model = Some(V2_DEFAULT_MODEL.to_string());
@@ -1092,6 +1107,26 @@ async fn spawned_full_history_v2_child_uses_model_precedence_without_dropping_co
 
     let child_request = wait_for_request_with_model(&child_request_log, expected_model).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
+    let developer_messages = child_request.message_input_texts("developer");
+    assert_eq!(
+        developer_messages
+            .iter()
+            .filter(|text| text.starts_with("<multi_agent_usage_hint>\n"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![format!(
+            "<multi_agent_usage_hint>\n{CHILD_USAGE_HINT}\n</multi_agent_usage_hint>"
+        )]
+    );
+    assert!(!child_request.body_contains_text(ROOT_USAGE_HINT));
+    assert_eq!(
+        developer_messages
+            .iter()
+            .filter(|text| text.starts_with("<multi_agent_mode>"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![format!("<multi_agent_mode>{MODE_HINT}</multi_agent_mode>")]
+    );
     let child_body = child_request.body_json();
     assert_eq!(
         (

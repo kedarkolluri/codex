@@ -1,7 +1,7 @@
 use super::MultiAgentV2Config;
 
 pub(super) const USAGE_HINT_TEXT_MAX_BYTES: usize = 1_000;
-pub(super) const PROMPT_FIELD_MAX_BYTES: usize = 4_000;
+pub(crate) const PROMPT_FIELD_MAX_BYTES: usize = 4_000;
 pub(super) const PROMPT_TOTAL_MAX_BYTES: usize = 8_000;
 
 pub(super) fn validate(config: &MultiAgentV2Config) -> std::io::Result<()> {

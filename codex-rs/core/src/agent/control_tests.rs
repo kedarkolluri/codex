@@ -9,6 +9,8 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentModeInstructions;
+use crate::context::MultiAgentUsageHint;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
@@ -25,6 +27,7 @@ use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::config_types::Settings;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
@@ -82,6 +85,15 @@ async fn test_config_with_cli_overrides(
 
 async fn test_config() -> (TempDir, Config) {
     test_config_with_cli_overrides(Vec::new()).await
+}
+
+fn enable_workflow_for_usage_hint_test(config: &mut Config) {
+    for feature in [Feature::MultiAgentV2, Feature::CodeMode, Feature::Workflow] {
+        config
+            .features
+            .enable(feature)
+            .expect("test config should allow feature update");
+    }
 }
 
 fn text_input(text: &str) -> Vec<UserInput> {
@@ -1203,19 +1215,31 @@ async fn spawn_agent_numeric_fork_from_compacted_paginated_parent_clamps_to_prov
 
 #[tokio::test]
 async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+    const MODE_SENTINEL: &str = "Preserve this multi-agent mode policy.";
+
+    let mode_instructions =
+        MultiAgentModeInstructions::from_mode(MultiAgentMode::Custom(MODE_SENTINEL.to_string()))
+            .expect("non-empty custom mode should render")
+            .render();
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
-    let _ = parent_config.features.enable(Feature::MultiAgentV2);
-    parent_config.multi_agent_v2.root_agent_usage_hint_text =
-        Some("Parent root guidance.".to_string());
+    enable_workflow_for_usage_hint_test(&mut parent_config);
+    let legacy_default_root_guidance = parent_config
+        .multi_agent_v2
+        .root_agent_usage_hint_text
+        .clone()
+        .expect("default root guidance");
+    parent_config.multi_agent_v2.root_agent_usage_hint_text = Some(mode_instructions.clone());
     parent_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Parent subagent guidance.".to_string());
+    parent_config.multi_agent_v2.multi_agent_mode_hint_text = Some(MODE_SENTINEL.to_string());
     let mut child_config = harness.config.clone();
-    let _ = child_config.features.enable(Feature::MultiAgentV2);
+    enable_workflow_for_usage_hint_test(&mut child_config);
     child_config.multi_agent_v2.root_agent_usage_hint_text =
         Some("Child root guidance.".to_string());
     child_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Child subagent guidance.".to_string());
+    child_config.multi_agent_v2.multi_agent_mode_hint_text = Some(MODE_SENTINEL.to_string());
     let new_thread = harness
         .manager
         .start_thread(parent_config.clone())
@@ -1236,6 +1260,24 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .expect("parent seed should be recorded");
     let turn_context = parent_thread.session.new_default_turn().await;
     let parent_spawn_call_id = "spawn-call-history".to_string();
+    let retained_aggregated_context = "Parent subagent guidance.";
+    let aggregated_parent_context = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: retained_aggregated_context.to_string(),
+            },
+            ContentItem::InputText {
+                text: MultiAgentUsageHint::new("Parent subagent guidance.").render(),
+            },
+            ContentItem::InputText {
+                text: mode_instructions.clone(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
     let trigger_message = InterAgentCommunication::new(
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("agent path"),
@@ -1248,24 +1290,19 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .record_conversation_items(
             turn_context.as_ref(),
             &[
+                ContextualUserFragment::into(MultiAgentUsageHint::new(
+                    "Historical parent root guidance.",
+                )),
                 ResponseItem::Message {
                     id: None,
                     role: "developer".to_string(),
                     content: vec![ContentItem::InputText {
-                        text: "Parent root guidance.".to_string(),
+                        text: legacy_default_root_guidance.clone(),
                     }],
                     phase: None,
                     internal_chat_message_metadata_passthrough: None,
                 },
-                ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: "Parent subagent guidance.".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
+                aggregated_parent_context,
                 assistant_message("parent commentary", Some(MessagePhase::Commentary)),
                 assistant_message("parent final answer", Some(MessagePhase::FinalAnswer)),
                 assistant_message("parent unknown phase", /*phase*/ None),
@@ -1294,6 +1331,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .flush_rollout()
         .await
         .expect("parent rollout should flush");
+    let parent_history_before_fork = parent_thread.session.clone_history().await;
     let child_thread_id = harness
         .control
         .spawn_agent_with_metadata(
@@ -1326,23 +1364,36 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let mut expected_final_answer =
         assistant_message("parent final answer", Some(MessagePhase::FinalAnswer));
     expected_final_answer.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut expected_aggregated_context = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: retained_aggregated_context.to_string(),
+            },
+            ContentItem::InputText {
+                text: mode_instructions,
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_aggregated_context.set_turn_id_if_missing(&turn_context.sub_id);
     let expected_history = [
         expected_parent_seed,
+        expected_aggregated_context,
         expected_final_answer,
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Child subagent guidance.".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        ContextualUserFragment::into(MultiAgentUsageHint::new("Child subagent guidance.")),
     ];
     assert_eq!(
         history.raw_items(),
         &expected_history,
-        "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
+        "full-history forked child history should replace identified parent usage hints, preserve mode and unrelated developer context, and filter non-final assistant/tool chatter"
+    );
+    assert_eq!(
+        parent_thread.session.clone_history().await.raw_items(),
+        parent_history_before_fork.raw_items(),
+        "fork sanitization must not mutate parent history"
     );
     assert_eq!(
         serde_json::to_value(child_thread.session.reference_context_item().await)
@@ -1353,7 +1404,7 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     );
 
     let mut no_hint_child_config = harness.config.clone();
-    let _ = no_hint_child_config.features.enable(Feature::MultiAgentV2);
+    enable_workflow_for_usage_hint_test(&mut no_hint_child_config);
     no_hint_child_config.multi_agent_v2.subagent_usage_hint_text = None;
     let no_hint_child_thread_id = harness
         .control
@@ -1425,19 +1476,23 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
 
 #[tokio::test]
 async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
+    const MODE_SENTINEL: &str = "Preserve compacted multi-agent mode policy.";
+
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
-    let _ = parent_config.features.enable(Feature::MultiAgentV2);
+    enable_workflow_for_usage_hint_test(&mut parent_config);
     parent_config.multi_agent_v2.root_agent_usage_hint_text =
         Some("Parent root guidance.".to_string());
     parent_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Parent subagent guidance.".to_string());
+    parent_config.multi_agent_v2.multi_agent_mode_hint_text = Some(MODE_SENTINEL.to_string());
     let mut child_config = harness.config.clone();
-    let _ = child_config.features.enable(Feature::MultiAgentV2);
+    enable_workflow_for_usage_hint_test(&mut child_config);
     child_config.multi_agent_v2.root_agent_usage_hint_text =
         Some("Child root guidance.".to_string());
     child_config.multi_agent_v2.subagent_usage_hint_text =
         Some("Child subagent guidance.".to_string());
+    child_config.multi_agent_v2.multi_agent_mode_hint_text = Some(MODE_SENTINEL.to_string());
     let new_thread = harness
         .manager
         .start_thread(parent_config)
@@ -1460,9 +1515,21 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Parent root guidance.".to_string(),
-            }],
+            content: vec![
+                ContentItem::InputText {
+                    text: "retained compacted developer context".to_string(),
+                },
+                ContentItem::InputText {
+                    text: MultiAgentUsageHint::new("Parent root guidance.").render(),
+                },
+                ContentItem::InputText {
+                    text: MultiAgentModeInstructions::from_mode(MultiAgentMode::Custom(
+                        MODE_SENTINEL.to_string(),
+                    ))
+                    .expect("non-empty custom mode should render")
+                    .render(),
+                },
+            ],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1524,6 +1591,11 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),
         "forked child history should strip stale parent hints from compacted replacement history"
+    );
+    assert!(
+        history_contains_text(history.raw_items(), "retained compacted developer context")
+            && history_contains_text(history.raw_items(), MODE_SENTINEL),
+        "compacted sanitization should preserve unrelated developer context and mode policy"
     );
     assert!(
         history_contains_text(history.raw_items(), "Child subagent guidance."),
