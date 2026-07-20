@@ -53,6 +53,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::WorkflowSupervisorOwnership;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
@@ -1128,6 +1129,7 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
     .expect("read child session metadata");
     assert_eq!(meta.meta.history_mode, ThreadHistoryMode::Paginated);
     assert_eq!(meta.meta.subagent_history_start_ordinal, None);
+    assert_eq!(meta.meta.workflow_supervisor_ownership, None);
 
     let _ = harness
         .control
@@ -1138,6 +1140,159 @@ async fn spawn_agent_without_fork_from_paginated_parent_stays_fresh_and_paginate
         .submit(Op::Shutdown {})
         .await
         .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
+async fn workflow_supervised_spawn_persists_typed_ownership() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .spawn_anonymous_child(
+            parent_thread_id,
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                parent_completion_delivery: ParentCompletionDelivery::WorkflowSupervisor {
+                    ownership: WorkflowSupervisorOwnership::V1,
+                },
+                ..Default::default()
+            },
+        )
+        .await;
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    child_thread.ensure_rollout_materialized().await;
+    child_thread
+        .flush_rollout()
+        .await
+        .expect("child rollout should flush");
+    let meta = codex_rollout::read_session_meta_line(
+        &child_thread
+            .rollout_path()
+            .expect("child rollout should exist"),
+    )
+    .await
+    .expect("read child session metadata");
+
+    assert_eq!(
+        meta.meta.workflow_supervisor_ownership,
+        Some(WorkflowSupervisorOwnership::V1)
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should submit");
+    let _ = parent_thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("parent shutdown should submit");
+}
+
+#[tokio::test]
+async fn workflow_supervised_spawn_rejects_forks_before_manager_access() {
+    let control = AgentControl::default();
+    let (_home, config) = test_config().await;
+    let parent_thread_id = ThreadId::new();
+
+    for fork_mode in [
+        SpawnAgentForkMode::FullHistory,
+        SpawnAgentForkMode::LastNTurns(1),
+    ] {
+        let err = control
+            .spawn_agent_with_metadata(
+                config.clone(),
+                text_input("child task"),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_path: None,
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                SpawnAgentOptions {
+                    fork_mode: Some(fork_mode),
+                    parent_thread_id: Some(parent_thread_id),
+                    parent_completion_delivery: ParentCompletionDelivery::WorkflowSupervisor {
+                        ownership: WorkflowSupervisorOwnership::V1,
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("workflow-supervised fork should fail");
+
+        assert_matches!(
+            err,
+            CodexErr::InvalidRequest(message)
+                if message == "workflow-supervised agents cannot fork parent history"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workflow_supervised_spawn_requires_matching_parent_before_manager_access() {
+    let control = AgentControl::default();
+    let (_home, config) = test_config().await;
+    let parent_thread_id = ThreadId::new();
+    let other_thread_id = ThreadId::new();
+    let cases = vec![
+        (None, Some(parent_thread_id)),
+        (
+            Some(SessionSource::SubAgent(SubAgentSource::Other(
+                "not-a-thread-spawn".to_string(),
+            ))),
+            Some(parent_thread_id),
+        ),
+        (
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            None,
+        ),
+        (
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            Some(other_thread_id),
+        ),
+    ];
+
+    for (session_source, requested_parent_thread_id) in cases {
+        let err = control
+            .spawn_agent_with_metadata(
+                config.clone(),
+                text_input("child task"),
+                session_source,
+                SpawnAgentOptions {
+                    parent_thread_id: requested_parent_thread_id,
+                    parent_completion_delivery: ParentCompletionDelivery::WorkflowSupervisor {
+                        ownership: WorkflowSupervisorOwnership::V1,
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("workflow-supervised spawn should require a matching parent");
+
+        assert_matches!(
+            err,
+            CodexErr::InvalidRequest(message)
+                if message
+                    == "workflow-supervised agents require a matching thread-spawn parent"
+        );
+    }
 }
 
 #[tokio::test]

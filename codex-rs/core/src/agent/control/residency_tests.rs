@@ -1,5 +1,6 @@
 use crate::ThreadManager;
 use crate::agent::AgentControl;
+use crate::agent::ParentCompletionDelivery;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
 use crate::config::test_config;
@@ -142,6 +143,7 @@ async fn spawn_v2_subagent(
             Some(parent_thread_id),
             /*forked_from_thread_id*/ None,
             Some(ThreadSource::Subagent),
+            ParentCompletionDelivery::NotifyParent,
             /*metrics_service_name*/ None,
             /*inherited_environments*/ None,
             /*inherited_exec_policy*/ None,

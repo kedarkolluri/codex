@@ -112,6 +112,7 @@ pub(crate) async fn run_codex_thread_interactive(
         forked_from_thread_id,
         parent_thread_id: Some(parent_session.thread_id),
         thread_source: Some(ThreadSource::Subagent),
+        parent_completion_delivery: crate::agent::ParentCompletionDelivery::NotifyParent,
         originator: parent_ctx.originator.clone(),
         agent_control: parent_session.services.agent_control.clone(),
         dynamic_tools: Vec::new(),
