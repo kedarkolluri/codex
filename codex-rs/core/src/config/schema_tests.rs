@@ -55,6 +55,43 @@ Run `just write-config-schema` to overwrite with your changes.\n\n{diff}"
 }
 
 #[test]
+fn config_schema_accepts_workflow_feature_config() {
+    let schema_json = config_schema_json().expect("serialize config schema");
+    let schema_value: serde_json::Value =
+        serde_json::from_slice(&schema_json).expect("decode schema json");
+
+    let workflow = schema_value
+        .pointer("/properties/features/properties/workflow")
+        .expect("features.workflow property should exist in the schema");
+    assert_eq!(
+        workflow.get("$ref").and_then(serde_json::Value::as_str),
+        Some("#/definitions/FeatureToml_for_WorkflowConfigToml")
+    );
+
+    let wrapper = schema_value
+        .pointer("/definitions/FeatureToml_for_WorkflowConfigToml/anyOf")
+        .and_then(serde_json::Value::as_array)
+        .expect("workflow feature config should accept multiple shapes");
+    assert_eq!(
+        (
+            wrapper.iter().any(|variant| {
+                variant.get("type").and_then(serde_json::Value::as_str) == Some("boolean")
+            }),
+            wrapper.iter().any(|variant| {
+                variant.get("$ref").and_then(serde_json::Value::as_str)
+                    == Some("#/definitions/WorkflowConfigToml")
+            }),
+        ),
+        (true, true)
+    );
+
+    let enabled = schema_value
+        .pointer("/definitions/WorkflowConfigToml/properties/enabled/type")
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(enabled, Some("boolean"));
+}
+
+#[test]
 fn config_schema_hides_unsupported_inline_mcp_bearer_token() {
     let schema_json = config_schema_json().expect("serialize config schema");
     let schema_value: serde_json::Value =
