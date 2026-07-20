@@ -86,6 +86,60 @@ fn code_mode_only_requires_code_mode() {
 }
 
 #[test]
+fn workflow_config_enables_its_runtime_dependencies() {
+    let features_toml: FeaturesToml = toml::from_str(
+        r#"
+[workflow]
+enabled = true
+"#,
+    )
+    .expect("workflow feature config should deserialize");
+    assert_eq!(
+        features_toml.workflow,
+        Some(FeatureToml::Config(crate::WorkflowConfigToml {
+            enabled: Some(true),
+        }))
+    );
+
+    let features = Features::from_sources(
+        FeatureConfigSource {
+            features: Some(&features_toml),
+            ..Default::default()
+        },
+        FeatureConfigSource::default(),
+        FeatureOverrides::default(),
+    );
+    assert_eq!(
+        (
+            features.enabled(Feature::Workflow),
+            features.enabled(Feature::CodeMode),
+            features.enabled(Feature::MultiAgentV2),
+        ),
+        (true, true, true)
+    );
+}
+
+#[test]
+fn workflow_config_accepts_boolean_toggle() {
+    let features_toml: FeaturesToml =
+        toml::from_str("workflow = true").expect("workflow feature toggle should deserialize");
+
+    assert_eq!(features_toml.workflow, Some(FeatureToml::Enabled(true)));
+}
+
+#[test]
+fn workflow_config_rejects_unknown_fields() {
+    toml::from_str::<FeaturesToml>(
+        r#"
+[workflow]
+enabled = true
+unknown = true
+"#,
+    )
+    .expect_err("unknown workflow feature fields should be rejected");
+}
+
+#[test]
 fn from_sources_ignores_removed_terminal_resize_reflow_feature_key() {
     let features_toml = FeaturesToml::from(BTreeMap::from([(
         "terminal_resize_reflow".to_string(),

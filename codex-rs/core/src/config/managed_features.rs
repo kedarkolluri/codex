@@ -313,11 +313,11 @@ pub(crate) fn validate_explicit_feature_settings_in_config_toml(
     Ok(())
 }
 
-pub(crate) fn validate_feature_requirements_in_config_toml(
+pub(crate) fn resolve_features_in_config_toml(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
-) -> std::io::Result<()> {
-    let configured_features = Features::from_sources(
+) -> std::io::Result<ManagedFeatures> {
+    let configured_features = Features::from_sources_without_dependency_normalization(
         FeatureConfigSource {
             features: cfg.features.as_ref(),
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
@@ -325,5 +325,5 @@ pub(crate) fn validate_feature_requirements_in_config_toml(
         FeatureConfigSource::default(),
         FeatureOverrides::default(),
     );
-    ManagedFeatures::from_configured(configured_features, feature_requirements.cloned()).map(|_| ())
+    ManagedFeatures::from_configured(configured_features, feature_requirements.cloned())
 }

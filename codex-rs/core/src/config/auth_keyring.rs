@@ -23,7 +23,7 @@ pub fn resolve_bootstrap_auth_keyring_backend_kind(
     bootstrap_config: &ConfigTomlLoadResult,
 ) -> std::io::Result<AuthKeyringBackendKind> {
     let config_toml = &bootstrap_config.config_toml;
-    let features = Features::from_sources(
+    let features = Features::from_sources_without_dependency_normalization(
         FeatureConfigSource {
             features: config_toml.features.as_ref(),
             experimental_use_unified_exec_tool: config_toml.experimental_use_unified_exec_tool,

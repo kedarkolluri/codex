@@ -778,6 +778,55 @@ personality = true
 }
 
 #[tokio::test]
+async fn write_value_rejects_workflow_dependency_conflict_from_base_config() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join(CONFIG_TOML_FILE),
+        "[features]\nworkflow = true\n",
+    )
+    .unwrap();
+    let selected_path = tmp.path().join("work.config.toml");
+    std::fs::write(&selected_path, "").unwrap();
+
+    let mut loader_overrides =
+        LoaderOverrides::with_managed_config_path_for_tests(tmp.path().join("managed_config.toml"));
+    loader_overrides.user_config_path =
+        Some(AbsolutePathBuf::from_absolute_path(&selected_path).expect("selected config path"));
+    loader_overrides.user_config_profile = Some("work".parse().expect("profile-v2 name"));
+    let service = ConfigManager::new_for_tests(
+        tmp.path().to_path_buf(),
+        vec![],
+        loader_overrides,
+        CloudConfigBundleLoader::default(),
+    );
+
+    for dependency in ["code_mode", "multi_agent_v2"] {
+        let error = service
+            .write_value(ConfigValueWriteParams {
+                file_path: None,
+                key_path: format!("features.{dependency}"),
+                value: serde_json::json!(false),
+                merge_strategy: MergeStrategy::Replace,
+                expected_version: None,
+            })
+            .await
+            .expect_err("cross-layer workflow dependency conflict should fail");
+
+        assert_eq!(
+            error.write_error_code(),
+            Some(ConfigWriteErrorCode::ConfigValidationError)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("features.{dependency}")),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_to_string(&selected_path).unwrap(), "");
+    }
+}
+
+#[tokio::test]
 async fn read_reports_managed_overrides_user_and_session_flags() {
     let tmp = tempdir().expect("tempdir");
     let user_path = tmp.path().join(CONFIG_TOML_FILE);

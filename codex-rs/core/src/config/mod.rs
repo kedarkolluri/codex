@@ -156,6 +156,7 @@ mod permissions;
 mod resolved_permission_profile;
 #[cfg(test)]
 mod schema;
+mod workflow_feature_dependencies;
 pub use auth_keyring::resolve_bootstrap_auth_keyring_backend_kind;
 pub use codex_config::ConfigLoadOptions;
 pub use codex_config::Constrained;
@@ -1897,13 +1898,25 @@ pub fn deserialize_config_toml_with_base(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Validate user-visible feature settings against managed feature requirements.
+/// Validate user-visible feature settings and their cross-feature requirements.
 pub fn validate_feature_requirements_for_config_toml(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<()> {
     managed_features::validate_explicit_feature_settings_in_config_toml(cfg, feature_requirements)?;
-    managed_features::validate_feature_requirements_in_config_toml(cfg, feature_requirements)
+    validate_feature_dependencies_for_config_toml(cfg, feature_requirements)
+}
+
+/// Validate cross-feature requirements after all configuration layers are merged.
+pub fn validate_feature_dependencies_for_config_toml(
+    cfg: &ConfigToml,
+    feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
+) -> std::io::Result<()> {
+    let features = managed_features::resolve_features_in_config_toml(cfg, feature_requirements)?;
+    workflow_feature_dependencies::validate_workflow_feature_dependencies(
+        cfg.features.as_ref(),
+        features.enabled(Feature::Workflow),
+    )
 }
 
 fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> {
@@ -2882,7 +2895,7 @@ pub fn resolve_bootstrap_respect_system_proxy(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
 ) -> std::io::Result<bool> {
-    let configured_features = Features::from_sources(
+    let configured_features = Features::from_sources_without_dependency_normalization(
         FeatureConfigSource {
             features: cfg.features.as_ref(),
             experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
@@ -3158,7 +3171,7 @@ impl Config {
             web_search_request: override_tools_web_search_request,
         };
 
-        let configured_features = Features::from_sources(
+        let configured_features = Features::from_sources_without_dependency_normalization(
             FeatureConfigSource {
                 features: cfg.features.as_ref(),
                 experimental_use_unified_exec_tool: cfg.experimental_use_unified_exec_tool,
@@ -3172,6 +3185,10 @@ impl Config {
             configured_features,
             feature_requirements,
             &mut startup_warnings,
+        )?;
+        workflow_feature_dependencies::validate_workflow_feature_dependencies(
+            cfg.features.as_ref(),
+            features.enabled(Feature::Workflow),
         )?;
         let respect_system_proxy = features.enabled(Feature::RespectSystemProxy);
         let enable_network_proxy = features.enabled(Feature::NetworkProxy);
@@ -4474,3 +4491,7 @@ mod tests;
 #[cfg(test)]
 #[path = "config_loader_tests.rs"]
 mod config_loader_tests;
+
+#[cfg(test)]
+#[path = "workflow_feature_dependency_tests.rs"]
+mod workflow_feature_dependency_tests;
