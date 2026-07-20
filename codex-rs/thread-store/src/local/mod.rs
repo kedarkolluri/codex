@@ -421,10 +421,12 @@ mod tests {
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
     use codex_protocol::protocol::ThreadMemoryMode;
+    use codex_protocol::protocol::ThreadSource;
     use codex_protocol::protocol::TurnCompleteEvent;
     use codex_protocol::protocol::TurnContextItem;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::user_input::UserInput;
     use tempfile::TempDir;
 
     use super::*;
@@ -1294,9 +1296,12 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let thread_id = ThreadId::default();
+        let expected_thread_source = Some(ThreadSource::Feature("test-feature".to_string()));
+        let mut create_params = create_thread_params(thread_id);
+        create_params.thread_source = expected_thread_source.clone();
 
         store
-            .create_thread(create_thread_params(thread_id))
+            .create_thread(create_params)
             .await
             .expect("create thread");
         store
@@ -1323,6 +1328,7 @@ mod tests {
 
         assert_eq!(thread.thread_id, thread_id);
         assert_eq!(thread.history_mode, ThreadHistoryMode::Legacy);
+        assert_eq!(thread.thread_source, expected_thread_source);
         assert_eq!(
             thread
                 .history
@@ -1418,8 +1424,10 @@ mod tests {
         let home = TempDir::new().expect("temp dir");
         let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
         let thread_id = ThreadId::default();
+        let expected_thread_source = Some(ThreadSource::Feature("test-feature".to_string()));
         let mut create_params = create_thread_params(thread_id);
         create_params.history_mode = ThreadHistoryMode::Paginated;
+        create_params.thread_source = expected_thread_source.clone();
         store
             .create_thread(create_params)
             .await
@@ -1430,7 +1438,10 @@ mod tests {
             item: TurnItem::UserMessage(UserMessageItem {
                 id: "item-1".to_string(),
                 client_id: None,
-                content: Vec::new(),
+                content: vec![UserInput::Text {
+                    text: "paginated preview".to_string(),
+                    text_elements: Vec::new(),
+                }],
             }),
             completed_at_ms: 1,
         }));
@@ -1465,6 +1476,15 @@ mod tests {
                     if event.message == "legacy event should not persist"
             )
         }));
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read paginated thread metadata");
+        assert_eq!(thread.thread_source, expected_thread_source);
     }
 
     fn create_thread_params(thread_id: ThreadId) -> CreateThreadParams {

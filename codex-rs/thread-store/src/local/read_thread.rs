@@ -281,6 +281,7 @@ async fn read_thread_from_rollout_path(
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
+    thread.thread_source = meta_line.meta.thread_source;
     if let Some(model_provider) = meta_line
         .meta
         .model_provider
