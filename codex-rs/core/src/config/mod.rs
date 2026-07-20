@@ -149,6 +149,7 @@ pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
 mod managed_features;
+mod multi_agent_v2_bounds;
 mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
@@ -1907,7 +1908,8 @@ pub fn validate_feature_requirements_for_config_toml(
     validate_feature_dependencies_for_config_toml(cfg, feature_requirements)
 }
 
-/// Validate cross-feature requirements after all configuration layers are merged.
+/// Validate cross-feature requirements and workflow prompt admission after all configuration
+/// layers are merged.
 pub fn validate_feature_dependencies_for_config_toml(
     cfg: &ConfigToml,
     feature_requirements: Option<&Sourced<FeatureRequirementsToml>>,
@@ -1916,7 +1918,11 @@ pub fn validate_feature_dependencies_for_config_toml(
     workflow_feature_dependencies::validate_workflow_feature_dependencies(
         cfg.features.as_ref(),
         features.enabled(Feature::Workflow),
-    )
+    )?;
+    if features.enabled(Feature::Workflow) {
+        multi_agent_v2_bounds::validate(&resolve_multi_agent_v2_config(cfg))?;
+    }
+    Ok(())
 }
 
 fn load_catalog_json(path: &AbsolutePathBuf) -> std::io::Result<ModelsResponse> {
@@ -3605,6 +3611,12 @@ impl Config {
             ));
         }
         validate_multi_agent_v2_tool_namespace(multi_agent_v2.tool_namespace.as_deref())?;
+        // Workflow execution can expose these configured strings through both tool metadata and
+        // developer context. Preserve legacy MultiAgentV2 config compatibility until the workflow
+        // feature explicitly opts into the stricter admission contract.
+        if features.enabled(Feature::Workflow) {
+            multi_agent_v2_bounds::validate(&multi_agent_v2)?;
+        }
         let agents_enabled = cfg
             .agents
             .as_ref()

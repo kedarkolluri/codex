@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use codex_core::config::AgentRoleConfig;
+use codex_core::config::Config;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_models_manager::manager::RefreshStrategy;
@@ -33,6 +34,44 @@ use tokio::time::sleep;
 
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
+
+fn max_workflow_usage_hint() -> String {
+    format!("WORKFLOW_USAGE_HINT:{}", "u".repeat(980))
+}
+
+fn configure_workflow_prompt_and_roles(config: &mut Config, usage_hint_text: String) {
+    for feature in [
+        Feature::Collab,
+        Feature::MultiAgentV2,
+        Feature::CodeMode,
+        Feature::Workflow,
+    ] {
+        config
+            .features
+            .enable(feature)
+            .expect("test config should allow feature update");
+    }
+    config.multi_agent_v2.non_code_mode_only = false;
+    config.multi_agent_v2.usage_hint_text = Some(usage_hint_text);
+    for index in 0..40 {
+        let description = if index == 0 {
+            format!("role description {index}: {}", "🦀".repeat(1_000))
+        } else {
+            (0..80)
+                .map(|line| format!("role {index} line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        config.agent_roles.insert(
+            format!("role-{index:02}"),
+            AgentRoleConfig {
+                description: Some(description),
+                config_file: None,
+                nickname_candidates: None,
+            },
+        );
+    }
+}
 
 fn spawn_agent_description(body: &Value) -> Option<String> {
     namespace_child_tool(body, MULTI_AGENT_V1_NAMESPACE, SPAWN_AGENT_TOOL_NAME)
@@ -306,46 +345,19 @@ async fn configured_agent_roles_control_spawn_agent_type(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_agent_role_catalog_is_bounded_in_the_model_request() -> Result<()> {
+async fn workflow_prompt_and_role_catalog_are_bounded_in_code_mode_request() -> Result<()> {
     let server = start_mock_server().await;
     let response = mount_sse_once(
         &server,
         sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
     )
     .await;
+    let usage_hint_text = max_workflow_usage_hint();
+    assert_eq!(usage_hint_text.len(), 1_000);
+    let usage_hint_for_config = usage_hint_text.clone();
     let test = test_codex()
-        .with_config(|config| {
-            config
-                .features
-                .enable(Feature::Collab)
-                .expect("test config should allow feature update");
-            config
-                .features
-                .enable(Feature::MultiAgentV2)
-                .expect("test config should allow feature update");
-            config
-                .features
-                .enable(Feature::CodeMode)
-                .expect("test config should allow feature update");
-            config.multi_agent_v2.non_code_mode_only = false;
-            for index in 0..40 {
-                let description = if index == 0 {
-                    format!("role description {index}: {}", "🦀".repeat(1_000))
-                } else {
-                    (0..80)
-                        .map(|line| format!("role {index} line {line}"))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                };
-                config.agent_roles.insert(
-                    format!("role-{index:02}"),
-                    AgentRoleConfig {
-                        description: Some(description),
-                        config_file: None,
-                        nickname_candidates: None,
-                    },
-                );
-            }
+        .with_config(move |config| {
+            configure_workflow_prompt_and_roles(config, usage_hint_for_config);
         })
         .build_with_auto_env(&server)
         .await?;
@@ -386,6 +398,68 @@ async fn configured_agent_role_catalog_is_bounded_in_the_model_request() -> Resu
         .expect("Code Mode spawn_agent description should be present");
     assert!(augmented_description.contains("exec tool declaration:"));
     assert!(augmented_description.contains(&rendered_catalog));
+    assert_eq!(augmented_description.matches(&usage_hint_text).count(), 1);
     assert!(catalog.len() + rendered_catalog.len() <= 8_320);
+    assert!(catalog.len() + rendered_catalog.len() + usage_hint_text.len() <= 9_320);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_prompt_and_rendered_role_catalog_are_bounded_in_code_mode_only_request()
+-> Result<()> {
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let usage_hint_text = max_workflow_usage_hint();
+    assert_eq!(usage_hint_text.len(), 1_000);
+    let usage_hint_for_config = usage_hint_text.clone();
+    let test = test_codex()
+        .with_config(move |config| {
+            configure_workflow_prompt_and_roles(config, usage_hint_for_config);
+            config
+                .features
+                .enable(Feature::CodeModeOnly)
+                .expect("test config should allow feature update");
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("hello").await?;
+
+    let body = response.single_request().body_json();
+    assert!(namespace_child_tool(&body, "collaboration", SPAWN_AGENT_TOOL_NAME).is_none());
+
+    let exec_description = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .and_then(|tools| {
+            tools.iter().find(|tool| {
+                tool.get("name").and_then(Value::as_str) == Some(codex_code_mode::PUBLIC_TOOL_NAME)
+            })
+        })
+        .and_then(|tool| tool.get("description"))
+        .and_then(Value::as_str)
+        .expect("Code Mode exec description should be present");
+    let rendered_start = exec_description
+        .find("  // Available roles:")
+        .expect("exec description should contain the rendered role catalog");
+    let rendered_end = exec_description[rendered_start..]
+        .find("\n  agent_type")
+        .map(|offset| rendered_start + offset)
+        .expect("rendered role catalog should precede the agent_type declaration");
+    let rendered_catalog = &exec_description[rendered_start..rendered_end];
+    assert!(rendered_catalog.len() <= 4_320);
+    assert!(rendered_catalog.lines().count() <= 64);
+    assert!(rendered_catalog.contains("role-00"));
+    assert!(rendered_catalog.contains("... [entry truncated]"));
+    assert!(!rendered_catalog.contains("role-01"));
+    assert!(rendered_catalog.contains("... [additional roles omitted]"));
+    assert_eq!(exec_description.matches(&usage_hint_text).count(), 1);
+    assert!(rendered_catalog.len() + usage_hint_text.len() <= 5_320);
+
     Ok(())
 }
