@@ -1,3 +1,4 @@
+use super::event_observer::EventObserverTap;
 use super::input_queue::InputQueue;
 use super::*;
 use crate::agent::ParentCompletionDelivery;
@@ -31,6 +32,7 @@ pub(crate) struct Session {
     pub(crate) thread_id: ThreadId,
     pub(crate) installation_id: String,
     pub(super) tx_event: Sender<Event>,
+    pub(super) event_observers: EventObserverTap,
     pub(super) agent_status: watch::Sender<AgentStatus>,
     pub(super) state: Mutex<SessionState>,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
@@ -1160,6 +1162,7 @@ impl Session {
                 thread_id,
                 installation_id,
                 tx_event: tx_event.clone(),
+                event_observers: EventObserverTap::default(),
                 agent_status,
                 state: Mutex::new(state),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),

@@ -415,6 +415,14 @@ impl CodexThread {
         self.io.next_event().await
     }
 
+    /// Subscribe to a bounded event tap without competing with the primary event consumer.
+    //
+    // Used by the next stacked workflow spawn-and-await consumer.
+    #[allow(dead_code)]
+    pub(crate) fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<Event> {
+        self.session.subscribe_events()
+    }
+
     pub async fn agent_status(&self) -> AgentStatus {
         self.io.agent_status().await
     }

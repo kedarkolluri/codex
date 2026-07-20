@@ -18,6 +18,7 @@ use crate::skills::SkillRenderSideEffects;
 use crate::skills::render::SkillMetadataBudget;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::format_exec_output_str;
+use assert_matches::assert_matches;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID;
@@ -5440,6 +5441,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
+        event_observers: super::event_observer::EventObserverTap::default(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
@@ -5578,6 +5580,112 @@ async fn make_session_with_config_and_rx(
     .await?;
 
     Ok((session, rx_event))
+}
+
+async fn expect_initial_session_configured_event(events: &async_channel::Receiver<Event>) {
+    let event = timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("initial configured event should arrive")
+        .expect("primary receiver should remain connected");
+    assert_matches!(event.msg, EventMsg::SessionConfigured(_));
+}
+
+#[tokio::test]
+async fn event_observers_do_not_compete_with_primary_event_receiver() {
+    let (session, primary_events) = make_session_with_config_and_rx(|_| {})
+        .await
+        .expect("create test session");
+    expect_initial_session_configured_event(&primary_events).await;
+    let mut first_observer = session.subscribe_events();
+    let mut second_observer = session.subscribe_events();
+    let event = Event {
+        id: "event-observer-test".to_string(),
+        msg: EventMsg::ShutdownComplete,
+    };
+    let expected = serde_json::to_value(&event).expect("serialize expected event");
+
+    session.deliver_event_raw(event).await;
+
+    let first_observed = timeout(Duration::from_secs(1), first_observer.recv())
+        .await
+        .expect("first observer should receive event")
+        .expect("first observer should remain connected");
+    let second_observed = timeout(Duration::from_secs(1), second_observer.recv())
+        .await
+        .expect("second observer should receive event")
+        .expect("second observer should remain connected");
+    let primary_observed = timeout(Duration::from_secs(1), primary_events.recv())
+        .await
+        .expect("primary receiver should receive event")
+        .expect("primary receiver should remain connected");
+
+    assert_eq!(
+        vec![
+            serde_json::to_value(first_observed).expect("serialize first observed event"),
+            serde_json::to_value(second_observed).expect("serialize second observed event"),
+            serde_json::to_value(primary_observed).expect("serialize primary observed event"),
+        ],
+        vec![expected.clone(), expected.clone(), expected]
+    );
+}
+
+#[tokio::test]
+async fn event_observers_start_at_subscription_time() {
+    let (session, _primary_events) = make_session_with_config_and_rx(|_| {})
+        .await
+        .expect("create test session");
+    let first_event = Event {
+        id: "before-subscription".to_string(),
+        msg: EventMsg::ShutdownComplete,
+    };
+    session.deliver_event_raw(first_event).await;
+
+    let mut events = session.subscribe_events();
+    assert_matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    );
+
+    let second_event = Event {
+        id: "after-subscription".to_string(),
+        msg: EventMsg::ShutdownComplete,
+    };
+    let expected = serde_json::to_value(&second_event).expect("serialize expected event");
+    session.deliver_event_raw(second_event).await;
+    let observed = timeout(Duration::from_secs(1), events.recv())
+        .await
+        .expect("observer should receive post-subscription event")
+        .expect("observer should remain connected");
+
+    assert_eq!(
+        serde_json::to_value(observed).expect("serialize observed event"),
+        expected
+    );
+}
+
+#[tokio::test]
+async fn stalled_event_observer_reports_lag_without_blocking_primary_delivery() {
+    let (session, primary_events) = make_session_with_config_and_rx(|_| {})
+        .await
+        .expect("create test session");
+    expect_initial_session_configured_event(&primary_events).await;
+    let mut events = session.subscribe_events();
+    let delivered = super::event_observer::EVENT_OBSERVER_CAPACITY + 1;
+
+    for index in 0..delivered {
+        session
+            .deliver_event_raw(Event {
+                id: format!("event-{index}"),
+                msg: EventMsg::ShutdownComplete,
+            })
+            .await;
+    }
+
+    assert_matches!(
+        events.recv().await,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(1))
+    );
+    assert_eq!(primary_events.len(), delivered);
 }
 
 async fn make_session_with_history_source_and_agent_control_and_rx(
@@ -7603,6 +7711,7 @@ where
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
         tx_event,
+        event_observers: super::event_observer::EventObserverTap::default(),
         agent_status: agent_status_tx,
         state: Mutex::new(state),
         managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
