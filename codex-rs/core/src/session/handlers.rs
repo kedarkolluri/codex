@@ -55,6 +55,7 @@ use codex_protocol::mcp::RequestId as ProtocolRequestId;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use serde_json::Value;
+use std::future::Future;
 use std::sync::Arc;
 use tracing::debug;
 use tracing::info;
@@ -671,6 +672,14 @@ pub async fn shutdown(sess: &Arc<Session>, sub_id: String) -> bool {
     true
 }
 
+pub(super) async fn shutdown_after_stopping_turn_admissions(
+    turn_admission_loop_guard: &mut Option<super::turn_admission_registry::TurnAdmissionLoopGuard>,
+    shutdown: impl Future<Output = bool>,
+) -> bool {
+    drop(turn_admission_loop_guard.take());
+    shutdown.await
+}
+
 pub async fn review(
     sess: &Arc<Session>,
     config: &Arc<Config>,
@@ -712,6 +721,7 @@ pub(super) async fn submission_loop(
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
 ) {
+    let mut turn_admission_loop_guard = Some(sess.turn_admissions.loop_guard());
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
     while let Ok(sub) = rx_sub.recv().await {
@@ -834,7 +844,13 @@ pub(super) async fn submission_loop(
                         .await;
                     false
                 }
-                Op::Shutdown => shutdown(&sess, sub.id.clone()).await,
+                Op::Shutdown => {
+                    shutdown_after_stopping_turn_admissions(
+                        &mut turn_admission_loop_guard,
+                        shutdown(&sess, sub.id.clone()),
+                    )
+                    .await
+                }
                 Op::Review { review_request } => {
                     review(&sess, &config, sub.id.clone(), review_request).await;
                     false
@@ -853,6 +869,9 @@ pub(super) async fn submission_loop(
             break;
         }
     }
+    // No queued admission can dispatch after the receive loop ends. Explicit shutdown drops the
+    // guard before teardown; this drop handles channel close, while guard ownership covers panics.
+    drop(turn_admission_loop_guard);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {
