@@ -324,6 +324,7 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         thread: &CodexThread,
     ) -> Result<(), JSONRPCErrorError> {
+        self.ensure_thread_mutation_allowed(request_id, thread)?;
         if thread.multi_agent_version() == Some(MultiAgentVersion::V2)
             && matches!(
                 thread.config_snapshot().await.session_source,
@@ -335,6 +336,18 @@ impl TurnRequestProcessor {
             return Err(error);
         }
 
+        Ok(())
+    }
+
+    fn ensure_thread_mutation_allowed(
+        &self,
+        request_id: &ConnectionRequestId,
+        thread: &CodexThread,
+    ) -> Result<(), JSONRPCErrorError> {
+        if let Err(error) = ensure_workflow_managed_thread_mutation_allowed(thread) {
+            self.track_error_response(request_id, &error, /*error_type*/ None);
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -776,6 +789,7 @@ impl TurnRequestProcessor {
         params: ThreadSettingsUpdateParams,
     ) -> Result<ThreadSettingsUpdateResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
+        self.ensure_thread_mutation_allowed(request_id, thread.as_ref())?;
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
             .build_environment_override(thread.as_ref(), cwd, /*environment_selections*/ None)
@@ -819,6 +833,7 @@ impl TurnRequestProcessor {
         params: ThreadInjectItemsParams,
     ) -> Result<ThreadInjectItemsResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
 
         let items = params
             .items
@@ -976,6 +991,7 @@ impl TurnRequestProcessor {
         thread_id: &str,
     ) -> Result<Option<(ThreadId, Arc<CodexThread>)>, JSONRPCErrorError> {
         let (thread_id, thread) = self.load_thread(thread_id).await?;
+        self.ensure_thread_mutation_allowed(request_id, thread.as_ref())?;
 
         match self
             .ensure_conversation_listener(
@@ -1332,6 +1348,7 @@ impl TurnRequestProcessor {
         } = params;
 
         let (parent_thread_id, parent_thread) = self.load_thread(&thread_id).await?;
+        self.ensure_thread_mutation_allowed(request_id, parent_thread.as_ref())?;
         let (review_request, display_text) = Self::review_request_from_target(target)?;
         match delivery.unwrap_or(ApiReviewDelivery::Inline).to_core() {
             CoreReviewDelivery::Inline => {
@@ -1367,6 +1384,7 @@ impl TurnRequestProcessor {
         let is_startup_interrupt = turn_id.is_empty();
 
         let (thread_uuid, thread) = self.load_thread(&thread_id).await?;
+        self.ensure_thread_mutation_allowed(request_id, thread.as_ref())?;
 
         // Record turn interrupts so we can reply when TurnAborted arrives. Startup
         // interrupts do not have a turn and are acknowledged after submission.

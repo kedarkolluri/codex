@@ -30,6 +30,13 @@ impl ChatWidget {
             return;
         }
 
+        if self.handle_workflow_monitor_key_event(key_event) {
+            self.bottom_pane.clear_quit_shortcut_hint();
+            self.quit_shortcut_expires_at = None;
+            self.quit_shortcut_key = None;
+            return;
+        }
+
         if self.handle_reasoning_shortcut(key_event) {
             self.bottom_pane.clear_quit_shortcut_hint();
             self.quit_shortcut_expires_at = None;

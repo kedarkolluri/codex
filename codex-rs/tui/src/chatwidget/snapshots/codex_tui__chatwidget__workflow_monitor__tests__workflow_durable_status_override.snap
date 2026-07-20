@@ -1,0 +1,61 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"FAILED\\n{failed}\\n\\nUNKNOWN\\n{unknown}\\n\\nSTOPPED\\n{stopped}\\n\\nPAUSED\\n{paused}\\n\\nCOMPLETED FENCE\\n{completed_fence}\\n\\nLIVE AGAIN\\n{live_again}\\n\\nEXACT COMPLETION\\n{exact_completion}\")"
+---
+FAILED
+› ◆ Workflow restart-recovery  …456789ab  failed
+  1 tokens · 1 tool
+  ● work · 0/1 agents · elapsed ≥ 4s
+    └─ ● worker  gpt-5.5 · high  running · attempt 1 · 1 tok · 1 tool · ≥0ms
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+UNKNOWN
+› ◆ Workflow restart-recovery  …456789ab  unknown
+  1 tokens · 1 tool
+  ● work · 0/1 agents · elapsed ≥ 4s
+    └─ ● worker  gpt-5.5 · high  running · attempt 1 · 1 tok · 1 tool · ≥0ms
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+STOPPED
+› ◆ Workflow restart-recovery  …456789ab  stopped
+  1 tokens · 1 tool
+  ● work · 0/1 agents · elapsed ≥ 4s
+    └─ ● worker  gpt-5.5 · high  running · attempt 1 · 1 tok · 1 tool · ≥0ms
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+PAUSED
+› ◆ Workflow restart-recovery  …456789ab  paused
+  1 tokens · 1 tool
+  ● work · 0/1 agents · elapsed ≥ 4s
+    └─ ● worker  gpt-5.5 · high  running · attempt 1 · 1 tok · 1 tool · ≥0ms
+
+  ↑↓ choose run/agent · r resume · Enter inspect agents · Esc exit
+
+COMPLETED FENCE
+› ◆ Workflow restart-recovery  …456789ab  completed
+  1 tokens · 1 tool
+  ● work · 0/1 agents · elapsed ≥ 4s
+    └─ ● worker  gpt-5.5 · high  running · attempt 1 · 1 tok · 1 tool · ≥0ms
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+LIVE AGAIN
+› ◆ Workflow restart-recovery  …456789ab  running · elapsed ≥ 5s
+  120 tokens · 2 tools
+  ● work · 0/1 agents · elapsed ≥ 4s
+    └─ ● worker  gpt-5.5 · high  running · attempt 1 · 120 tok · 2 tools · ≥0ms
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc exit
+
+EXACT COMPLETION
+› ◆ Workflow restart-recovery  …456789ab  completed · duration 8s
+  120 tokens · 2 tools
+  ✓ work · 1/1 agents · duration 7s
+    └─ ✓ worker  gpt-5.5 · high  completed · attempt 1 · 120 tok · 2 tools · 0ms
+  budget  120 / 500 weighted tokens
+  ↳ exact completion
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit

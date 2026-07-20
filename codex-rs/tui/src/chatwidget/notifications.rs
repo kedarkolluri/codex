@@ -25,11 +25,28 @@ impl ChatWidget {
 
 #[derive(Debug)]
 pub(super) enum Notification {
-    AgentTurnComplete { response: String },
-    ExecApprovalRequested { command: String },
-    EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
-    ElicitationRequested { server_name: String },
-    PlanModePrompt { title: String },
+    AgentTurnComplete {
+        response: String,
+    },
+    WorkflowComplete {
+        name: String,
+        status: codex_app_server_protocol::CollabAgentStatus,
+        agent_count: Option<usize>,
+        spent: i64,
+    },
+    ExecApprovalRequested {
+        command: String,
+    },
+    EditApprovalRequested {
+        cwd: PathBuf,
+        changes: Vec<PathBuf>,
+    },
+    ElicitationRequested {
+        server_name: String,
+    },
+    PlanModePrompt {
+        title: String,
+    },
 }
 
 impl Notification {
@@ -38,6 +55,28 @@ impl Notification {
             Notification::AgentTurnComplete { response } => {
                 Notification::agent_turn_preview(response)
                     .unwrap_or_else(|| "Agent turn complete".to_string())
+            }
+            Notification::WorkflowComplete {
+                name,
+                status,
+                agent_count,
+                spent,
+            } => {
+                let name = bounded_normalized_text(name, WORKFLOW_NOTIFICATION_NAME_GRAPHEMES);
+                let status = workflow_status_label(status);
+                let mut summary = match name {
+                    Some(name) => format!("Workflow {name} {status}"),
+                    None => format!("Workflow {status}"),
+                };
+                if let Some(agent_count) = agent_count {
+                    let noun = if *agent_count == 1 { "agent" } else { "agents" };
+                    summary.push_str(&format!(" · {agent_count} {noun}"));
+                }
+                summary.push_str(&format!(
+                    " · spent {} weighted tokens",
+                    format_tokens_compact(*spent)
+                ));
+                truncate_text(&summary, WORKFLOW_NOTIFICATION_GRAPHEMES)
             }
             Notification::ExecApprovalRequested { command } => {
                 format!(
@@ -68,6 +107,7 @@ impl Notification {
     fn type_name(&self) -> &str {
         match self {
             Notification::AgentTurnComplete { .. } => "agent-turn-complete",
+            Notification::WorkflowComplete { .. } => "workflow-complete",
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. } => "approval-requested",
@@ -78,10 +118,11 @@ impl Notification {
     fn priority(&self) -> u8 {
         match self {
             Notification::AgentTurnComplete { .. } => 0,
+            Notification::WorkflowComplete { .. } => 1,
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. }
-            | Notification::PlanModePrompt { .. } => 1,
+            | Notification::PlanModePrompt { .. } => 2,
         }
     }
 
@@ -126,3 +167,60 @@ impl Notification {
 }
 
 const AGENT_NOTIFICATION_PREVIEW_GRAPHEMES: usize = 200;
+const WORKFLOW_NOTIFICATION_NAME_GRAPHEMES: usize = 72;
+const WORKFLOW_NOTIFICATION_GRAPHEMES: usize = 160;
+
+fn bounded_normalized_text(text: &str, max_graphemes: usize) -> Option<String> {
+    if max_graphemes == 0 {
+        return None;
+    }
+
+    let mut normalized = String::new();
+    let mut grapheme_count = 0;
+    let mut truncated = false;
+    'words: for word in text.split_whitespace() {
+        if !normalized.is_empty() {
+            if grapheme_count == max_graphemes {
+                truncated = true;
+                break;
+            }
+            normalized.push(' ');
+            grapheme_count += 1;
+        }
+        for grapheme in word.graphemes(true) {
+            if grapheme_count == max_graphemes {
+                truncated = true;
+                break 'words;
+            }
+            normalized.push_str(grapheme);
+            grapheme_count += 1;
+        }
+    }
+
+    if normalized.is_empty() {
+        return None;
+    }
+    if truncated && let Some((last_grapheme, _)) = normalized.grapheme_indices(true).next_back() {
+        normalized.truncate(last_grapheme);
+        normalized.push('…');
+    }
+    Some(normalized)
+}
+
+fn workflow_status_label(status: &codex_app_server_protocol::CollabAgentStatus) -> &'static str {
+    use codex_app_server_protocol::CollabAgentStatus;
+
+    match status {
+        CollabAgentStatus::PendingInit => "pending",
+        CollabAgentStatus::Running => "running",
+        CollabAgentStatus::Interrupted => "interrupted",
+        CollabAgentStatus::Completed => "completed",
+        CollabAgentStatus::Errored => "errored",
+        CollabAgentStatus::Shutdown => "shut down",
+        CollabAgentStatus::NotFound => "not found",
+    }
+}
+
+#[cfg(test)]
+#[path = "notifications_tests.rs"]
+mod tests;

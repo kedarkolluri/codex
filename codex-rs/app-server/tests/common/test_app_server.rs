@@ -83,9 +83,13 @@ use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::ThreadArchiveParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsCleanParams;
+use codex_app_server_protocol::ThreadBackgroundTerminalsTerminateParams;
 use codex_app_server_protocol::ThreadCompactStartParams;
+use codex_app_server_protocol::ThreadDecrementElicitationParams;
 use codex_app_server_protocol::ThreadDeleteParams;
 use codex_app_server_protocol::ThreadForkParams;
+use codex_app_server_protocol::ThreadIncrementElicitationParams;
 use codex_app_server_protocol::ThreadInjectItemsParams;
 use codex_app_server_protocol::ThreadItemsListParams;
 use codex_app_server_protocol::ThreadListParams;
@@ -116,6 +120,14 @@ use codex_app_server_protocol::TurnStartParams;
 use codex_app_server_protocol::TurnStartResponse;
 use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::WindowsSandboxSetupStartParams;
+use codex_app_server_protocol::WorkflowAgentControlParams;
+use codex_app_server_protocol::WorkflowListParams;
+use codex_app_server_protocol::WorkflowPauseParams;
+use codex_app_server_protocol::WorkflowReadParams;
+use codex_app_server_protocol::WorkflowResumeParams;
+use codex_app_server_protocol::WorkflowSaveParams;
+use codex_app_server_protocol::WorkflowStartParams;
+use codex_app_server_protocol::WorkflowStopParams;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_AUTH_TOKEN_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_CHATGPT_ACCOUNT_ID_ENV_VAR;
 use codex_exec_server::CODEX_EXEC_SERVER_NOISE_ENVIRONMENT_ID_ENV_VAR;
@@ -171,6 +183,15 @@ impl TestAppServer {
     }
 
     pub async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
+        self.process.wait().await
+    }
+
+    /// Terminates the app-server without first closing stdin, then waits for it to exit.
+    ///
+    /// This simulates a process crash for restart-recovery tests; ordinary test cleanup should
+    /// continue to rely on [`Drop`].
+    pub async fn force_kill_and_wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.process.start_kill()?;
         self.process.wait().await
     }
 
@@ -520,6 +541,46 @@ impl TestAppServer {
         self.send_request("thread/delete", params).await
     }
 
+    /// Send a `thread/increment_elicitation` JSON-RPC request.
+    pub async fn send_thread_increment_elicitation_request(
+        &mut self,
+        params: ThreadIncrementElicitationParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/increment_elicitation", params)
+            .await
+    }
+
+    /// Send a `thread/decrement_elicitation` JSON-RPC request.
+    pub async fn send_thread_decrement_elicitation_request(
+        &mut self,
+        params: ThreadDecrementElicitationParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/decrement_elicitation", params)
+            .await
+    }
+
+    /// Send a `thread/backgroundTerminals/clean` JSON-RPC request.
+    pub async fn send_thread_background_terminals_clean_request(
+        &mut self,
+        params: ThreadBackgroundTerminalsCleanParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/backgroundTerminals/clean", params)
+            .await
+    }
+
+    /// Send a `thread/backgroundTerminals/terminate` JSON-RPC request.
+    pub async fn send_thread_background_terminals_terminate_request(
+        &mut self,
+        params: ThreadBackgroundTerminalsTerminateParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("thread/backgroundTerminals/terminate", params)
+            .await
+    }
+
     /// Send a `thread/name/set` JSON-RPC request.
     pub async fn send_thread_set_name_request(
         &mut self,
@@ -799,6 +860,103 @@ impl TestAppServer {
     ) -> anyhow::Result<i64> {
         let params = Some(serde_json::to_value(params)?);
         self.send_request("skills/list", params).await
+    }
+
+    /// Send a `workflow/list` JSON-RPC request.
+    pub async fn send_workflow_list_request(
+        &mut self,
+        params: WorkflowListParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/list", params).await
+    }
+
+    /// Send a `workflow/start` JSON-RPC request.
+    pub async fn send_workflow_start_request(
+        &mut self,
+        params: WorkflowStartParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/start", params).await
+    }
+
+    /// Send a `workflow/read` JSON-RPC request.
+    pub async fn send_workflow_read_request(
+        &mut self,
+        params: WorkflowReadParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/read", params).await
+    }
+
+    /// Send a `workflow/save` JSON-RPC request.
+    pub async fn send_workflow_save_request(
+        &mut self,
+        params: WorkflowSaveParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/save", params).await
+    }
+
+    /// Send a `workflow/stop` JSON-RPC request.
+    pub async fn send_workflow_stop_request(
+        &mut self,
+        params: WorkflowStopParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/stop", params).await
+    }
+
+    /// Send a `workflow/pause` JSON-RPC request.
+    pub async fn send_workflow_pause_request(
+        &mut self,
+        params: WorkflowPauseParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/pause", params).await
+    }
+
+    /// Send an untyped `workflow/pause` request for boundary-validation tests.
+    pub async fn send_workflow_pause_raw_request(
+        &mut self,
+        params: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.send_request("workflow/pause", Some(params)).await
+    }
+
+    /// Send a `workflow/resume` JSON-RPC request.
+    pub async fn send_workflow_resume_request(
+        &mut self,
+        params: WorkflowResumeParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/resume", params).await
+    }
+
+    /// Send an untyped `workflow/resume` request for boundary-validation tests.
+    pub async fn send_workflow_resume_raw_request(
+        &mut self,
+        params: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.send_request("workflow/resume", Some(params)).await
+    }
+
+    /// Send a `workflow/agent/control` JSON-RPC request.
+    pub async fn send_workflow_agent_control_request(
+        &mut self,
+        params: WorkflowAgentControlParams,
+    ) -> anyhow::Result<i64> {
+        let params = Some(serde_json::to_value(params)?);
+        self.send_request("workflow/agent/control", params).await
+    }
+
+    /// Send an untyped `workflow/agent/control` request for boundary-validation tests.
+    pub async fn send_workflow_agent_control_raw_request(
+        &mut self,
+        params: serde_json::Value,
+    ) -> anyhow::Result<i64> {
+        self.send_request("workflow/agent/control", Some(params))
+            .await
     }
 
     /// Send a `skills/extraRoots/set` JSON-RPC request.

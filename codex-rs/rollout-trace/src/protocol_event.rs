@@ -405,6 +405,10 @@ pub(crate) fn tool_runtime_trace_event(event: &EventMsg) -> Option<ToolRuntimeTr
         | EventMsg::ReasoningRawContentDelta(_)
         | EventMsg::CollabResumeBegin(_)
         | EventMsg::CollabResumeEnd(_) => None,
+
+        // Workflow progress is persisted by the rollout policy. It is not a tool-runtime
+        // boundary, so do not duplicate it in the runtime trace stream.
+        EventMsg::Workflow(_) => None,
     }
 }
 
@@ -486,6 +490,7 @@ pub(crate) fn wrapped_protocol_event_type(event: &EventMsg) -> Option<&'static s
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeBegin(_)
         | EventMsg::CollabResumeEnd(_)
+        | EventMsg::Workflow(_)
         | EventMsg::SubAgentActivity(_) => None,
     }
 }

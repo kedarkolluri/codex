@@ -148,6 +148,7 @@ pub(crate) mod agent_roles;
 mod auth_keyring;
 pub mod edit;
 mod managed_features;
+mod multi_agent_v2_bounds;
 mod network_proxy_spec;
 mod otel;
 mod permission_profile_catalog;
@@ -260,6 +261,41 @@ fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency
     format!(
         "{usage_hint_text}\n{DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT}\nThere are {max_concurrency} available concurrency slots, meaning that up to {max_concurrency} agents can be active at once, including you."
     )
+}
+
+/// Recognize unmarked usage hints emitted by older versions before the dedicated contextual
+/// fragment supplied durable identity. This intentionally accepts only the built-in templates;
+/// arbitrary developer messages and legacy custom hints are not distinguishable after config
+/// drift and must be preserved.
+pub(crate) fn is_legacy_default_multi_agent_v2_usage_hint_text(text: &str) -> bool {
+    [
+        DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+        DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+    ]
+    .into_iter()
+    .any(|base| {
+        let Some(concurrency_clause) = text
+            .strip_prefix(base)
+            .and_then(|text| text.strip_prefix('\n'))
+            .and_then(|text| text.strip_prefix(DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT))
+            .and_then(|text| text.strip_prefix("\nThere are "))
+        else {
+            return false;
+        };
+        let Some((available, active)) =
+            concurrency_clause.split_once(" available concurrency slots, meaning that up to ")
+        else {
+            return false;
+        };
+        let Some(active) = active.strip_suffix(" agents can be active at once, including you.")
+        else {
+            return false;
+        };
+        available == active
+            && !available.is_empty()
+            && available.bytes().all(|byte| byte.is_ascii_digit())
+            && available.parse::<usize>().is_ok()
+    })
 }
 
 pub(crate) const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
@@ -434,6 +470,28 @@ impl Permissions {
 
     pub fn set_workspace_roots(&mut self, workspace_roots: Vec<AbsolutePathBuf>) {
         self.workspace_roots = workspace_roots;
+    }
+
+    /// Add a structurally explicit, read-only runtime root without changing profile identity.
+    pub(crate) fn add_explicit_runtime_readable_root(
+        &mut self,
+        root: AbsolutePathBuf,
+    ) -> ConstraintResult<()> {
+        let permission_profile = self
+            .permission_profile()
+            .clone()
+            .with_explicit_readable_root(root);
+        let snapshot = match self.active_permission_profile() {
+            Some(active_permission_profile) => {
+                PermissionProfileSnapshot::active_with_profile_workspace_roots(
+                    permission_profile,
+                    active_permission_profile,
+                    self.profile_workspace_roots().to_vec(),
+                )
+            }
+            None => PermissionProfileSnapshot::legacy(permission_profile),
+        };
+        self.set_permission_profile_from_session_snapshot(snapshot)
     }
 
     pub fn workspace_roots(&self) -> &[AbsolutePathBuf] {
@@ -3532,6 +3590,11 @@ impl Config {
             ));
         }
         validate_multi_agent_v2_tool_namespace(multi_agent_v2.tool_namespace.as_deref())?;
+        // Prompt bounds protect the new workflow context surface. Keep them behind that opt-in
+        // so legacy MultiAgentV2-only configurations continue to load unchanged.
+        if features.enabled(Feature::Workflow) {
+            multi_agent_v2_bounds::validate(&multi_agent_v2)?;
+        }
         let agent_max_threads = cfg.agents.as_ref().and_then(|agents| agents.max_threads);
         if agent_max_threads == Some(0) {
             return Err(std::io::Error::new(

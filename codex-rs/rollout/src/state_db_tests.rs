@@ -10,6 +10,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
 use std::path::Path;
@@ -111,7 +112,12 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
 async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let thread_id = ThreadId::new();
-    let rollout_path = write_rollout_with_user_message(home.path(), thread_id, "Hey")?;
+    let rollout_path = write_rollout_with_user_message(
+        home.path(),
+        thread_id,
+        "Hey",
+        /*thread_source*/ None,
+    )?;
     let runtime =
         codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
             .await?;
@@ -145,10 +151,59 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
     Ok(())
 }
 
+#[tokio::test]
+async fn reconcile_rollout_keeps_workflow_source_across_metadata_disagreement() -> anyhow::Result<()>
+{
+    let home = TempDir::new().expect("temp dir");
+    let runtime =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+    let workflow_source = ThreadSource::Feature("workflow".to_string());
+    let other_source = ThreadSource::Feature("other".to_string());
+
+    for (rollout_source, sqlite_source) in [
+        (workflow_source.clone(), other_source.clone()),
+        (other_source, workflow_source.clone()),
+    ] {
+        let thread_id = ThreadId::new();
+        let rollout_path = write_rollout_with_user_message(
+            home.path(),
+            thread_id,
+            "workflow source disagreement",
+            Some(rollout_source),
+        )?;
+        let mut metadata =
+            metadata::extract_metadata_from_rollout(rollout_path.as_path(), "test-provider")
+                .await?
+                .metadata;
+        metadata.thread_source = Some(sqlite_source);
+        runtime.upsert_thread(&metadata).await?;
+
+        reconcile_rollout(
+            Some(runtime.as_ref()),
+            rollout_path.as_path(),
+            "test-provider",
+            /*builder*/ None,
+            &[],
+            /*archived_only*/ Some(false),
+            /*new_thread_memory_mode*/ None,
+        )
+        .await;
+
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await?
+            .expect("thread should exist");
+        assert_eq!(persisted.thread_source, Some(workflow_source.clone()));
+    }
+    Ok(())
+}
+
 fn write_rollout_with_user_message(
     home: &Path,
     thread_id: ThreadId,
     message: &str,
+    thread_source: Option<ThreadSource>,
 ) -> anyhow::Result<std::path::PathBuf> {
     let dir = home.join("sessions/2026/06/01");
     std::fs::create_dir_all(dir.as_path())?;
@@ -168,7 +223,7 @@ fn write_rollout_with_user_message(
                     originator: "test".to_string(),
                     cli_version: "test".to_string(),
                     source: SessionSource::Cli,
-                    thread_source: None,
+                    thread_source,
                     agent_nickname: None,
                     agent_role: None,
                     agent_path: None,

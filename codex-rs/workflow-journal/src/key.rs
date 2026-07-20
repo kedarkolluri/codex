@@ -50,6 +50,13 @@ use serde_json::json;
 /// hash construction MUST bump this.
 pub const KEY_ALGO_VERSION: u32 = 1;
 
+/// Version of the run-level execution-environment fingerprint.
+///
+/// This is intentionally independent from [`KEY_ALGO_VERSION`]: the per-call
+/// cache-key field set can remain stable while the host learns about another
+/// provider/router input that must invalidate a whole replay prefix.
+pub const EXECUTION_FINGERPRINT_VERSION: u32 = 1;
+
 /// Prefix on every hash string this module emits (`"blake3:<hex>"`), matching
 /// the §7 journal samples (`"key":"blake3:..."`).
 const HASH_PREFIX: &str = "blake3:";
@@ -132,12 +139,49 @@ pub fn prompt_hash(prompt: &str) -> String {
 /// hash; like [`prompt_hash`], it is a content fingerprint and is not
 /// version-prefixed.
 pub fn schema_hash(schema: &Value) -> String {
-    let mut canonical = String::new();
-    write_canonical(schema, &mut canonical);
+    canonical_value_hash(schema)
+}
+
+/// Hash of an arbitrary JSON value after recursively sorting every object key.
+///
+/// This is suitable for structural fingerprints such as workflow arguments,
+/// where equivalent objects must hash identically regardless of insertion or
+/// serialization order. Array order remains significant.
+pub fn canonical_value_hash(value: &Value) -> String {
+    let canonical = canonical_value_json(value);
     format!(
         "{HASH_PREFIX}{}",
         blake3::hash(canonical.as_bytes()).to_hex()
     )
+}
+
+/// Canonical JSON bytes for a structured value.
+///
+/// Kept crate-private so durable workflow artifacts can persist the exact byte
+/// representation used by [`canonical_value_hash`] without expanding this
+/// crate's public API.
+pub(crate) fn canonical_value_json(value: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical(value, &mut canonical);
+    canonical
+}
+
+/// Hash a host-selected execution environment for run-level replay safety.
+///
+/// Callers should pass a JSON object containing only non-secret, execution-
+/// relevant facts (for example the effective model/provider identity, reasoning
+/// effort, service tier, and role configuration). The canonical encoding makes
+/// map insertion order irrelevant. A dedicated domain and version prevent this
+/// fingerprint from being confused with workflow arguments or schemas.
+pub fn execution_fingerprint(value: &Value) -> String {
+    let mut canonical = String::new();
+    write_canonical(value, &mut canonical);
+
+    let mut hasher = Hasher::new();
+    hasher.update(b"codex-workflow-execution-fingerprint\0");
+    hasher.update(&EXECUTION_FINGERPRINT_VERSION.to_le_bytes());
+    hasher.update(canonical.as_bytes());
+    format!("{HASH_PREFIX}{}", hasher.finalize().to_hex())
 }
 
 /// Append a canonical JSON encoding of `value` to `out`.
@@ -236,6 +280,27 @@ mod tests {
         // run_meta.key_algo_version.
         let _: u32 = KEY_ALGO_VERSION;
         assert_eq!(KEY_ALGO_VERSION, 1);
+    }
+
+    #[test]
+    fn execution_fingerprint_is_canonical_versioned_and_domain_separated() {
+        let a = json!({
+            "provider": { "id": "headroom", "headerNames": ["x-router"] },
+            "model": "gpt-5",
+        });
+        let mut provider = serde_json::Map::new();
+        provider.insert("headerNames".to_string(), json!(["x-router"]));
+        provider.insert("id".to_string(), json!("headroom"));
+        let mut reordered = serde_json::Map::new();
+        reordered.insert("model".to_string(), json!("gpt-5"));
+        reordered.insert("provider".to_string(), Value::Object(provider));
+
+        assert_eq!(
+            execution_fingerprint(&a),
+            execution_fingerprint(&Value::Object(reordered))
+        );
+        assert_ne!(execution_fingerprint(&a), canonical_value_hash(&a));
+        assert_eq!(EXECUTION_FINGERPRINT_VERSION, 1);
     }
 
     #[test]
@@ -447,6 +512,25 @@ mod tests {
         assert_eq!(schema_hash(&a), schema_hash(&b), "key-order invariant");
         assert_ne!(schema_hash(&a), schema_hash(&c), "value change is detected");
         assert!(schema_hash(&a).starts_with("blake3:"));
+    }
+
+    #[test]
+    fn canonical_value_hash_is_nested_key_order_invariant_but_array_order_sensitive() {
+        let a: Value =
+            serde_json::from_str(r#"{"outer":{"a":1,"b":2},"items":[{"x":3,"y":4},5]}"#).unwrap();
+        let reordered_objects: Value =
+            serde_json::from_str(r#"{"items":[{"y":4,"x":3},5],"outer":{"b":2,"a":1}}"#).unwrap();
+        let reordered_array: Value =
+            serde_json::from_str(r#"{"outer":{"a":1,"b":2},"items":[5,{"x":3,"y":4}]}"#).unwrap();
+
+        assert_eq!(
+            canonical_value_hash(&a),
+            canonical_value_hash(&reordered_objects)
+        );
+        assert_ne!(
+            canonical_value_hash(&a),
+            canonical_value_hash(&reordered_array)
+        );
     }
 
     #[test]

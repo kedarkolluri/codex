@@ -1,0 +1,9 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&chat.workflow_monitor, 90)"
+---
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit

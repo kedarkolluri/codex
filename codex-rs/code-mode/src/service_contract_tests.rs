@@ -164,6 +164,8 @@ fn execute_request(source: &str) -> ExecuteRequest {
         workflow: false,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 

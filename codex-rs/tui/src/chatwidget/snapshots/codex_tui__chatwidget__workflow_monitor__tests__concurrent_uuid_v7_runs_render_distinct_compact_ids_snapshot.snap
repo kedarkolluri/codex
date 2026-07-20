@@ -1,0 +1,11 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 80)"
+---
+◆ Workflow first concurrent run  …456789ab  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow second concurrent run  …ba987654  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+  Enter inspect agents

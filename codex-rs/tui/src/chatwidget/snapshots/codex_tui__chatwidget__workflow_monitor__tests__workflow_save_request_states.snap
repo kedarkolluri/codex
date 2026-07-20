@@ -1,0 +1,49 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"PENDING\\n{pending}\\n\\nCREATED\\n{created}\\n\\nCONFLICT\\n{conflict}\\n\\nOVERWRITTEN\\n{overwritten}\\n\\nFAILED\\n{failed}\")"
+---
+PENDING
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  save  creating exact personal script…
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+CREATED
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  saved  exact personal script created
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+CONFLICT
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  save conflict  personal workflow already exists
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+OVERWRITTEN
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  saved  exact personal script overwritten
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit
+
+FAILED
+› ◆ Workflow release-check  run-save  completed · duration 8s
+  save failed  personal · registry unavailable
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…
+  ✓ work · duration 7s
+  budget  10 / 10 weighted tokens
+
+  ↑↓ choose run/agent · s save · Enter inspect agents · Esc exit

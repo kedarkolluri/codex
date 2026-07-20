@@ -11,6 +11,7 @@ use super::AdditionalContextStore;
 use super::auto_compact_window::AutoCompactWindow;
 use super::auto_compact_window::AutoCompactWindowIds;
 use super::auto_compact_window::AutoCompactWindowSnapshot;
+use super::auto_compact_window::PlannedAutoCompactWindow;
 use crate::context_manager::ContextManager;
 use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
@@ -179,8 +180,20 @@ impl SessionState {
         self.auto_compact_window.restore(window_number, ids);
     }
 
+    #[cfg(test)]
     pub(crate) fn advance_auto_compact_window(&mut self) -> (u64, AutoCompactWindowIds) {
         self.auto_compact_window.advance()
+    }
+
+    pub(crate) fn plan_auto_compact_window_advance(&self) -> PlannedAutoCompactWindow {
+        self.auto_compact_window.plan_advance()
+    }
+
+    pub(crate) fn commit_auto_compact_window_advance(
+        &mut self,
+        planned: PlannedAutoCompactWindow,
+    ) -> Result<(u64, AutoCompactWindowIds), &'static str> {
+        self.auto_compact_window.commit_advance(planned)
     }
 
     pub(crate) fn request_new_context_window(&mut self) {
@@ -191,10 +204,13 @@ impl SessionState {
         self.auto_compact_window.take_new_context_window_request()
     }
 
-    pub(crate) fn start_new_context_window(&mut self) -> (u64, AutoCompactWindowIds) {
-        let window = self.auto_compact_window.advance();
+    pub(crate) fn commit_new_context_window(
+        &mut self,
+        planned: PlannedAutoCompactWindow,
+    ) -> Result<(u64, AutoCompactWindowIds), &'static str> {
+        let window = self.auto_compact_window.commit_advance(planned)?;
         self.auto_compact_window.clear_prefill();
-        window
+        Ok(window)
     }
 
     pub(crate) fn token_info(&self) -> Option<TokenUsageInfo> {

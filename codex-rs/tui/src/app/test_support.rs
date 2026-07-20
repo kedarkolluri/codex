@@ -15,6 +15,7 @@ pub(super) async fn make_test_app() -> App {
     let file_search = FileSearchManager::new(config.cwd.to_path_buf(), app_event_tx.clone());
     let model = get_model_offline_for_tests(config.model.as_deref());
     let session_telemetry = test_session_telemetry(&config, model.as_str());
+    let workflow_feature_state = WorkflowFeatureState::from_config(&config);
 
     App {
         model_catalog: chat_widget.model_catalog(),
@@ -23,6 +24,7 @@ pub(super) async fn make_test_app() -> App {
         chat_widget,
         workspace_command_runner: None,
         config,
+        workflow_feature_state,
         state_db: None,
         cli_kv_overrides: Vec::new(),
         harness_overrides: ConfigOverrides::default(),
@@ -58,6 +60,7 @@ pub(super) async fn make_test_app() -> App {
         side_threads: HashMap::new(),
         active_thread_id: None,
         active_thread_rx: None,
+        workflow_monitor_returns: Vec::new(),
         primary_thread_id: None,
         last_subagent_backfill_attempt: None,
         primary_session_configured: None,

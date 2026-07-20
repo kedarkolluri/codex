@@ -33,9 +33,11 @@ use serde_json::json;
 use crate::config::CurrentTimeReminderConfig;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_workflow_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::multi_agents_spec::MULTI_AGENT_V1_NAMESPACE;
+use crate::tools::router::CollaborationToolAccess;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
@@ -50,6 +52,7 @@ struct ToolPlanInputs {
     tool_suggest_candidates: Option<ToolSuggestCandidates>,
     extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     dynamic_tools: Vec<DynamicToolSpec>,
+    collaboration_tool_access: CollaborationToolAccess,
 }
 
 struct ToolPlanProbe {
@@ -191,6 +194,7 @@ async fn probe_with(
             deferred_mcp_tools: inputs.deferred_mcp_tools,
             extension_tool_executors: inputs.extension_tool_executors,
             dynamic_tools: inputs.dynamic_tools.as_slice(),
+            collaboration_tool_access: inputs.collaboration_tool_access,
         },
         &Default::default(),
     );
@@ -336,6 +340,33 @@ impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
 
     fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async { panic!("spec planning should not execute extension tools") })
+    }
+}
+
+struct TestPlainExtensionTool {
+    tool_name: &'static str,
+}
+
+impl ToolExecutor<ExtensionToolCall> for TestPlainExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::plain(self.tool_name)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Function(ResponsesApiTool {
+            name: self.tool_name.to_string(),
+            description: "Test plain extension tool.".to_string(),
+            strict: true,
+            defer_loading: None,
+            parameters: codex_tools::JsonSchema::default(),
+            output_schema: None,
+        })
+    }
+
+    fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async {
+            Ok(Box::new(codex_tools::JsonToolOutput::new(json!({}))) as Box<dyn ToolOutput>)
+        })
     }
 }
 
@@ -682,6 +713,7 @@ async fn environment_tools_follow_the_step_context() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            collaboration_tool_access: Default::default(),
         },
         &Default::default(),
     ));
@@ -842,6 +874,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            collaboration_tool_access: Default::default(),
         },
         &cache,
     );
@@ -859,6 +892,7 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
             tool_suggest_candidates: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: &[],
+            collaboration_tool_access: Default::default(),
         },
         &cache,
     );
@@ -1282,6 +1316,70 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             .exposure(&ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, "spawn_agent").to_string()),
         ToolExposure::DirectModelOnly
     );
+}
+
+#[tokio::test]
+async fn disabled_collaboration_access_omits_v2_specs_and_runtimes() {
+    let plan = probe_with(
+        |turn| set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true),
+        ToolPlanInputs {
+            collaboration_tool_access: CollaborationToolAccess::Disabled,
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+
+    plan.assert_visible_lacks(&[MULTI_AGENT_V2_NAMESPACE]);
+    for tool_name in [
+        "spawn_agent",
+        "send_message",
+        "followup_task",
+        "wait_agent",
+        "interrupt_agent",
+        "list_agents",
+    ] {
+        let registered_name = ToolName::namespaced(MULTI_AGENT_V2_NAMESPACE, tool_name).to_string();
+        assert!(
+            !plan.registered_names.contains(&registered_name),
+            "expected workflow-managed tool `{registered_name}` to be absent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workflow_managed_child_omits_workflow_run_spec_and_runtime() {
+    let (session, _original_turn, _events) = make_workflow_session_and_context_with_rx().await;
+    let turn = session.new_default_turn().await;
+    let mut turn = Arc::try_unwrap(turn).expect("new workflow turn must be uniquely owned");
+    set_features(
+        &mut turn,
+        &[Feature::CodeMode, Feature::MultiAgentV2, Feature::Workflow],
+    );
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let plan = ToolPlanProbe::from_router(ToolRouter::from_context(
+        step_context.as_ref(),
+        ToolRouterParams {
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            tool_suggest_candidates: None,
+            extension_tool_executors: ["get_goal", "create_goal", "update_goal"]
+                .into_iter()
+                .map(|tool_name| {
+                    Arc::new(TestPlainExtensionTool { tool_name })
+                        as Arc<dyn ToolExecutor<ExtensionToolCall>>
+                })
+                .collect(),
+            dynamic_tools: &[],
+            collaboration_tool_access: CollaborationToolAccess::Disabled,
+        },
+        &Default::default(),
+    ));
+
+    plan.assert_visible_lacks(&["workflow_run"]);
+    plan.assert_registered_lacks(&["workflow_run"]);
+    plan.assert_visible_lacks(&["get_goal", "create_goal", "update_goal"]);
+    plan.assert_registered_lacks(&["get_goal", "create_goal", "update_goal"]);
 }
 
 #[tokio::test]

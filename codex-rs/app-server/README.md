@@ -208,6 +208,14 @@ Example with notification opt-out:
 - `environment/info` — experimental; connect to a configured environment by `environmentId` and return its detected `shell` plus its default `cwd` as a canonical environment-native `file:` URI. Connection failures are returned as request errors.
 - `collaborationMode/list` — list available collaboration mode presets (experimental, no pagination). Built-in presets do not select a model; the Plan preset selects medium reasoning effort. This response omits built-in developer instructions; clients should either pass `settings.developer_instructions: null` when setting a mode to use Codex's built-in instructions, or provide their own instructions explicitly.
 - `skills/list` — list skills for one or more `cwd` values (optional `forceReload`).
+- `workflow/list` — experimental; list saved-workflow picker metadata visible to a loaded thread. Pass the required `threadId` plus optional `cursor` and `limit`; results are name-sorted, de-duplicated with project → personal → Codex-home precedence, and capped at 100 entries per page. This request requires `capabilities.experimentalApi: true` and the `workflow` feature in both app-server startup config and the thread's effective config. It never returns or executes workflow source bodies.
+- `workflow/read` — experimental; read the reconciled durable lifecycle status of one exact thread-owned `{ threadId, runId }`. The response contains only `{ runId, status }`, where `status` is `running`, `completed`, `stopped`, `paused`, `failed`, or `unknown`; it never exposes source, paths, arguments, journals, transcripts, or invocation metadata. Malformed, unavailable, unknown, ownerless, and wrong-thread run ids intentionally return the same bounded error.
+- `workflow/start` — experimental; start a saved workflow by exact registry `name` in a loaded `threadId`, with optional JSON `args`, and return `{ runId }` after the run is durably initialized. The request accepts neither source text nor a filesystem path. It uses the same project → personal → Codex-home resolution and feature gates as `workflow/list`; the run continues in the thread-owned background task after the response.
+- `workflow/save` — experimental; save only the exact bounded `script.js` from a durable `{ threadId, runId }`. Pass a portable `name`, `scope` (`project` for the owning local thread cwd's `.codex/workflows`, or `personal` for the app-server host's `$HOME/.agents/workflows`), and an explicit `overwrite` boolean. The durable owner, run id, metadata name, and script hash must all match before the same verified source buffer is published. The response contains only a typed `disposition`: `created`, `conflict`, or `overwritten`. The method never accepts or returns source, paths, args, journals, transcripts, or invocation metadata; it never writes `.claude`. Malformed, unknown, wrong-thread, and legacy ownerless run ids intentionally return the same bounded error. Project saves are unavailable for remote execution environments whose cwd is not on the app-server host. On Unix, existing Personal registry directories must be owned by the effective user and cannot be group/other-writable; their permissions are preserved. On Windows, new Personal directories receive a protected current-user/System/Administrators DACL during native creation; existing Personal directories must be owned by the current user and have a protected DACL whose allow ACEs satisfy that policy. Existing ACLs are preserved, and unprotected inherited roots fail closed.
+- `workflow/stop` — experimental; request cancellation of an active `{ threadId, runId }` and wait for the owning thread's isolate, child-agent, journal, progress, recorder, worktree, and lease cleanup to finish. The response disposition is `applied` when this request initiated cancellation or `alreadyRequested` when it joined an overlapping request. Malformed, inactive, unknown, and wrong-thread run ids intentionally return the same bounded error.
+- `workflow/pause` — experimental; checkpoint one active `{ threadId, runId }` only after the same joined cleanup barrier has published a durable `paused` terminal state. The typed disposition is `applied` or `alreadyRequested`; malformed, stale, unknown, and wrong-thread targets share one bounded unavailable error.
+- `workflow/resume` — experimental; resume one paused `{ threadId, runId }` from the exact private durable `script.js` and invocation arguments, returning only the fresh successor `{ runId }`. It never consults the mutable saved-workflow registry and accepts no source, path, name, or args. Duplicate requests return the one durably claimed successor id. Unavailable, corrupt, non-paused, ownerless, unknown, and wrong-thread checkpoints share one bounded error.
+- `workflow/agent/control` — experimental; apply exact-attempt `skip` or `retry` to `{ threadId, runId, nodeId, attempt }`. Same-action duplicates join one cleanup; conflicting actions use immutable first-writer semantics. Responses are the closed tagged dispositions `skipped`, `retryScheduled` (with the fresh `attempt`), or `retryLimitReached`; stale, completed, malformed, unknown, and wrong-thread selections share one bounded unavailable error.
 - `skills/extraRoots/set` — replace the app-server process runtime extra standalone skill roots. The roots are not persisted; missing directories are accepted and simply load no skills.
 - `hooks/list` — list discovered hooks for one or more `cwd` values.
 - `marketplace/add` — add a remote plugin marketplace from an HTTP(S) Git URL, SSH Git URL, or GitHub `owner/repo` shorthand, then persist it into the user marketplace config. Returns the installed root path plus whether the marketplace was already present.
@@ -1362,6 +1370,90 @@ The app-server streams JSON-RPC notifications while a turn is running. Each turn
 - `turn/moderationMetadata` — experimental; `{ threadId, turnId, metadata }` when a first-party backend supplies turn-scoped moderation metadata for client-side presentation.
 
 Today both notifications carry an empty `items` array even when item events were streamed; rely on `item/*` notifications for the canonical item list until this is fixed.
+
+### Workflow events
+
+Workflow runtime notifications require both the `workflow` feature and an app-server client initialized
+with `capabilities.experimentalApi: true`. Without the experimental API opt-in, app-server silently
+filters these notifications for that connection. When both gates are enabled, app-server streams a
+run-scoped progress topology on the owning `threadId`. Lifecycle timestamps are integer Unix
+seconds observed by app-server; clients should use them for elapsed-time presentation instead of
+inventing local workflow timestamps.
+
+After `thread/resume` returns, app-server replays a bounded, connection-scoped workflow snapshot
+from the durable rollout. The replay restores recent run topology without writing duplicate rollout
+records or notifying other attached clients; its timestamps represent when the resumed connection
+observed the snapshot, not the original wall-clock boundaries.
+
+- `workflow/started` — declares the run id, nullable `resumedFromRunId`, workflow name, argument digest, and complete phase skeleton.
+- `workflow/phase/changed` — marks a phase `active` or `completed` by deterministic `phaseIndex`.
+- `workflow/group/started` and `workflow/group/completed` — preserve parallel/pipeline group topology, including empty groups, by deterministic `groupId`.
+- `workflow/agent/started` — attaches an exact `attempt` of an agent node to a group or agent parent and reports its nullable `lastAttemptReason`, effective model, and reasoning effort.
+- `workflow/agent/bound` — binds an exact announced node `attempt` to the persistent child `threadId` that clients can resume for drill-in.
+- `workflow/agent/updated` — refreshes the exact attempt, nullable control reason, aggregate token/tool counters, and aggregate `durationMs` across retries.
+- `workflow/agent/completed` — reports the logical node's final attempt, nullable control reason, terminal status/message, aggregate counters/duration, and whether the workflow-visible result was `null`.
+- `workflow/log` — carries one workflow-authored narration line.
+- `workflow/completed` — reports the legacy coarse status, nullable exact `terminalReason` (`completed`, `failed`, `interrupted`, `stopped`, or `paused`), and weighted-token consumption; `total` is
+  `null` for an unmetered workflow and a number (including `0`) for an explicit ceiling.
+
+`groupId` and agent `nodeId` share one deterministic per-run topology namespace. A
+`parentNodeId` can therefore identify either kind without ambiguity.
+
+Saved workflow discovery is exposed separately through experimental `workflow/list`. The target
+`threadId` must identify a loaded thread so app-server can use that thread's selected local
+environment cwd alongside `$HOME/.agents/workflows` and `$CODEX_HOME/workflows`. Remote selected
+environments do not contribute a host-local project root. The response contains only static
+picker metadata (`name`, `description`, declared `phases`, `scope`, and `path`) plus `nextCursor`;
+workflow bodies are neither returned nor executed. App-server caches discovery, and
+`workflows/changed` invalidates that shared cache before clients refresh the list. Durable artifacts
+under the reserved `$CODEX_HOME/workflows/runs/` subtree are excluded from both discovery and
+change notifications, so a prior run's persisted `script.js` never becomes a saved-workflow entry.
+
+Experimental `workflow/read` accepts only `{ threadId, runId }` and performs targeted stale-owner
+reconciliation before returning the durable `{ runId, status }` projection. This gives reconnecting
+clients a read-only status fence after app-server restart without treating rollout notification
+replay as the lifecycle authority. The closed status enum is `running | completed | stopped | paused
+| failed | unknown`; legacy runs whose final lifecycle cannot be proven report `unknown`. The
+response never includes workflow source, filesystem paths, hashes, arguments, journals,
+transcripts, or private invocation metadata. Unavailable and wrong-owner targets use the same
+bounded error.
+
+Experimental `workflow/start` consumes that same registry view. Its request is
+`{ threadId, name, args? }`; `name` is matched exactly, `args` is capped at 32 KiB when serialized,
+and there is deliberately no raw-source or path field. A successful `{ runId }` response means the
+run directory, metadata, journal, discovery row, runtime cell, and dispatch route have been
+initialized. Completion is reported asynchronously through the `workflow/*` notifications above.
+
+Experimental `workflow/stop` is thread-owned and run-targeted. Its request is
+`{ threadId, runId }`; overlapping callers are admitted concurrently so exactly one receives
+`applied` and the others receive `alreadyRequested`, while every successful response waits for the
+same joined cleanup path. Unknown, inactive, malformed, and wrong-thread run identifiers use the
+same public error to avoid exposing run ownership. A successful explicit stop publishes durable
+status and exact terminal reason `stopped` while retaining the legacy coarse shutdown status.
+
+Experimental `workflow/pause` has the same thread-owned, run-targeted shape and intentionally
+admits overlapping callers concurrently. A successful response waits until child processes,
+worktrees, journal writers, progress publication, the recorder, and the run lease are quiescent;
+the source then emits exact terminal reason `paused`. `applied` identifies the first pause request,
+while `alreadyRequested` identifies callers that joined its barrier. A stop or another terminal
+cause that won first makes the pause target unavailable.
+
+Experimental `workflow/resume` accepts only `{ threadId, runId }`, where `runId` is the paused
+source. Core authenticates the source owner and immutable fingerprint, reads its exact bounded
+`script.js` and separately private invocation arguments, and creates a fresh UUIDv7 successor with
+`resumedFromRunId`. The saved-workflow registry may be edited or deleted without changing the
+resume input. A source-side durable claim makes duplicate/concurrent requests idempotent: each
+returns the same successor `runId`. No response or error contains source, paths, arguments,
+journal content, or checkpoint metadata.
+
+Experimental `workflow/agent/control` accepts only
+`{ threadId, runId, nodeId, attempt, action }`, where `action` is the closed enum `skip | retry`.
+The exact attempt is captured by the caller; app-server never infers a newer generation at
+dispatch time. Requests remain concurrent so same-action duplicates can join cleanup and a
+conflicting skip/retry pair reaches core's immutable first-writer gate. A retry re-enters normal
+scheduler, budget, spawn, and worktree admission under the same logical `nodeId`; at most five
+retries follow the initial attempt. Control responses wait for the selected child's cleanup and
+terminal journal barrier.
 
 #### Items
 

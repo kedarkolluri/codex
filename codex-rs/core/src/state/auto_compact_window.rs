@@ -8,6 +8,12 @@ pub(crate) struct AutoCompactWindowIds {
     pub(crate) window_id: Uuid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PlannedAutoCompactWindow {
+    pub(crate) window_number: u64,
+    pub(crate) ids: AutoCompactWindowIds,
+}
+
 impl AutoCompactWindowIds {
     pub(crate) fn new_initial() -> Self {
         let window_id = Uuid::now_v7();
@@ -72,13 +78,42 @@ impl AutoCompactWindow {
         self.ids = ids;
     }
 
+    #[cfg(test)]
     pub(super) fn advance(&mut self) -> (u64, AutoCompactWindowIds) {
-        self.window_number = self.window_number.saturating_add(1);
-        self.ids.previous_window_id = Some(self.ids.window_id);
-        self.ids.window_id = Uuid::now_v7();
+        let planned = self.plan_advance();
+        let Ok(window) = self.commit_advance(planned) else {
+            unreachable!("a freshly planned window advance must commit")
+        };
+        window
+    }
+
+    pub(super) fn plan_advance(&self) -> PlannedAutoCompactWindow {
+        PlannedAutoCompactWindow {
+            window_number: self.window_number.saturating_add(1),
+            ids: AutoCompactWindowIds {
+                first_window_id: self.ids.first_window_id,
+                previous_window_id: Some(self.ids.window_id),
+                window_id: Uuid::now_v7(),
+            },
+        }
+    }
+
+    pub(super) fn commit_advance(
+        &mut self,
+        planned: PlannedAutoCompactWindow,
+    ) -> Result<(u64, AutoCompactWindowIds), &'static str> {
+        if planned.window_number != self.window_number.saturating_add(1)
+            || planned.ids.first_window_id != self.ids.first_window_id
+            || planned.ids.previous_window_id != Some(self.ids.window_id)
+            || planned.ids.window_id == self.ids.window_id
+        {
+            return Err("context window changed before the planned advance committed");
+        }
+        self.window_number = planned.window_number;
+        self.ids = planned.ids;
         self.new_context_window_requested = false;
         self.token_budget_reminder_delivered = false;
-        (self.window_number, self.ids)
+        Ok((self.window_number, self.ids))
     }
 
     pub(super) fn claim_token_budget_reminder(&mut self) -> bool {
@@ -223,5 +258,26 @@ mod tests {
                 prefill_input_tokens: Some(120),
             }
         );
+    }
+
+    #[test]
+    fn planned_advance_commits_exact_ids_and_rejects_a_stale_plan() {
+        let mut window = AutoCompactWindow::new_with_ids(AutoCompactWindowIds::new_initial());
+        let initial_ids = window.ids();
+        let planned = window.plan_advance();
+
+        assert_eq!(planned.window_number, 1);
+        assert_eq!(planned.ids.first_window_id, initial_ids.first_window_id);
+        assert_eq!(planned.ids.previous_window_id, Some(initial_ids.window_id));
+        assert_ne!(planned.ids.window_id, initial_ids.window_id);
+        assert_eq!(window.commit_advance(planned), Ok((1, planned.ids)));
+
+        let stale = window.plan_advance();
+        let advanced = window.advance();
+        assert_eq!(
+            window.commit_advance(stale),
+            Err("context window changed before the planned advance committed")
+        );
+        assert_eq!((window.window_number(), window.ids()), advanced);
     }
 }

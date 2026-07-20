@@ -6,6 +6,8 @@
 //! then optionally layer role-specific config on top.
 
 use crate::agent::AgentStatus;
+use crate::agent::agent_resolver::ensure_collaboration_sender_allowed;
+use crate::agent::agent_resolver::ensure_collaboration_target_allowed;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;

@@ -1,3 +1,4 @@
+use crate::agent::control::WORKFLOW_MANAGED_COLLABORATION_TARGET_ERROR;
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -87,6 +88,11 @@ pub(crate) fn collab_agent_error(agent_id: ThreadId, err: CodexErr) -> FunctionC
         }
         CodexErr::UnsupportedOperation(_) => {
             FunctionCallError::RespondToModel("collab manager unavailable".to_string())
+        }
+        CodexErr::InvalidRequest(message)
+            if message == WORKFLOW_MANAGED_COLLABORATION_TARGET_ERROR =>
+        {
+            FunctionCallError::RespondToModel(message)
         }
         err => FunctionCallError::RespondToModel(format!("collab tool failed: {err}")),
     }

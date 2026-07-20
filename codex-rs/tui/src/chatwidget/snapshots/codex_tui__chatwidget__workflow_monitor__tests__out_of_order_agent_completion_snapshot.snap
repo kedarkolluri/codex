@@ -1,0 +1,14 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 80)"
+---
+◆ Workflow fanout  run-inve  running · elapsed ≥ 6s
+  2.97K tokens · 6 tools
+  ● work · 1/2 agents · elapsed ≥ 5s
+    └─ ● parallel · 2 items
+      ├─ ● slow-first  gpt-5.5 · high  running · attempt 1 · 2.1K tok · 4 tools
+         · ≥0ms
+      └─ ✓ fast-second  gpt-5.5-mini · low  completed · attempt 1 · 870 tok · 2
+         tools · 0ms
+
+  Enter inspect agents

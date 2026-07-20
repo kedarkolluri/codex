@@ -1,0 +1,23 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 30)"
+---
+◆ Workflow cross-platform
+  verification  run-narr
+  running · elapsed ≥ 7s
+  12.4K tokens · 18 tools
+  ● execute · 0/1 agents ·
+    elapsed ≥ 6s
+    └─ ● pipeline · 1 item
+      └─ ● windows integration
+         tests  custom-router/
+         gpt-5.5 · ultra
+         running · attempt 1 ·
+         12.4K tok · 18 tools
+         · ≥0ms
+  ↳ Waiting for the remote
+    Windows executor to finish
+    its integration test
+    matrix.
+
+  Enter inspect agents

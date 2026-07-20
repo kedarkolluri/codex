@@ -26,6 +26,26 @@ async fn build_config_on_runtime_worker(
 }
 
 impl App {
+    fn apply_workflow_runtime_feature_state(&self, config: &mut Config) -> Result<()> {
+        config
+            .features
+            .set_enabled(
+                Feature::Workflow,
+                self.workflow_feature_state.runtime_enabled,
+            )
+            .map_err(|err| {
+                color_eyre::eyre::eyre!(
+                    "failed to preserve the startup workflow feature state: {err}"
+                )
+            })
+    }
+
+    pub(super) fn set_configured_workflow_feature_enabled(&mut self, enabled: bool) {
+        self.workflow_feature_state.configured_enabled = enabled;
+        self.chat_widget
+            .set_workflow_feature_configured_enabled(enabled);
+    }
+
     pub(super) async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
         let mut overrides = self.harness_overrides.clone();
         overrides.cwd = Some(cwd.clone());
@@ -209,8 +229,11 @@ impl App {
         let mut config = self
             .rebuild_config_for_cwd(self.chat_widget.config_ref().cwd.to_path_buf())
             .await?;
+        let configured_workflow_enabled = config.features.enabled(Feature::Workflow);
+        self.apply_workflow_runtime_feature_state(&mut config)?;
         self.apply_runtime_policy_overrides(&mut config);
         self.config = config;
+        self.set_configured_workflow_feature_enabled(configured_workflow_enabled);
         self.chat_widget.sync_plugin_mentions_config(&self.config);
         Ok(())
     }
@@ -252,11 +275,11 @@ impl App {
         current_cwd: &Path,
         resume_cwd: PathBuf,
     ) -> Result<Config> {
-        match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
-            Ok(config) => Ok(config),
+        let mut config = match self.rebuild_config_for_cwd(resume_cwd.clone()).await {
+            Ok(config) => config,
             Err(err) => {
                 if crate::session_resume::cwds_differ(current_cwd, &resume_cwd) {
-                    Err(err)
+                    return Err(err);
                 } else {
                     let resume_cwd_display = resume_cwd.display().to_string();
                     tracing::warn!(
@@ -264,10 +287,14 @@ impl App {
                         cwd = %resume_cwd_display,
                         "failed to rebuild config for same-cwd resume; using current in-memory config"
                     );
-                    Ok(self.config.clone())
+                    return Ok(self.config.clone());
                 }
             }
-        }
+        };
+        let configured_workflow_enabled = config.features.enabled(Feature::Workflow);
+        self.apply_workflow_runtime_feature_state(&mut config)?;
+        self.set_configured_workflow_feature_enabled(configured_workflow_enabled);
+        Ok(config)
     }
 
     pub(super) fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
@@ -382,6 +409,8 @@ impl App {
         let mut permission_profile_override = None;
         let mut active_permission_profile_override = None;
         let mut feature_updates_to_apply = Vec::with_capacity(updates.len());
+        let configured_workflow_before = self.workflow_feature_state.configured_enabled;
+        let mut configured_workflow_update = None;
         let mut permissions_history_label: Option<&'static str> = None;
         let mut config_edits = Vec::new();
 
@@ -464,8 +493,12 @@ impl App {
                 active_permission_profile_override =
                     Some(auto_review_preset.active_permission_profile.clone());
             }
-            next_config = feature_config;
-            feature_updates_to_apply.push((feature, effective_enabled));
+            if feature == Feature::Workflow {
+                configured_workflow_update = Some(effective_enabled);
+            } else {
+                next_config = feature_config;
+                feature_updates_to_apply.push((feature, effective_enabled));
+            }
             config_edits.extend(feature_edits);
             config_edits.push(crate::config_update::build_feature_enabled_edit(
                 feature_key,
@@ -511,6 +544,11 @@ impl App {
                     &effective_config,
                     &feature_updates_to_apply,
                 );
+                if configured_workflow_update.is_some() {
+                    let enabled =
+                        feature_enabled_from_effective_config(&effective_config, Feature::Workflow);
+                    self.set_configured_workflow_feature_enabled(enabled);
+                }
                 self.sync_auto_review_runtime_state_from_effective_config(
                     &effective_config,
                     &feature_updates_to_apply,
@@ -525,6 +563,18 @@ impl App {
 
         let memory_tool_was_enabled = self.config.features.enabled(Feature::MemoryTool);
         self.config = next_config;
+        if let Some(enabled) = configured_workflow_update {
+            self.set_configured_workflow_feature_enabled(enabled);
+            if enabled != configured_workflow_before
+                && enabled != self.workflow_feature_state.runtime_enabled
+            {
+                let state = if enabled { "enabled" } else { "disabled" };
+                self.chat_widget.add_info_message(
+                    format!("Dynamic workflows will be {state} after restarting Codex."),
+                    /*hint*/ None,
+                );
+            }
+        }
         let show_memory_enable_notice =
             feature_updates_to_apply.iter().any(|(feature, enabled)| {
                 *feature == Feature::MemoryTool && *enabled && !memory_tool_was_enabled

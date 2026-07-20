@@ -45,6 +45,7 @@ impl Handler {
             call_id,
             ..
         } = invocation;
+        ensure_collaboration_sender_allowed(session.as_ref()).await?;
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let min_timeout_ms = turn.config.multi_agent_v2.min_wait_timeout_ms;

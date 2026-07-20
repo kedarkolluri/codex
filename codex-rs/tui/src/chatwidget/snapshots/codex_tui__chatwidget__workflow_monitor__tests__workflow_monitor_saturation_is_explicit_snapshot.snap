@@ -1,0 +1,43 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"SATURATED\\n{saturated}\\n\\nTERMINAL RETIRED\\n{retired}\")"
+---
+SATURATED
+  … 1 workflow run omitted
+
+◆ Workflow workflow 1  run-0001  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow workflow 2  run-0002  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow workflow 3  run-0003  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◇ Workflow workflow 4  run-0004  compact · running
+◇ Workflow workflow 5  run-0005  compact · running
+◇ Workflow workflow 6  run-0006  compact · running
+◇ Workflow workflow 7  run-0007  compact · running
+
+  … 1 additional workflow run omitted at monitor capacity · latest run-0008
+
+  Enter inspect agents
+
+TERMINAL RETIRED
+  … 1 workflow run omitted
+
+◆ Workflow workflow 1  run-0001  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow workflow 2  run-0002  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow workflow 3  run-0003  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◇ Workflow workflow 4  run-0004  compact · running
+◇ Workflow workflow 5  run-0005  compact · running
+◇ Workflow workflow 6  run-0006  compact · running
+◇ Workflow workflow 7  run-0007  compact · running
+
+  Enter inspect agents

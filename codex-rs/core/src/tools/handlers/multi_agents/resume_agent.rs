@@ -39,11 +39,11 @@ async fn handle_resume_agent(
         call_id,
         ..
     } = invocation;
+    ensure_collaboration_sender_allowed(session.as_ref()).await?;
     let arguments = function_arguments(payload)?;
     let args: ResumeAgentArgs = parse_arguments(&arguments)?;
-    let receiver_thread_id = ThreadId::from_string(&args.id).map_err(|err| {
-        FunctionCallError::RespondToModel(format!("invalid agent id {}: {err:?}", args.id))
-    })?;
+    let receiver_thread_id = parse_agent_id_target(&args.id)?;
+    ensure_collaboration_target_allowed(session.as_ref(), receiver_thread_id).await?;
     let receiver_agent = session
         .services
         .agent_control
@@ -192,17 +192,22 @@ async fn try_resume_closed_agent(
     child_depth: i32,
 ) -> Result<(), FunctionCallError> {
     let config = build_agent_resume_config(turn.as_ref())?;
-    Box::pin(session.services.agent_control.resume_agent_from_rollout(
-        config,
-        receiver_thread_id,
-        thread_spawn_source(
-            session.thread_id(),
-            &turn.session_source,
-            child_depth,
-            /*agent_role*/ None,
-            /*task_name*/ None,
-        )?,
-    ))
+    Box::pin(
+        session
+            .services
+            .agent_control
+            .resume_agent_from_rollout_from_generic_collaboration(
+                config,
+                receiver_thread_id,
+                thread_spawn_source(
+                    session.thread_id(),
+                    &turn.session_source,
+                    child_depth,
+                    /*agent_role*/ None,
+                    /*task_name*/ None,
+                )?,
+            ),
+    )
     .await
     .map(|_| ())
     .map_err(|err| collab_agent_error(receiver_thread_id, err))

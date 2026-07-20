@@ -286,6 +286,13 @@ impl ConfigRequestProcessor {
         };
         let thread_ids = self.thread_manager.list_thread_ids().await;
         for thread_id in thread_ids {
+            if self
+                .thread_manager
+                .is_workflow_managed_thread(thread_id)
+                .await
+            {
+                continue;
+            }
             let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
                 continue;
             };

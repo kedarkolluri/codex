@@ -10415,6 +10415,29 @@ max_concurrent_threads_per_session = 17
 }
 
 #[test]
+fn legacy_default_multi_agent_v2_usage_hint_identity_survives_concurrency_drift() {
+    for base in [
+        DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT,
+        DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT,
+    ] {
+        let historical_hint = default_multi_agent_v2_usage_hint_text(base, 37);
+        assert!(is_legacy_default_multi_agent_v2_usage_hint_text(
+            &historical_hint
+        ));
+
+        let mismatched_count =
+            historical_hint.replacen("up to 37 agents", "up to 36 agents", /*count*/ 1);
+        assert!(!is_legacy_default_multi_agent_v2_usage_hint_text(
+            &mismatched_count
+        ));
+    }
+
+    assert!(!is_legacy_default_multi_agent_v2_usage_hint_text(
+        "Preserve this arbitrary developer instruction."
+    ));
+}
+
+#[test]
 fn multi_agent_v2_preserves_empty_mode_hint_override() {
     let config_toml = toml::from_str(
         r#"[features.multi_agent_v2]
@@ -10450,6 +10473,127 @@ subagent_usage_hint_text = ""
 
     assert_eq!(config.multi_agent_v2.root_agent_usage_hint_text, None);
     assert_eq!(config.multi_agent_v2.subagent_usage_hint_text, None);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_agent_v2_prompt_bounds_are_inactive_without_workflow() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let usage_hint_text = "é".repeat(multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES / 2 + 1);
+    let root_agent_usage_hint_text = "r".repeat(multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES);
+    let subagent_usage_hint_text = "s".repeat(multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES);
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        format!(
+            r#"[features]
+workflow = false
+
+[features.multi_agent_v2]
+enabled = true
+usage_hint_text = "{usage_hint_text}"
+root_agent_usage_hint_text = "{root_agent_usage_hint_text}"
+subagent_usage_hint_text = "{subagent_usage_hint_text}"
+"#,
+        ),
+    )?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await?;
+
+    assert!(config.features.enabled(Feature::MultiAgentV2));
+    assert!(!config.features.enabled(Feature::Workflow));
+    assert_eq!(
+        (
+            config.multi_agent_v2.usage_hint_text.as_deref(),
+            config.multi_agent_v2.root_agent_usage_hint_text.as_deref(),
+            config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
+        ),
+        (
+            Some(usage_hint_text.as_str()),
+            Some(root_agent_usage_hint_text.as_str()),
+            Some(subagent_usage_hint_text.as_str()),
+        )
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_rejects_multi_agent_v2_prompt_field_over_utf8_byte_limit() -> std::io::Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let usage_hint_text = "é".repeat(multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES / 2 + 1);
+    let usage_hint_bytes = usage_hint_text.len();
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        format!(
+            r#"[features]
+workflow = true
+
+[features.multi_agent_v2]
+usage_hint_text = "{usage_hint_text}"
+"#,
+        ),
+    )?;
+
+    let err = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await
+        .expect_err("workflow should reject a prompt field over its UTF-8 byte limit");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "features.multi_agent_v2.usage_hint_text exceeds the 4000-byte limit (got {usage_hint_bytes} bytes)"
+        )
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn workflow_rejects_combined_multi_agent_v2_prompt_payload() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let usage_hint_text = "u".repeat(multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES - 1);
+    let root_agent_usage_hint_text = "r".repeat(multi_agent_v2_bounds::PROMPT_FIELD_MAX_BYTES - 1);
+    let subagent_usage_hint_text = "sss";
+    let total_bytes =
+        usage_hint_text.len() + root_agent_usage_hint_text.len() + subagent_usage_hint_text.len();
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        format!(
+            r#"[features]
+workflow = true
+
+[features.multi_agent_v2]
+usage_hint_text = "{usage_hint_text}"
+root_agent_usage_hint_text = "{root_agent_usage_hint_text}"
+subagent_usage_hint_text = "{subagent_usage_hint_text}"
+"#,
+        ),
+    )?;
+
+    let err = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(codex_home.path().to_path_buf()))
+        .build()
+        .await
+        .expect_err("workflow should reject an oversized combined prompt payload");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "features.multi_agent_v2 prompt payload exceeds the 8000-byte combined limit (got {total_bytes} bytes)"
+        )
+    );
 
     Ok(())
 }

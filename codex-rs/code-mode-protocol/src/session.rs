@@ -14,6 +14,8 @@ use crate::ExecuteRequest;
 use crate::RuntimeResponse;
 use crate::WaitOutcome;
 use crate::WaitRequest;
+use crate::WorkflowBudgetSnapshot;
+use codex_protocol::protocol::WorkflowEvent;
 
 pub type CodeModeSessionResultFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
@@ -22,6 +24,29 @@ pub type CodeModeSessionProviderFuture<'a> =
 pub type ToolInvocationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
 pub type NotificationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+pub type WorkflowBudgetSnapshotFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Option<WorkflowBudgetSnapshot>, String>> + Send + 'a>>;
+
+/// Runtime-to-core workflow progress carried by the negotiated `workflow-v1` host envelope.
+///
+/// Renderer-neutral events are authored in the isolate where source order is known. Terminal
+/// completion is intentionally a separate signal: core owns the live budget and translates it to
+/// the public `WorkflowRunEndEvent` at the session boundary.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowHostProgress {
+    Event { event: Box<WorkflowEvent> },
+    Complete { status: WorkflowHostCompletion },
+}
+
+/// Terminal runtime outcome before core adds run budget counters.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowHostCompletion {
+    Completed,
+    Errored(String),
+    Interrupted,
+}
 /// The three-way resolution of a workflow `agent(prompt, opts?)` spawn, produced host-side and
 /// carried back to the isolate so the `agent()` promise can RESOLVE, resolve-to-null, or REJECT.
 ///
@@ -48,22 +73,19 @@ pub enum AgentSpawnOutcome {
 /// `null`, or throw).
 pub type AgentSpawnFuture<'a> = Pin<Box<dyn Future<Output = AgentSpawnOutcome> + Send + 'a>>;
 
-/// Live, thread-safe view of a workflow run's shared token budget, backing the native
-/// `budget.spent()` / `budget.remaining()` isolate globals (§4 `budget`; §8).
+/// Live, thread-safe view of one workflow run's runtime-owned budget mirror,
+/// backing the native `budget.spent()` / `budget.remaining()` globals.
 ///
-/// This is the shared seam type between core's budget accounting and the code-mode runtime. The
-/// implementor is core's `RolloutBudget` (via an adapter), whose getters read the tree-wide weighted
-/// counter under the existing lock, so the isolate observes spend accrued by subagents that
-/// completed turns *after* install — the values are read live at call time, never snapshotted. It is
-/// threaded into the isolate as an in-process `Arc` (it cannot ride the serializable
-/// `ExecuteRequest` wire), exactly like the other host handles, and is installed only for workflow
-/// runs.
+/// The mirror starts from [`ExecuteRequest::workflow_budget`] and is refreshed
+/// through [`CodeModeSessionDelegate::workflow_budget_snapshot`] after callbacks
+/// that can change spend. This keeps the isolate API identical for in-process and
+/// process-owned hosts without exposing core's session-wide rollout budget.
 pub trait WorkflowBudgetHandle: Send + Sync {
     /// Configured `budget.total` ceiling (pure output-token spend, §8).
     fn total(&self) -> i64;
-    /// Live weighted output-token spend so far (`RolloutBudget::spent`).
+    /// Live output-token spend charged to this workflow run.
     fn spent(&self) -> i64;
-    /// Live remaining budget, clamped at 0 (`RolloutBudget::remaining`).
+    /// Live effective remaining budget, clamped at 0.
     fn remaining(&self) -> i64;
 }
 
@@ -159,12 +181,24 @@ pub trait CodeModeSessionDelegate: Send + Sync {
     fn spawn_agent<'a>(
         &'a self,
         cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: crate::AgentCallOpts,
         cancellation_token: CancellationToken,
     ) -> AgentSpawnFuture<'a> {
-        let _ = (cell_id, prompt, ordinal, opts, cancellation_token);
+        let _ = (
+            cell_id,
+            node_id,
+            parent_node_id,
+            phase,
+            prompt,
+            ordinal,
+            opts,
+            cancellation_token,
+        );
         Box::pin(async { AgentSpawnOutcome::Failed })
     }
 
@@ -189,68 +223,63 @@ pub trait CodeModeSessionDelegate: Send + Sync {
         Box::pin(async { AgentSpawnOutcome::Failed })
     }
 
-    /// The live shared token-budget handle backing the workflow `budget` global's `spent()` /
-    /// `remaining()` native functions (§4/§8), or `None` when this session runs no budgeted
-    /// workflow.
-    ///
-    /// The code-mode runtime threads the returned handle into every cell it spawns so a real
-    /// workflow observes live tree-wide spend rather than a static snapshot. It is an in-process
-    /// `Arc` (never serialized over the `ExecuteRequest` wire). The default implementation returns
-    /// `None` so non-workflow hosts — and the process-owned host, which cannot forward an `Arc`
-    /// across the IPC boundary — need no changes; the budget global then reports `0` spent and
-    /// `budget.total` remaining.
-    fn budget_handle(&self) -> Option<Arc<dyn WorkflowBudgetHandle>> {
-        None
-    }
-
-    /// Prior-run journal `agent_call` lines seeding prefix-replay for a resumed run
-    /// (spec §7 "Resume algorithm" steps 1-3, `P3-resume-entry`).
-    ///
-    /// Returned as raw JSON `agent_call` records (each a serialized
-    /// `codex_workflow_journal::AgentCallLine`) so this protocol trait stays free of a
-    /// dependency on the journal crate — the code-mode runtime deserializes them into
-    /// the isolate's `ReplayState` when it spawns the cell. Like [`budget_handle`], this
-    /// is an in-process hand-off (never serialized over the `ExecuteRequest` wire).
-    ///
-    /// The default returns an empty vec so a fresh (non-resume) run — and every
-    /// non-workflow host — seeds no replay state and dispatches every `agent()` live.
-    /// A resume delegate hands the loaded prefix to the FIRST cell it spawns (the
-    /// top-level resumed run); later nested `workflow()` cells receive an empty vec and
-    /// run fresh.
-    ///
-    /// [`budget_handle`]: CodeModeSessionDelegate::budget_handle
-    fn replay_entries(&self, cell_id: CellId) -> Vec<JsonValue> {
+    /// Refresh the run-local budget mirror after an `agent()`, replay, or nested
+    /// workflow callback. Process-owned hosts route this over IPC; in-process
+    /// hosts use the identical callback so both observe the same ordering.
+    fn workflow_budget_snapshot<'a>(&'a self, cell_id: CellId) -> WorkflowBudgetSnapshotFuture<'a> {
         let _ = cell_id;
-        Vec::new()
+        Box::pin(async { Ok(None) })
     }
 
-    /// Journal a workflow `phase(title)` marker for the run executing in `cell_id` (§7 `phase` line).
-    /// The default is a no-op so non-workflow hosts need no changes.
+    /// Journal a workflow `phase(title)` marker for the run executing in `cell_id` (§7 `phase`
+    /// line). An error stops the workflow with a generic public failure while the host detail stays
+    /// diagnostic-only. The default is a successful no-op so non-workflow hosts need no changes.
     fn journal_phase<'a>(&'a self, cell_id: CellId, title: String) -> NotificationFuture<'a> {
         let _ = (cell_id, title);
         Box::pin(async { Ok(()) })
     }
 
     /// Journal a workflow `log(message)` marker for the run executing in `cell_id` (§7 `log` line).
-    /// The default is a no-op so non-workflow hosts need no changes.
+    /// An error stops the workflow with a generic public failure while the host detail stays
+    /// diagnostic-only. The default is a successful no-op so non-workflow hosts need no changes.
     fn journal_log<'a>(&'a self, cell_id: CellId, message: String) -> NotificationFuture<'a> {
         let _ = (cell_id, message);
         Box::pin(async { Ok(()) })
     }
 
     /// Handle a prefix-replay cache hit for the run executing in `cell_id` (§7 "Resume algorithm"
-    /// step 3): re-append the replayed `agent_call` line to the run's journal and re-add its
-    /// `tokens_spent` to the shared budget, WITHOUT spawning a subagent — so `spent()`/`remaining()`
-    /// and the ceiling throw track the original run.
+    /// step 3): re-append the replayed `agent_call` line to the run's journal and charge its
+    /// `tokens_spent` to that run's local meter, WITHOUT spawning a subagent. Session accounting is
+    /// unchanged because replay performs no model turn.
     ///
     /// `entry` is a raw JSON `agent_call` record (a serialized
     /// `codex_workflow_journal::AgentCallLine`), mirroring [`replay_entries`] so this protocol trait
     /// stays free of a dependency on the journal crate. The default is a no-op so non-workflow hosts
-    /// — and every host that neither journals nor meters — need no changes.
+    /// — and every host that neither journals nor meters — need no changes. Any error is fatal to
+    /// the workflow: callers must not continue from a replay prefix that was not durably recorded
+    /// and charged.
     ///
-    /// [`replay_entries`]: CodeModeSessionDelegate::replay_entries
-    fn replay_agent<'a>(&'a self, cell_id: CellId, entry: JsonValue) -> NotificationFuture<'a> {
-        let _ = (cell_id, entry);
+    /// [`replay_entries`]: ExecuteRequest::replay_entries
+    fn replay_agent<'a>(
+        &'a self,
+        cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
+        entry: JsonValue,
+    ) -> NotificationFuture<'a> {
+        let _ = (cell_id, node_id, parent_node_id, phase, entry);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Deliver source-ordered workflow progress for `cell_id` to core. The default is a no-op so
+    /// plain code-mode hosts and tests that do not negotiate `workflow-v1` remain unchanged.
+    fn workflow_progress<'a>(
+        &'a self,
+        cell_id: CellId,
+        progress: WorkflowHostProgress,
+    ) -> NotificationFuture<'a> {
+        let _ = (cell_id, progress);
         Box::pin(async { Ok(()) })
     }
 

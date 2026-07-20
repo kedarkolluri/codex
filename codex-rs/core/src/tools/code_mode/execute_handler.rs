@@ -10,6 +10,7 @@ use codex_tools::ToolSpec;
 
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
+use super::delegate::CodeModeDispatchOrigin;
 use super::handle_runtime_response;
 use super::is_exec_tool_name;
 
@@ -43,20 +44,25 @@ impl CodeModeExecuteHandler {
             .session
             .services
             .code_mode_service
-            .execute(codex_code_mode::ExecuteRequest {
-                tool_call_id: call_id.clone(),
-                enabled_tools,
-                source: args.code.clone(),
-                yield_time_ms: args.yield_time_ms,
-                max_output_tokens: args.max_output_tokens,
-                // Plain code-mode exec is never workflow mode: the workflow-only
-                // narrator globals stay uninstalled for model-authored programs.
-                workflow: false,
-                // Plain code-mode exec carries no invocation args and mints no
-                // run id; these are workflow-only.
-                args: None,
-                run_id: None,
-            })
+            .execute(
+                codex_code_mode::ExecuteRequest {
+                    tool_call_id: call_id.clone(),
+                    enabled_tools,
+                    source: args.code.clone(),
+                    yield_time_ms: args.yield_time_ms,
+                    max_output_tokens: args.max_output_tokens,
+                    // Plain code-mode exec is never workflow mode: the workflow-only
+                    // narrator globals stay uninstalled for model-authored programs.
+                    workflow: false,
+                    // Plain code-mode exec carries no invocation args and mints no
+                    // run id; these are workflow-only.
+                    args: None,
+                    run_id: None,
+                    replay_entries: Vec::new(),
+                    workflow_budget: None,
+                },
+                CodeModeDispatchOrigin::Turn(exec.turn.sub_id.clone()),
+            )
             .await
             .map_err(FunctionCallError::RespondToModel)?;
         let cell_id = started_cell.cell_id.clone();

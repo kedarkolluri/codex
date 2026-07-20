@@ -3,9 +3,12 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use app_test_support::DEFAULT_CLIENT_NAME;
 use app_test_support::TestAppServer;
 use app_test_support::to_response;
 use app_test_support::write_mock_responses_config_toml;
+use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::JSONRPCResponse;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ThreadStartParams;
@@ -99,6 +102,62 @@ async fn workflows_changed_notification_is_emitted_after_workflow_change() -> Re
     Ok(())
 }
 
+/// Backward compatibility: the saved-workflow invalidation notification was
+/// stable before workflow controls were introduced, so it must still reach a
+/// connection that did not opt into the experimental app-server API.
+#[tokio::test]
+async fn workflows_changed_notification_remains_stable_without_experimental_api() -> Result<()> {
+    skip_if_remote!(
+        Ok(()),
+        "host-local workflow changes are not visible to remote executors"
+    );
+
+    let server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    write_config(
+        codex_home.path(),
+        &server.uri(),
+        /*workflow_enabled*/ true,
+    )?;
+    let workflows_dir = codex_home.path().join("workflows");
+    std::fs::create_dir_all(&workflows_dir)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    mcp.initialize_with_capabilities(
+        ClientInfo {
+            name: DEFAULT_CLIENT_NAME.to_string(),
+            title: None,
+            version: "0.1.0".to_string(),
+        },
+        Some(InitializeCapabilities {
+            experimental_api: false,
+            ..Default::default()
+        }),
+    )
+    .await?;
+
+    std::fs::write(
+        workflows_dir.join("demo.workflow.js"),
+        workflow_source("demo", "demo description"),
+    )?;
+
+    let notification = timeout(
+        WATCHER_TIMEOUT,
+        mcp.read_stream_until_notification_message("workflows/changed"),
+    )
+    .await??;
+    let params = notification
+        .params
+        .context("workflows/changed params must be present")?;
+    let notification: WorkflowsChangedNotification = serde_json::from_value(params)?;
+    assert_eq!(notification, WorkflowsChangedNotification {});
+
+    Ok(())
+}
+
 /// Gating: with `Feature::Workflow` disabled, no watcher is constructed, so a
 /// workflow file change under a would-be-watched root emits nothing.
 #[tokio::test]
@@ -145,6 +204,53 @@ async fn no_workflows_changed_notification_when_feature_disabled() -> Result<()>
     Ok(())
 }
 
+/// Durable run artifacts share the Codex-home `workflows` parent directory with
+/// saved definitions, but changes below its reserved top-level `runs` subtree
+/// must not invalidate the saved-workflow registry or notify clients.
+#[tokio::test]
+async fn no_workflows_changed_notification_for_codex_home_run_artifacts() -> Result<()> {
+    skip_if_remote!(
+        Ok(()),
+        "host-local workflow changes are not visible to remote executors"
+    );
+
+    let server = responses::start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    write_config(
+        codex_home.path(),
+        &server.uri(),
+        /*workflow_enabled*/ true,
+    )?;
+    let run_dir = codex_home
+        .path()
+        .join("workflows")
+        .join("runs")
+        .join("run-id");
+    std::fs::create_dir_all(&run_dir)?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    std::fs::write(
+        run_dir.join("script.js"),
+        workflow_source("historical-run", "durable execution state"),
+    )?;
+
+    let result = timeout(
+        ABSENCE_WINDOW,
+        mcp.read_stream_until_notification_message("workflows/changed"),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "workflows/changed must not be emitted for durable run artifacts"
+    );
+    Ok(())
+}
+
 /// Per-thread roots: a thread attaching in a directory contributes
 /// `<that cwd>/.codex/workflows` to the watched set (mirrors how the skills
 /// watcher derives roots per thread at listener-attach time). A change there
@@ -170,10 +276,10 @@ async fn workflows_changed_notification_is_emitted_for_thread_project_root() -> 
         .await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    // The thread's `config.cwd` is the project root the listener registers on
-    // attach (`<cwd>/.codex/workflows`). Pin it to the auto environment's cwd (an
-    // existing host-local temp dir) and pre-create the workflows dir so the
-    // watcher registers a direct recursive watch on it.
+    // The thread's primary selected environment cwd is the project root the
+    // listener registers on attach (`<cwd>/.codex/workflows`). Pin config cwd to
+    // that same existing host-local temp dir and pre-create the workflows dir so
+    // the watcher registers a direct recursive watch on it.
     let thread_cwd = mcp.auto_env()?.cwd().clone().into_path_buf();
     let project_workflows_dir = thread_cwd.join(".codex").join("workflows");
     std::fs::create_dir_all(&project_workflows_dir)?;

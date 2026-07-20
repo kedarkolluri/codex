@@ -284,6 +284,7 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
             deferred_mcp_tools: None,
             extension_tool_executors: Vec::new(),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            collaboration_tool_access: Default::default(),
         },
         &Default::default(),
     ));

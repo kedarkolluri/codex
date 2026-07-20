@@ -70,6 +70,7 @@ pub(crate) async fn handle_message_string_tool(
         call_id,
         ..
     } = invocation;
+    ensure_collaboration_sender_allowed(session.as_ref()).await?;
     let receiver_thread_id = resolve_agent_target(&session, &turn, &target).await?;
     let receiver_agent = session
         .services

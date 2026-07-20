@@ -4,6 +4,7 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
@@ -62,7 +63,12 @@ fn apply_session_meta_from_item(metadata: &mut ThreadMetadata, meta_line: &Sessi
     metadata.id = meta_line.meta.id;
     metadata.source = enum_to_string(&meta_line.meta.source);
     // Later SessionMeta lines do not redefine the canonical history_mode.
-    metadata.thread_source = meta_line.meta.thread_source.clone();
+    if !matches!(
+        metadata.thread_source.as_ref(),
+        Some(ThreadSource::Feature(feature)) if feature == "workflow"
+    ) {
+        metadata.thread_source = meta_line.meta.thread_source.clone();
+    }
     metadata.agent_nickname = meta_line.meta.agent_nickname.clone();
     metadata.agent_role = meta_line.meta.agent_role.clone();
     metadata.agent_path = meta_line.meta.agent_path.clone();

@@ -11,6 +11,7 @@ use crate::thread_state::TurnSummary;
 use crate::thread_state::resolve_server_request_on_thread_listener;
 use crate::thread_status::ThreadWatchActiveGuard;
 use crate::thread_status::ThreadWatchManager;
+use crate::workflow_event_mapping::workflow_event_to_server_notification;
 use codex_app_server_protocol::AccountRateLimitsUpdatedNotification;
 use codex_app_server_protocol::AdditionalPermissionProfile as V2AdditionalPermissionProfile;
 use codex_app_server_protocol::CodexErrorInfo as V2CodexErrorInfo;
@@ -840,6 +841,15 @@ pub(crate) async fn apply_bespoke_event_handling(
             // compatibility consumers.
             // App-server v2 receives TurnItem lifecycle instead, and dispatches dynamic tool
             // requests from DynamicToolCall starts.
+        }
+        EventMsg::Workflow(event) => {
+            let thread_id = conversation_id.to_string();
+            let notification = workflow_event_to_server_notification(
+                &thread_id,
+                event,
+                now_unix_timestamp_ms() / 1_000,
+            );
+            outgoing.send_server_notification(notification).await;
         }
         EventMsg::McpToolCallBegin(_) | EventMsg::McpToolCallEnd(_) => {
             // Deprecated MCP tool-call events are still fanned out for raw-event and rollout
@@ -2044,6 +2054,8 @@ mod tests {
     use crate::outgoing_message::OutgoingEnvelope;
     use crate::outgoing_message::OutgoingMessage;
     use crate::outgoing_message::OutgoingMessageSender;
+    use crate::transport::OutboundConnectionState;
+    use crate::transport::route_outgoing_envelope;
     use anyhow::Result;
     use anyhow::anyhow;
     use anyhow::bail;
@@ -2053,6 +2065,7 @@ mod tests {
     use codex_app_server_protocol::JSONRPCErrorError;
     use codex_app_server_protocol::ServerRequest;
     use codex_app_server_protocol::TurnPlanStepStatus;
+    use codex_app_server_protocol::WorkflowStartedNotification;
     use codex_login::CodexAuth;
     use codex_protocol::AgentPath;
     use codex_protocol::items::DynamicToolCallItem;
@@ -2083,6 +2096,8 @@ mod tests {
     use codex_protocol::protocol::TokenUsage;
     use codex_protocol::protocol::TokenUsageInfo;
     use codex_protocol::protocol::UserMessageEvent;
+    use codex_protocol::protocol::WorkflowEvent;
+    use codex_protocol::protocol::WorkflowRunBeginEvent;
     use codex_thread_store::StoredThread;
     use codex_thread_store::StoredThreadHistory;
     use codex_utils_absolute_path::AbsolutePathBuf;
@@ -2091,6 +2106,10 @@ mod tests {
     use core_test_support::load_default_config_for_test;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::RwLock;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
     use tokio::sync::mpsc;
@@ -2113,6 +2132,120 @@ mod tests {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
             OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_event_delivery_requires_experimental_api_capability() -> Result<()> {
+        let codex_home = TempDir::new()?;
+        let config = load_default_config_for_test(&codex_home).await;
+        let thread_manager = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider_and_home(
+                CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+                config.model_provider.clone(),
+                config.codex_home.to_path_buf(),
+                Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+            ),
+        );
+        let codex_core::NewThread {
+            thread_id: conversation_id,
+            thread: conversation,
+            ..
+        } = thread_manager.start_thread(config).await?;
+
+        let opted_in_connection = ConnectionId(1);
+        let not_opted_in_connection = ConnectionId(2);
+        let (envelope_tx, mut envelope_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            envelope_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let outgoing = ThreadScopedOutgoingMessageSender::new(
+            outgoing,
+            vec![opted_in_connection, not_opted_in_connection],
+            conversation_id,
+        );
+
+        apply_bespoke_event_handling(
+            Event {
+                id: "turn-1".to_string(),
+                msg: EventMsg::Workflow(WorkflowEvent::RunBegin(WorkflowRunBeginEvent {
+                    run_id: "run-1".to_string(),
+                    resumed_from_run_id: None,
+                    name: "release-audit".to_string(),
+                    phases: vec!["inventory".to_string(), "review".to_string()],
+                    args_digest: "blake3:args".to_string(),
+                })),
+            },
+            conversation_id,
+            conversation,
+            thread_manager,
+            outgoing,
+            new_thread_state(),
+            ThreadWatchManager::new(),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
+            "test-provider".to_string(),
+        )
+        .await;
+
+        let (opted_in_tx, mut opted_in_rx) = mpsc::channel(1);
+        let (not_opted_in_tx, mut not_opted_in_rx) = mpsc::channel(1);
+        let mut connections = HashMap::from([
+            (
+                opted_in_connection,
+                OutboundConnectionState::new(
+                    opted_in_tx,
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(RwLock::new(HashSet::new())),
+                    /*disconnect_sender*/ None,
+                ),
+            ),
+            (
+                not_opted_in_connection,
+                OutboundConnectionState::new(
+                    not_opted_in_tx,
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::new(AtomicBool::new(false)),
+                    Arc::new(RwLock::new(HashSet::new())),
+                    /*disconnect_sender*/ None,
+                ),
+            ),
+        ]);
+        for _ in 0..2 {
+            let envelope = envelope_rx.recv().await.ok_or_else(|| {
+                anyhow!("workflow handler should emit one envelope per connection")
+            })?;
+            route_outgoing_envelope(&mut connections, envelope).await;
+        }
+
+        assert!(
+            not_opted_in_rx.try_recv().is_err(),
+            "workflow notifications should be silently filtered without experimentalApi"
+        );
+        let delivered = opted_in_rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow!("opted-in connection should receive workflow notification"))?;
+        let actual = match delivered.message {
+            OutgoingMessage::AppServerNotification(ServerNotification::WorkflowStarted(actual)) => {
+                actual
+            }
+            other => bail!("unexpected opted-in message: {other:?}"),
+        };
+        assert!(actual.started_at > 0);
+        assert_eq!(
+            actual,
+            WorkflowStartedNotification {
+                thread_id: conversation_id.to_string(),
+                run_id: "run-1".to_string(),
+                resumed_from_run_id: None,
+                name: "release-audit".to_string(),
+                phases: vec!["inventory".to_string(), "review".to_string()],
+                args_digest: "blake3:args".to_string(),
+                started_at: actual.started_at,
+            }
+        );
+        Ok(())
     }
 
     #[test]

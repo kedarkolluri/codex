@@ -16,6 +16,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::ThreadSource;
 use codex_rollout::persisted_rollout_items;
 
 use crate::AppendThreadItemsParams;
@@ -309,6 +310,42 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn workflow_thread_source_is_sticky_in_metadata_updates() {
+        let workflow_source = ThreadSource::Feature("workflow".to_string());
+        let other_source = ThreadSource::Feature("other".to_string());
+
+        for (created_source, updated_source) in [
+            (Some(workflow_source.clone()), Some(other_source.clone())),
+            (Some(workflow_source.clone()), None),
+            (Some(other_source), Some(workflow_source.clone())),
+            (None, Some(workflow_source.clone())),
+        ] {
+            let store = InMemoryThreadStore::default();
+            let thread_id = ThreadId::new();
+            let mut create_params = create_thread_params(thread_id, ThreadHistoryMode::Legacy);
+            create_params.thread_source = created_source;
+            store
+                .create_thread(create_params)
+                .await
+                .expect("create thread");
+
+            let stored = store
+                .update_thread_metadata(UpdateThreadMetadataParams {
+                    thread_id,
+                    patch: ThreadMetadataPatch {
+                        thread_source: Some(updated_source),
+                        ..Default::default()
+                    },
+                    include_archived: false,
+                })
+                .await
+                .expect("update thread metadata");
+
+            assert_eq!(stored.thread_source, Some(workflow_source.clone()));
+        }
+    }
+
     fn create_thread_params(
         thread_id: ThreadId,
         history_mode: ThreadHistoryMode,
@@ -576,14 +613,37 @@ impl InMemoryThreadStore {
     ) -> ThreadStoreResult<StoredThread> {
         let mut state = self.state.lock().await;
         state.calls.update_thread_metadata += 1;
-        if let Some(name) = params.patch.name.clone() {
+        let mut patch = params.patch;
+        if let Some(name) = patch.name.clone() {
             state.names.insert(params.thread_id, name);
+        }
+        let current_workflow_source = state
+            .created_threads
+            .get(&params.thread_id)
+            .and_then(|created| created.thread_source.as_ref())
+            .filter(
+                |source| matches!(source, ThreadSource::Feature(feature) if feature == "workflow"),
+            )
+            .cloned()
+            .or_else(|| {
+                state
+                    .metadata_updates
+                    .get(&params.thread_id)
+                    .and_then(|metadata| metadata.thread_source.as_ref())
+                    .and_then(Option::as_ref)
+                    .filter(|source| {
+                        matches!(source, ThreadSource::Feature(feature) if feature == "workflow")
+                    })
+                    .cloned()
+            });
+        if let Some(workflow_source) = current_workflow_source {
+            patch.thread_source = Some(Some(workflow_source));
         }
         state
             .metadata_updates
             .entry(params.thread_id)
             .or_default()
-            .merge(params.patch);
+            .merge(patch);
         stored_thread_from_state(&state, params.thread_id, /*include_history*/ false)
     }
 

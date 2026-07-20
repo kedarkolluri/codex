@@ -2,11 +2,14 @@ use anyhow::Result;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadConfigSnapshot;
 use codex_core::config::AgentRoleConfig;
+use codex_core::config::MultiAgentV2Config;
 use codex_features::Feature;
 use codex_models_manager::bundled_models_response;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
+use codex_protocol::models::ContentItem;
 use codex_protocol::models::PermissionProfile;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
@@ -1124,6 +1127,138 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
         .expect("child request log should capture at least one request");
     assert!(child_request.body_contains_text("Parent developer instructions."));
     assert!(child_request.body_contains_text(CHILD_PROMPT));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawned_multi_agent_v2_child_migrates_legacy_hint_from_unloaded_parent() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    const DRIFTED_ROOT_HINT: &str = "Drifted parent guidance.";
+    const CHILD_HINT: &str = "Child subagent guidance.";
+    const UNRELATED_DEVELOPER_INSTRUCTION: &str = "Preserve this arbitrary developer instruction.";
+
+    let legacy_root_hint = MultiAgentV2Config::default()
+        .root_agent_usage_hint_text
+        .expect("default root usage hint");
+    let server = start_mock_server().await;
+    let spawn_args = serde_json::to_string(&json!({
+        "message": CHILD_PROMPT,
+        "task_name": "worker",
+    }))?;
+    let spawn_turn = mount_response_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        sse_response(sse(vec![
+            ev_response_created("resp-parent-1"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                MULTI_AGENT_V2_NAMESPACE,
+                "spawn_agent",
+                &spawn_args,
+            ),
+            ev_completed("resp-parent-1"),
+        ]))
+        .set_delay(Duration::from_secs(1)),
+    )
+    .await;
+    let child_request_log = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, CHILD_PROMPT) && !body_contains(req, SPAWN_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("resp-child-1"),
+            ev_completed("resp-child-1"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        sse(vec![
+            ev_response_created("resp-parent-2"),
+            ev_assistant_message("msg-parent-2", "parent done"),
+            ev_completed("resp-parent-2"),
+        ]),
+    )
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::Collab)
+            .expect("test config should allow feature update");
+        config
+            .features
+            .enable(Feature::MultiAgentV2)
+            .expect("test config should allow feature update");
+        config.multi_agent_v2.root_agent_usage_hint_text = Some(DRIFTED_ROOT_HINT.to_string());
+        config.multi_agent_v2.subagent_usage_hint_text = Some(CHILD_HINT.to_string());
+    });
+    let test = builder.build(&server).await?;
+    test.codex
+        .inject_response_items(vec![
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: legacy_root_hint.clone(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::Message {
+                id: None,
+                role: "developer".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: UNRELATED_DEVELOPER_INSTRUCTION.to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ])
+        .await?;
+
+    let parent_thread_id = test.session_configured.thread_id;
+    let unload_parent = async {
+        let _ = wait_for_requests(&spawn_turn).await?;
+        assert!(
+            test.thread_manager
+                .remove_thread(&parent_thread_id)
+                .await
+                .is_some(),
+            "parent should be unloaded before its delayed spawn response is processed"
+        );
+        Ok::<(), anyhow::Error>(())
+    };
+    let (turn_result, unload_result) = tokio::join!(test.submit_turn(TURN_1_PROMPT), unload_parent);
+    unload_result?;
+    turn_result?;
+
+    let child_requests = wait_for_requests(&child_request_log).await?;
+    let child_request = child_requests
+        .last()
+        .expect("child request log should capture at least one request");
+    let developer_messages = child_request.message_input_texts("developer");
+    let expected_child_hint =
+        format!("<multi_agent_usage_hint>\n{CHILD_HINT}\n</multi_agent_usage_hint>");
+    let marked_usage_hints = developer_messages
+        .iter()
+        .filter(|text| text.starts_with("<multi_agent_usage_hint>\n"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(marked_usage_hints, vec![&expected_child_hint]);
+    assert_eq!(
+        developer_messages
+            .iter()
+            .filter(|text| text.as_str() == UNRELATED_DEVELOPER_INSTRUCTION)
+            .count(),
+        1
+    );
+    assert!(!child_request.body_contains_text(&legacy_root_hint));
+    assert!(!child_request.body_contains_text(DRIFTED_ROOT_HINT));
 
     Ok(())
 }

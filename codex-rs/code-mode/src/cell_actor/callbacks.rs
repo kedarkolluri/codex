@@ -13,6 +13,7 @@ use super::CellHost;
 use super::CellToolCall;
 use crate::TaskFailureHandler;
 use crate::runtime::RuntimeCommand;
+use crate::workflow_budget::WorkflowBudgetMirror;
 
 #[derive(Clone, Copy)]
 pub(super) enum CallbackCompletion {
@@ -99,20 +100,35 @@ pub(super) fn spawn_agent<H: CellHost>(
     tasks: &mut JoinSet<()>,
     host: Arc<H>,
     id: String,
+    node_id: u64,
+    parent_node_id: Option<u64>,
+    phase: Option<String>,
     prompt: String,
     ordinal: u64,
     opts: AgentCallOpts,
+    budget: Option<Arc<WorkflowBudgetMirror>>,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     cancellation_token: CancellationToken,
     task_failure_handler: Option<TaskFailureHandler>,
 ) {
     tasks.spawn(async move {
+        let callback_host = Arc::clone(&host);
         let outcome = AssertUnwindSafe(async move {
-            host.spawn_agent(prompt, ordinal, opts, cancellation_token)
+            callback_host
+                .spawn_agent(
+                    node_id,
+                    parent_node_id,
+                    phase,
+                    prompt,
+                    ordinal,
+                    opts,
+                    cancellation_token,
+                )
                 .await
         })
         .catch_unwind()
         .await;
+        refresh_workflow_budget(host.as_ref(), budget.as_ref()).await;
         let (command, failure_reason) = match outcome {
             Ok(AgentSpawnOutcome::Completed(value)) => {
                 (RuntimeCommand::ToolResponse { id, result: value }, None)
@@ -170,17 +186,21 @@ pub(super) fn spawn_workflow<H: CellHost>(
     id: String,
     name: String,
     args: Option<JsonValue>,
+    budget: Option<Arc<WorkflowBudgetMirror>>,
     runtime_tx: std::sync::mpsc::Sender<RuntimeCommand>,
     cancellation_token: CancellationToken,
     task_failure_handler: Option<TaskFailureHandler>,
 ) {
     tasks.spawn(async move {
-        let outcome =
-            AssertUnwindSafe(
-                async move { host.spawn_workflow(name, args, cancellation_token).await },
-            )
-            .catch_unwind()
-            .await;
+        let callback_host = Arc::clone(&host);
+        let outcome = AssertUnwindSafe(async move {
+            callback_host
+                .spawn_workflow(name, args, cancellation_token)
+                .await
+        })
+        .catch_unwind()
+        .await;
+        refresh_workflow_budget(host.as_ref(), budget.as_ref()).await;
         let (command, failure_reason) = match outcome {
             Ok(AgentSpawnOutcome::Completed(value)) => {
                 (RuntimeCommand::ToolResponse { id, result: value }, None)
@@ -214,6 +234,23 @@ pub(super) fn spawn_workflow<H: CellHost>(
             report_task_failure(task_failure_handler.as_ref(), failure_reason);
         }
     });
+}
+
+/// Refresh a workflow cell's runtime-owned budget mirror before a callback's
+/// promise is resolved. A failed refresh leaves the last monotonic view intact;
+/// the primary callback result still settles so transport trouble cannot hang JS.
+pub(super) async fn refresh_workflow_budget<H: CellHost>(
+    host: &H,
+    budget: Option<&Arc<WorkflowBudgetMirror>>,
+) {
+    let Some(budget) = budget else {
+        return;
+    };
+    match host.workflow_budget_snapshot().await {
+        Ok(Some(snapshot)) => budget.update(snapshot),
+        Ok(None) => {}
+        Err(error) => warn!("failed to refresh workflow budget: {error}"),
+    }
 }
 
 pub(super) async fn finish_callbacks(

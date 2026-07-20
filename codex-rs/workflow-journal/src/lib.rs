@@ -13,17 +13,31 @@
 //! reader live in sibling modules added by later tickets.
 
 pub mod key;
+pub mod lease;
+mod private_fs;
 pub mod recorder;
+mod recovery_cursor;
 pub mod replay;
 
+pub use key::EXECUTION_FINGERPRINT_VERSION;
 pub use key::KEY_ALGO_VERSION;
 pub use key::KeyInputs;
+pub use key::canonical_value_hash;
+pub use key::execution_fingerprint;
 pub use key::prompt_hash;
 pub use key::schema_hash;
+pub use lease::WorkflowRunLease;
+pub use lease::WorkflowRunLeaseAcquire;
 pub use recorder::JournalRecorder;
+pub use recovery_cursor::WorkflowRecoveryCursor;
+pub use recovery_cursor::WorkflowRecoveryCursorGuard;
+pub use recovery_cursor::WorkflowRecoveryCursorInvalidContent;
+pub use recovery_cursor::WorkflowRecoveryCursorRead;
 pub use replay::Divergence;
 pub use replay::ReplayEntry;
 pub use replay::ReplayJournal;
+pub use replay::RunAgentJournal;
+pub use replay::RunAgentLink;
 
 use serde::Deserialize;
 use serde::Deserializer;
@@ -33,6 +47,39 @@ use serde::de::IgnoredAny;
 use serde_json::Value;
 
 pub mod storage;
+
+/// Maximum serialized byte length of one workflow agent return value.
+///
+/// Returns are durable replay inputs and can later reach model-visible workflow output. This cap
+/// keeps each such fragment below the repository's 10K-token context limit with safety margin.
+pub const WORKFLOW_AGENT_RETURN_MAX_BYTES: usize = 32 * 1024;
+
+/// Maximum serialized byte length of one journal record, excluding its trailing newline.
+pub(crate) const WORKFLOW_JOURNAL_RECORD_MAX_BYTES: usize = 128 * 1024;
+
+/// Maximum total byte length of one run journal.
+pub(crate) const WORKFLOW_JOURNAL_MAX_BYTES: u64 = 192 * 1024 * 1024;
+
+/// Maximum number of nonblank records a journal reader will scan.
+///
+/// One maximally admitted run can write 57,001 records: one header; 4,000 agents with six
+/// attempts, one binding and at most one cleanup diagnostic per attempt, and one terminal record;
+/// plus 4,000 workflow logs and 1,000 phases. The remaining 2,999 records are maintenance
+/// headroom, while [`WORKFLOW_JOURNAL_MAX_BYTES`] remains the independent total-byte bound.
+pub const WORKFLOW_JOURNAL_MAX_RECORDS: usize = 60_000;
+
+/// Validate a workflow agent return before it is journaled or replayed.
+pub fn ensure_workflow_agent_return(value: &Value) -> Result<(), String> {
+    let serialized_len = serde_json::to_vec(value)
+        .map_err(|error| format!("failed to serialize workflow agent return: {error}"))?
+        .len();
+    if serialized_len > WORKFLOW_AGENT_RETURN_MAX_BYTES {
+        return Err(format!(
+            "workflow agent return exceeds the {WORKFLOW_AGENT_RETURN_MAX_BYTES}-byte replay cap"
+        ));
+    }
+    Ok(())
+}
 
 /// Zero-sized marker for the `ordinal` field on `phase`/`log` lines, which §7
 /// requires to be **always `null`** (only `agent_call` lines carry a numeric
@@ -81,6 +128,34 @@ pub enum RunMetaTag {
     RunMeta,
 }
 
+/// Durable lifecycle status stored in `meta.json` for discovery-index rebuilds.
+///
+/// The journal's line-zero copy remains the immutable start record; the per-run
+/// `meta.json` projection is atomically rewritten once when the run terminates.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunStatus {
+    /// The workflow body has started and has not emitted its terminal event yet.
+    #[default]
+    Running,
+    /// The workflow body completed successfully.
+    Completed,
+    /// The run was explicitly stopped by its owning user session.
+    Stopped,
+    /// The run reached a controller-requested checkpoint after child cleanup.
+    Paused,
+    /// The workflow body errored or was interrupted.
+    Failed,
+}
+
+impl WorkflowRunStatus {
+    // Serde's `skip_serializing_if` callback receives the field by reference.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    fn is_running(&self) -> bool {
+        *self == Self::Running
+    }
+}
+
 /// Line 0 of `journal.jsonl`: run-level metadata.
 ///
 /// Matches the §7 sample:
@@ -96,19 +171,52 @@ pub struct WorkflowRunMeta {
     pub run_id: String,
     /// Parent run id when this run was spawned via `workflow()`; otherwise null.
     pub parent_run_id: Option<String>,
+    /// Source run whose journal or checkpoint seeded this run; otherwise null.
+    ///
+    /// This is deliberately distinct from [`Self::parent_run_id`], which only
+    /// models runtime `workflow()` nesting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from_run_id: Option<String>,
+    /// The one durable successor admitted from this paused checkpoint.
+    ///
+    /// This field lives on the source run and is claimed while its lease is
+    /// held. Once present it is immutable: retries and concurrent callers must
+    /// converge on this exact run id instead of minting a fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_by_run_id: Option<String>,
+    /// Root thread whose session owns mutation authority for this run.
+    ///
+    /// Missing on legacy runs, which remain readable and recoverable but do not
+    /// acquire ownership implicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_thread_id: Option<String>,
     /// Hash of the executed script (structural-change detector for replay).
     pub script_hash: String,
     /// Hash of the run arguments (structural-change detector for replay).
     pub args_hash: String,
     /// Human-facing workflow name.
     pub name: String,
-    /// Total token budget granted to the run.
-    pub budget_total: u64,
+    /// Total token budget granted to the run, or `None` when unmetered.
+    ///
+    /// Legacy numeric values deserialize as `Some`, including zero. Older
+    /// journals cannot distinguish an explicit zero ceiling from a zero that
+    /// was used as an unmetered sentinel, so preserving the numeric meaning is
+    /// the only backward-compatible interpretation.
+    pub budget_total: Option<u64>,
     /// Version of the cache-key algorithm; lets hash changes across Codex
     /// versions be detected on resume.
     pub key_algo_version: u32,
     /// Host-supplied creation timestamp (never the isolate).
     pub created_at: String,
+    /// Opaque hash of the non-secret provider/router/model environment that
+    /// determines inherited `agent()` execution. Missing on legacy runs; a
+    /// current host with a fingerprint treats that as replay divergence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_fingerprint: Option<String>,
+    /// Rebuildable lifecycle projection. Missing means `running`, preserving the
+    /// original line-zero wire format while terminal `meta.json` writes are explicit.
+    #[serde(default, skip_serializing_if = "WorkflowRunStatus::is_running")]
+    pub status: WorkflowRunStatus,
 }
 
 impl WorkflowRunMeta {
@@ -120,7 +228,7 @@ impl WorkflowRunMeta {
         script_hash: String,
         args_hash: String,
         name: String,
-        budget_total: u64,
+        budget_total: Option<u64>,
         key_algo_version: u32,
         created_at: String,
     ) -> Self {
@@ -128,13 +236,37 @@ impl WorkflowRunMeta {
             kind: RunMetaTag::RunMeta,
             run_id,
             parent_run_id,
+            resumed_from_run_id: None,
+            resumed_by_run_id: None,
+            owner_thread_id: None,
             script_hash,
             args_hash,
             name,
             budget_total,
             key_algo_version,
             created_at,
+            execution_fingerprint: None,
+            status: WorkflowRunStatus::Running,
         }
+    }
+
+    /// Attach the host-computed execution fingerprint persisted for replay
+    /// compatibility checks.
+    pub fn with_execution_fingerprint(mut self, execution_fingerprint: String) -> Self {
+        self.execution_fingerprint = Some(execution_fingerprint);
+        self
+    }
+
+    /// Attach the root thread whose session owns mutation authority for this run.
+    pub fn with_owner_thread_id(mut self, owner_thread_id: String) -> Self {
+        self.owner_thread_id = Some(owner_thread_id);
+        self
+    }
+
+    /// Attach the source run whose journal or checkpoint seeded this fresh run.
+    pub fn with_resumed_from_run_id(mut self, resumed_from_run_id: String) -> Self {
+        self.resumed_from_run_id = Some(resumed_from_run_id);
+        self
     }
 }
 
@@ -151,6 +283,8 @@ pub enum JournalLine {
     ///
     /// Boxed because this variant is much larger than the narration variants.
     AgentCall(Box<AgentCallLine>),
+    /// Durable child-thread binding recorded before the child's first turn starts.
+    AgentBound(AgentBoundLine),
     /// A `phase()` narration marker.
     Phase(PhaseLine),
     /// A `log()` narration line.
@@ -171,8 +305,49 @@ impl JournalLine {
     pub fn validate(&self) -> Result<(), String> {
         match self {
             JournalLine::AgentCall(call) => call.validate(),
+            JournalLine::AgentBound(bound) => bound.validate(),
             JournalLine::Phase(_) | JournalLine::Log(_) => Ok(()),
         }
+    }
+}
+
+/// Durable binding between an invocation ordinal and its child transcript.
+///
+/// This is separate from [`AgentCallLine`] so the binding can be flushed before
+/// the child's first turn starts without racing the terminal call record.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AgentBoundLine {
+    /// Host-supplied timestamp; omitted on the wire when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// Invocation ordinal shared with the eventual [`AgentCallLine`].
+    pub ordinal: u64,
+    /// Zero-based attempt generation for this logical invocation.
+    ///
+    /// Older journals omitted this field and therefore describe the initial attempt.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempt: u32,
+    /// Registered child thread.
+    pub child_thread_id: String,
+    /// Absolute host-local path of the child's materialized rollout.
+    pub rollout_path: String,
+}
+
+impl AgentBoundLine {
+    pub fn validate(&self) -> Result<(), String> {
+        uuid::Uuid::parse_str(&self.child_thread_id).map_err(|error| {
+            format!(
+                "agent_bound ordinal {} has invalid child_thread_id: {error}",
+                self.ordinal
+            )
+        })?;
+        if !std::path::Path::new(&self.rollout_path).is_absolute() {
+            return Err(format!(
+                "agent_bound ordinal {} requires an absolute rollout_path",
+                self.ordinal
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -186,6 +361,60 @@ pub enum AgentStatus {
     Completed,
     /// The agent errored.
     Error,
+}
+
+/// Intentional selected-attempt outcome attached to the one terminal replay anchor.
+///
+/// This journal-local type keeps persistence independent from `codex-protocol`. A successful
+/// retry needs no terminal reason: its nonzero [`AgentCallLine::attempt`] carries the retry
+/// generation, while these variants distinguish intentional null settlements from an ordinary
+/// agent failure that also returns JavaScript `null`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlReason {
+    UserSkip,
+    RetryLimitReached,
+}
+
+/// Aggregate token counters for every attempt of one logical `agent()` invocation.
+///
+/// Kept as a standalone journal type to avoid coupling durable workflow data to protocol crates.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentTokenUsage {
+    pub input_tokens: i64,
+    pub cached_input_tokens: i64,
+    pub output_tokens: i64,
+    pub reasoning_output_tokens: i64,
+    pub total_tokens: i64,
+}
+
+/// Replay-visible aggregate counters across the initial attempt and every retry.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentCallProgress {
+    pub token_usage: AgentTokenUsage,
+    pub tool_call_count: u64,
+    pub duration_ms: u64,
+}
+
+impl AgentCallProgress {
+    fn validate(&self, ordinal: u64) -> Result<(), String> {
+        let counters = [
+            ("input_tokens", self.token_usage.input_tokens),
+            ("cached_input_tokens", self.token_usage.cached_input_tokens),
+            ("output_tokens", self.token_usage.output_tokens),
+            (
+                "reasoning_output_tokens",
+                self.token_usage.reasoning_output_tokens,
+            ),
+            ("total_tokens", self.token_usage.total_tokens),
+        ];
+        if let Some((field, value)) = counters.into_iter().find(|(_, value)| *value < 0) {
+            return Err(format!(
+                "agent_call ordinal {ordinal}: aggregate {field} must be non-negative, got {value}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The `opts` sub-object recorded on an `agent_call`.
@@ -215,6 +444,12 @@ pub struct AgentCallLine {
     pub timestamp: Option<String>,
     /// Invocation ordinal — the spine of prefix-replay.
     pub ordinal: u64,
+    /// Zero-based generation that produced this logical call's final outcome.
+    ///
+    /// Intermediate retries write only [`AgentBoundLine`] records; exactly one terminal call line
+    /// remains the replay anchor for the ordinal. Older journals default to the initial attempt.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempt: u32,
     /// The `(prompt, opts)` cache key (e.g. `"blake3:..."`).
     pub key: String,
     /// Hash of the prompt text.
@@ -231,13 +466,24 @@ pub struct AgentCallLine {
     pub rollout_path: Option<String>,
     /// Completion status; `null` while unknown/in-flight.
     pub status: Option<AgentStatus>,
+    /// Intentional selected-attempt terminal outcome, when one settled the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_reason: Option<AgentControlReason>,
     /// Return value: losslessly round-trips a string, an object, or `null`.
     #[serde(rename = "return")]
     pub ret: Value,
     /// Tokens spent by the agent.
     pub tokens_spent: Option<u64>,
+    /// Aggregate progress for all attempts. Missing on legacy journal records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<AgentCallProgress>,
     /// Order in which concurrent agents completed (recorded defensively).
     pub completion_seq: Option<u64>,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 impl AgentCallLine {
@@ -258,6 +504,37 @@ impl AgentCallLine {
     ///
     /// The recorder (a later ticket) MUST call this before appending.
     pub fn validate(&self) -> Result<(), String> {
+        ensure_workflow_agent_return(&self.ret)?;
+        self.validate_structure()
+    }
+
+    /// Validate replay and linkage fields independently of the current return-size bound.
+    ///
+    /// Legacy journals may contain a return that was valid before the bound was
+    /// introduced. Link discovery can still use those records, while replay
+    /// separately treats that ordinal as the end of the safe cached prefix.
+    fn validate_structure(&self) -> Result<(), String> {
+        if let Some(progress) = &self.progress {
+            progress.validate(self.ordinal)?;
+        }
+        if self.control_reason.is_some() && self.status != Some(AgentStatus::Completed) {
+            return Err(format!(
+                "agent_call ordinal {}: control_reason requires status=completed",
+                self.ordinal
+            ));
+        }
+        if self.control_reason.is_some() && !self.ret.is_null() {
+            return Err(format!(
+                "agent_call ordinal {}: control_reason requires return=null",
+                self.ordinal
+            ));
+        }
+        if self.control_reason.is_some() && self.progress.is_none() {
+            return Err(format!(
+                "agent_call ordinal {}: control_reason requires aggregate progress",
+                self.ordinal
+            ));
+        }
         if self.status == Some(AgentStatus::Completed) {
             if self.tokens_spent.is_none() {
                 return Err(format!(
@@ -327,6 +604,7 @@ mod tests {
         AgentCallLine {
             timestamp: None,
             ordinal: 0,
+            attempt: 0,
             key: "blake3:abc".to_string(),
             prompt_hash: "ph".to_string(),
             opts: AgentCallOpts {
@@ -341,8 +619,10 @@ mod tests {
             child_thread_id: Some("th_1".to_string()),
             rollout_path: Some("/home/u/.codex/sessions/rollout.jsonl".to_string()),
             status: Some(AgentStatus::Completed),
+            control_reason: None,
             ret: json!({"ok": true}),
             tokens_spent: Some(8123),
+            progress: None,
             completion_seq: Some(2),
         }
     }
@@ -355,7 +635,7 @@ mod tests {
             "sh".to_string(),
             "ah".to_string(),
             "triage".to_string(),
-            500_000,
+            Some(500_000),
             1,
             "2026-07-16T00:00:00Z".to_string(),
         );
@@ -367,11 +647,84 @@ mod tests {
             "sh".to_string(),
             "ah".to_string(),
             "sub".to_string(),
-            10,
+            Some(10),
             3,
             "2026-07-16T00:00:01Z".to_string(),
         );
         assert_byte_stable(&with_parent);
+    }
+
+    #[test]
+    fn run_meta_owner_identity_is_backward_compatible() {
+        let legacy_json = json!({
+            "type": "run_meta",
+            "run_id": "run-legacy",
+            "parent_run_id": null,
+            "script_hash": "blake3:script",
+            "args_hash": "blake3:args",
+            "name": "triage",
+            "budget_total": 500_000,
+            "key_algo_version": 1,
+            "created_at": "2026-07-18T00:00:00Z",
+        });
+        let legacy_meta = WorkflowRunMeta::new(
+            "run-legacy".to_string(),
+            None,
+            "blake3:script".to_string(),
+            "blake3:args".to_string(),
+            "triage".to_string(),
+            Some(500_000),
+            1,
+            "2026-07-18T00:00:00Z".to_string(),
+        );
+
+        assert_eq!(
+            serde_json::from_value::<WorkflowRunMeta>(legacy_json.clone())
+                .expect("deserialize legacy run metadata"),
+            legacy_meta
+        );
+        assert_eq!(
+            serde_json::to_value(&legacy_meta).expect("serialize legacy run metadata"),
+            legacy_json
+        );
+
+        let owned_meta =
+            legacy_meta.with_owner_thread_id("01900000-0000-7000-8000-000000000001".to_string());
+        let mut owned_json = legacy_json;
+        owned_json["owner_thread_id"] = json!("01900000-0000-7000-8000-000000000001");
+        assert_eq!(
+            serde_json::to_value(&owned_meta).expect("serialize owned run metadata"),
+            owned_json
+        );
+        assert_eq!(
+            serde_json::from_value::<WorkflowRunMeta>(owned_json)
+                .expect("deserialize owned run metadata"),
+            owned_meta
+        );
+    }
+
+    #[test]
+    fn run_meta_distinguishes_null_budget_from_legacy_numeric_zero() {
+        let unmetered = WorkflowRunMeta::new(
+            "run-unmetered".to_string(),
+            None,
+            "sh".to_string(),
+            "ah".to_string(),
+            "unmetered".to_string(),
+            None,
+            1,
+            "2026-07-18T00:00:00Z".to_string(),
+        );
+        let unmetered_json = serde_json::to_value(&unmetered).expect("serialize unmetered meta");
+        assert_eq!(unmetered_json["budget_total"], Value::Null);
+
+        // Legacy journals always encoded a number. Numeric zero remains an explicit
+        // zero limit because the old representation cannot reveal sentinel intent.
+        let mut legacy_zero_json = unmetered_json;
+        legacy_zero_json["budget_total"] = json!(0);
+        let legacy_zero: WorkflowRunMeta =
+            serde_json::from_value(legacy_zero_json).expect("deserialize legacy numeric zero");
+        assert_eq!(legacy_zero.budget_total, Some(0));
     }
 
     #[test]
@@ -387,6 +740,98 @@ mod tests {
         c.tokens_spent = None;
         c.completion_seq = None;
         assert_byte_stable(&JournalLine::AgentCall(Box::new(c)));
+    }
+
+    #[test]
+    fn agent_bound_round_trips_and_validates() {
+        let bound = AgentBoundLine {
+            timestamp: None,
+            ordinal: 7,
+            attempt: 0,
+            child_thread_id: uuid::Uuid::now_v7().to_string(),
+            rollout_path: std::env::temp_dir()
+                .join("rollout.jsonl")
+                .display()
+                .to_string(),
+        };
+        assert_byte_stable(&JournalLine::AgentBound(bound.clone()));
+        assert!(bound.validate().is_ok());
+
+        let mut invalid = bound;
+        invalid.rollout_path = "relative.jsonl".to_string();
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_agent_records_default_to_initial_attempt() {
+        let child_thread_id = uuid::Uuid::now_v7().to_string();
+        let bound: AgentBoundLine = serde_json::from_value(json!({
+            "timestamp": null,
+            "ordinal": 4,
+            "child_thread_id": child_thread_id,
+            "rollout_path": "/tmp/legacy-rollout.jsonl"
+        }))
+        .expect("legacy binding");
+        assert_eq!(bound.attempt, 0);
+
+        let mut value = serde_json::to_value(sample_agent_call()).expect("agent call");
+        value.as_object_mut().expect("object").remove("attempt");
+        let call: AgentCallLine = serde_json::from_value(value).expect("legacy call");
+        assert_eq!(call.attempt, 0);
+        assert_eq!(call.control_reason, None);
+        assert_eq!(call.progress, None);
+    }
+
+    #[test]
+    fn selected_control_reason_requires_a_completed_null_anchor_with_progress() {
+        let progress = AgentCallProgress {
+            token_usage: AgentTokenUsage {
+                input_tokens: 12,
+                cached_input_tokens: 3,
+                output_tokens: 4,
+                reasoning_output_tokens: 2,
+                total_tokens: 16,
+            },
+            tool_call_count: 5,
+            duration_ms: 900,
+        };
+        for reason in [
+            AgentControlReason::UserSkip,
+            AgentControlReason::RetryLimitReached,
+        ] {
+            let mut call = sample_agent_call();
+            call.control_reason = Some(reason);
+            call.ret = Value::Null;
+            call.progress = Some(progress.clone());
+            assert!(call.validate().is_ok());
+
+            let mut non_null = call.clone();
+            non_null.ret = json!("not null");
+            assert!(non_null.validate().is_err());
+
+            let mut non_completed = call.clone();
+            non_completed.status = Some(AgentStatus::Error);
+            assert!(non_completed.validate().is_err());
+
+            let mut missing_progress = call;
+            missing_progress.progress = None;
+            assert!(missing_progress.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn aggregate_progress_rejects_negative_token_counters() {
+        let mut call = sample_agent_call();
+        call.progress = Some(AgentCallProgress {
+            token_usage: AgentTokenUsage {
+                total_tokens: -1,
+                ..AgentTokenUsage::default()
+            },
+            tool_call_count: 0,
+            duration_ms: 0,
+        });
+        let error = call.validate().expect_err("negative counters must fail");
+        assert!(error.contains("total_tokens"), "unexpected error: {error}");
     }
 
     #[test]
@@ -554,5 +999,16 @@ mod tests {
         in_flight.child_thread_id = None;
         in_flight.rollout_path = None;
         assert!(in_flight.validate().is_ok(), "in-flight lines are exempt");
+    }
+
+    #[test]
+    fn validate_rejects_oversized_returns_using_serialized_bytes() {
+        let mut call = sample_agent_call();
+        call.ret = Value::String("x".repeat(WORKFLOW_AGENT_RETURN_MAX_BYTES));
+        assert!(call.validate().is_err());
+
+        // JSON escaping counts toward the durable replay representation.
+        call.ret = Value::String("\0".repeat(WORKFLOW_AGENT_RETURN_MAX_BYTES / 2));
+        assert!(call.validate().is_err());
     }
 }

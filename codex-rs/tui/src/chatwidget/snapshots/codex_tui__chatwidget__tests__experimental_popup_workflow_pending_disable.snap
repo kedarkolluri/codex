@@ -1,0 +1,15 @@
+---
+source: tui/src/chatwidget/tests/popups_and_settings.rs
+expression: popup
+---
+  Experimental features
+  Toggle experimental features. Changes are saved to config.toml.
+
+  [ ] Network proxy                Apply network proxy restrictions to sandboxed sessions that
+                                   already have network access.
+› [ ] Dynamic workflows            Run JS-authored dynamic workflows that orchestrate code mode
+                                   and multi-agent runs. Changes take effect after restarting
+                                   Codex.
+  [ ] Prevent sleep while running  Keep your computer awake while Codex is running a thread.
+
+  Press space to select or enter to save for next conversation

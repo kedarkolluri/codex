@@ -52,6 +52,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
@@ -1601,6 +1602,495 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
     assert_eq!(worker.agent_status, json!({"completed": "done"}));
     assert_eq!(worker.last_task_message, None);
     assert_eq!(success, Some(true));
+}
+
+#[tokio::test]
+async fn multi_agent_v2_hides_workflow_managed_agents_from_collaboration_tools() {
+    const WORKFLOW_PROMPT_SECRET: &str = "workflow prompt must stay private";
+    const WORKFLOW_RESULT_SECRET: &str = "workflow result must stay private";
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config.clone());
+
+    let workflow_agent = session
+        .services
+        .agent_control
+        .spawn_agent_with_metadata(
+            config,
+            vec![UserInput::Text {
+                text: WORKFLOW_PROMPT_SECRET.to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(
+                    AgentPath::root()
+                        .join("workflow_child")
+                        .expect("workflow child path"),
+                ),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions {
+                parent_thread_id: Some(root.thread_id),
+                preferred_agent_nickname: Some("workflow-agent".to_string()),
+                parent_completion_delivery:
+                    crate::agent::control::ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workflow child should spawn");
+    let child_thread = manager
+        .get_thread(workflow_agent.thread_id)
+        .await
+        .expect("workflow child should exist");
+    let child_turn = child_thread.codex.session.new_default_turn().await;
+    child_thread
+        .codex
+        .session
+        .send_event(
+            child_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: child_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some(WORKFLOW_RESULT_SECRET.to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let output = ListAgentsHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "list_agents",
+            function_payload(json!({})),
+        ))
+        .await
+        .expect("list_agents should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: ListAgentsResult =
+        serde_json::from_str(&content).expect("list_agents result should be json");
+
+    assert_eq!(
+        result
+            .agents
+            .iter()
+            .map(|agent| agent.agent_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/root"]
+    );
+    assert!(!content.contains(WORKFLOW_PROMPT_SECRET));
+    assert!(!content.contains(WORKFLOW_RESULT_SECRET));
+    assert_eq!(success, Some(true));
+
+    let Err(error) = InterruptAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "interrupt_agent",
+            function_payload(json!({"target": workflow_agent.thread_id.to_string()})),
+        ))
+        .await
+    else {
+        panic!("interrupt_agent should reject workflow-managed agents");
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "workflow-managed agents are available only through workflow controls".to_string()
+        )
+    );
+    assert!(
+        !manager
+            .captured_ops()
+            .iter()
+            .any(|(thread_id, op)| *thread_id == workflow_agent.thread_id
+                && matches!(op, Op::Interrupt))
+    );
+
+    let expected_target_error = || {
+        FunctionCallError::RespondToModel(
+            "workflow-managed agents are available only through workflow controls".to_string(),
+        )
+    };
+    let target = workflow_agent.thread_id.to_string();
+
+    let Err(error) = WaitAgentHandler::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "wait_agent",
+            function_payload(json!({"targets": [target.clone()], "timeout_ms": 1})),
+        ))
+        .await
+    else {
+        panic!("V1 wait_agent should reject workflow-managed agents");
+    };
+    assert_eq!(error, expected_target_error());
+
+    let Err(error) = SendInputHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "send_input",
+            function_payload(json!({
+                "target": target.clone(),
+                "message": "must not interrupt workflow child",
+                "interrupt": true,
+            })),
+        ))
+        .await
+    else {
+        panic!("V1 send_input should reject workflow-managed agents");
+    };
+    assert_eq!(error, expected_target_error());
+
+    let Err(error) = CloseAgentHandler
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "close_agent",
+            function_payload(json!({"target": target.clone()})),
+        ))
+        .await
+    else {
+        panic!("V1 close_agent should reject workflow-managed agents");
+    };
+    assert_eq!(error, expected_target_error());
+
+    let Err(error) = ResumeAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "resume_agent",
+            function_payload(json!({"id": target})),
+        ))
+        .await
+    else {
+        panic!("V1 resume_agent should reject workflow-managed agents");
+    };
+    assert_eq!(error, expected_target_error());
+    assert!(
+        !manager
+            .captured_ops()
+            .iter()
+            .any(|(thread_id, op)| *thread_id == workflow_agent.thread_id
+                && matches!(op, Op::Interrupt | Op::Shutdown))
+    );
+}
+
+#[tokio::test]
+async fn close_agent_rejects_ordinary_ancestor_of_workflow_managed_agent() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let config = turn.config.as_ref().clone();
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("ordinary parent should start");
+    let workflow_child = manager
+        .agent_control()
+        .spawn_agent_deferred_input(
+            config,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions {
+                parent_thread_id: Some(parent.thread_id),
+                parent_completion_delivery:
+                    crate::agent::control::ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workflow child should spawn");
+    // Use a distinct AgentControl handle to cover cross-root UUID targeting through the shared
+    // manager, not merely same-control tree traversal.
+    session.services.agent_control = manager.agent_control();
+
+    let Err(error) = CloseAgentHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "close_agent",
+            function_payload(json!({"target": parent.thread_id.to_string()})),
+        ))
+        .await
+    else {
+        panic!("close_agent should reject an ordinary ancestor of a workflow child");
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "workflow-managed agents are available only through workflow controls".to_string()
+        )
+    );
+    manager
+        .get_thread(parent.thread_id)
+        .await
+        .expect("ordinary parent should remain live");
+    manager
+        .get_thread(workflow_child.thread_id)
+        .await
+        .expect("workflow child should remain live");
+    assert!(!manager.captured_ops().iter().any(|(thread_id, op)| {
+        (*thread_id == parent.thread_id || *thread_id == workflow_child.thread_id)
+            && matches!(op, Op::Shutdown)
+    }));
+
+    let shutdown_report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(shutdown_report.submit_failed, Vec::<ThreadId>::new());
+    assert_eq!(shutdown_report.timed_out, Vec::<ThreadId>::new());
+}
+
+#[tokio::test]
+async fn resume_agent_rejects_cold_ordinary_ancestor_of_workflow_managed_agent() {
+    let (_session, turn) = make_session_and_context().await;
+    let mut config = turn.config.as_ref().clone();
+    config.agent_max_depth = 3;
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let state_db = init_state_db(&config).await;
+    let manager = ThreadManager::new(
+        &config,
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, state_db.clone()),
+        local_agent_graph_store_from_state_db(state_db.as_ref()),
+        "11111111-1111-4111-8111-111111111111".to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("ordinary parent should start");
+    let workflow_child = manager
+        .agent_control()
+        .spawn_agent_deferred_input(
+            config.clone(),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions {
+                parent_thread_id: Some(parent.thread_id),
+                parent_completion_delivery:
+                    crate::agent::control::ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workflow child should spawn");
+
+    manager
+        .agent_control()
+        .shutdown_live_agent(workflow_child.thread_id)
+        .await
+        .expect("workflow child should become cold");
+    manager
+        .agent_control()
+        .shutdown_live_agent(parent.thread_id)
+        .await
+        .expect("ordinary parent should become cold");
+    assert_eq!(
+        manager.agent_control().get_status(parent.thread_id).await,
+        AgentStatus::NotFound
+    );
+    assert_eq!(
+        manager
+            .agent_control()
+            .get_status(workflow_child.thread_id)
+            .await,
+        AgentStatus::NotFound
+    );
+
+    let operator = manager
+        .start_thread(config)
+        .await
+        .expect("operator thread should start");
+    let operator_session = operator.thread.codex.session.clone();
+    let Err(error) = ResumeAgentHandler
+        .handle(invocation(
+            operator_session.clone(),
+            operator_session.new_default_turn().await,
+            "resume_agent",
+            function_payload(json!({"id": parent.thread_id.to_string()})),
+        ))
+        .await
+    else {
+        panic!("resume_agent should reject an ordinary ancestor of a cold workflow child");
+    };
+    assert_eq!(
+        error,
+        FunctionCallError::RespondToModel(
+            "workflow-managed agents are available only through workflow controls".to_string()
+        )
+    );
+    assert_eq!(
+        manager.agent_control().get_status(parent.thread_id).await,
+        AgentStatus::NotFound
+    );
+    assert_eq!(
+        manager
+            .agent_control()
+            .get_status(workflow_child.thread_id)
+            .await,
+        AgentStatus::NotFound
+    );
+
+    let shutdown_report = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert_eq!(shutdown_report.submit_failed, Vec::<ThreadId>::new());
+    assert_eq!(shutdown_report.timed_out, Vec::<ThreadId>::new());
+}
+
+#[tokio::test]
+async fn multi_agent_v2_workflow_managed_sender_cannot_use_collaboration_tools() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    set_turn_config(&mut turn, config.clone());
+    let workflow_path = AgentPath::root()
+        .join("workflow_child")
+        .expect("workflow child path");
+    let workflow_agent = session
+        .services
+        .agent_control
+        .spawn_agent_deferred_input(
+            config,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: root.thread_id,
+                depth: 1,
+                agent_path: Some(workflow_path.clone()),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            crate::agent::control::SpawnAgentOptions {
+                parent_thread_id: Some(root.thread_id),
+                preferred_agent_nickname: Some("workflow-agent".to_string()),
+                parent_completion_delivery:
+                    crate::agent::control::ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workflow child should spawn");
+    let workflow_thread = manager
+        .get_thread(workflow_agent.thread_id)
+        .await
+        .expect("workflow child should be loaded");
+    let session = workflow_thread.codex.session.clone();
+    let turn = session.new_default_turn().await;
+    assert!(session.is_workflow_managed_agent().await);
+    assert_eq!(
+        workflow_thread
+            .codex
+            .thread_config_snapshot()
+            .await
+            .thread_source,
+        Some(ThreadSource::Feature("workflow".to_string()))
+    );
+    let expected_error = || {
+        FunctionCallError::RespondToModel(
+            "workflow-managed agents cannot use generic collaboration tools".to_string(),
+        )
+    };
+
+    let Err(error) = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "escape the workflow domain",
+                "task_name": "escape_child",
+            })),
+        ))
+        .await
+    else {
+        panic!("workflow child spawn_agent should be rejected");
+    };
+    assert_eq!(error, expected_error());
+
+    let Err(error) = ListAgentsHandlerV2
+        .handle(invocation(
+            session.clone(),
+            turn.clone(),
+            "list_agents",
+            function_payload(json!({})),
+        ))
+        .await
+    else {
+        panic!("workflow child list_agents should be rejected");
+    };
+    assert_eq!(error, expected_error());
+
+    let Err(error) = SendMessageHandlerV2
+        .handle(invocation(
+            session,
+            turn,
+            "send_message",
+            function_payload(json!({
+                "target": "/root",
+                "message": "workflow child mailbox injection",
+            })),
+        ))
+        .await
+    else {
+        panic!("workflow child send_message should be rejected");
+    };
+    assert_eq!(error, expected_error());
+    assert!(
+        !manager
+            .captured_ops()
+            .iter()
+            .any(|(_, op)| matches!(op, Op::InterAgentCommunication { .. }))
+    );
 }
 
 #[tokio::test]

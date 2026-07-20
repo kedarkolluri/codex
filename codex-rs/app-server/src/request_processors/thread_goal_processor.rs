@@ -8,6 +8,7 @@ use codex_goal_extension::GoalTokenBudgetUpdate;
 #[derive(Clone)]
 pub(crate) struct ThreadGoalRequestProcessor {
     thread_manager: Arc<ThreadManager>,
+    thread_store: Arc<dyn ThreadStore>,
     outgoing: Arc<OutgoingMessageSender>,
     config: Arc<Config>,
     thread_state_manager: ThreadStateManager,
@@ -18,6 +19,7 @@ pub(crate) struct ThreadGoalRequestProcessor {
 impl ThreadGoalRequestProcessor {
     pub(crate) fn new(
         thread_manager: Arc<ThreadManager>,
+        thread_store: Arc<dyn ThreadStore>,
         outgoing: Arc<OutgoingMessageSender>,
         config: Arc<Config>,
         thread_state_manager: ThreadStateManager,
@@ -26,6 +28,7 @@ impl ThreadGoalRequestProcessor {
     ) -> Self {
         Self {
             thread_manager,
+            thread_store,
             outgoing,
             config,
             thread_state_manager,
@@ -74,7 +77,9 @@ impl ThreadGoalRequestProcessor {
         self.emit_thread_goal_snapshot(thread_id).await;
         // App-server owns resume response and snapshot ordering, so wait until
         // those are sent before letting extensions react to the idle thread.
-        thread.emit_thread_idle_lifecycle_if_idle().await;
+        if !thread.is_workflow_managed_agent() {
+            thread.emit_thread_idle_lifecycle_if_idle().await;
+        }
     }
 
     pub(crate) async fn pending_resume_goal_state(
@@ -104,6 +109,7 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        self.ensure_goal_mutation_allowed(thread_id).await?;
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
@@ -191,6 +197,7 @@ impl ThreadGoalRequestProcessor {
         }
 
         let thread_id = parse_thread_id_for_request(params.thread_id.as_str())?;
+        self.ensure_goal_mutation_allowed(thread_id).await?;
         let state_db = self.state_db_for_materialized_thread(thread_id).await?;
         self.reconcile_thread_goal_rollout(thread_id, &state_db)
             .await?;
@@ -214,6 +221,32 @@ impl ThreadGoalRequestProcessor {
                 .await;
         }
         Ok(())
+    }
+
+    async fn ensure_goal_mutation_allowed(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), JSONRPCErrorError> {
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            return ensure_workflow_managed_thread_mutation_allowed(thread.as_ref());
+        }
+
+        let stored_thread = self
+            .thread_store
+            .read_thread(StoreReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::InvalidRequest { message } => invalid_request(message),
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    invalid_request(format!("thread not found: {thread_id}"))
+                }
+                err => internal_error(format!("failed to read thread: {err}")),
+            })?;
+        ensure_workflow_managed_thread_source_mutation_allowed(stored_thread.thread_source.as_ref())
     }
 
     async fn state_db_for_materialized_thread(

@@ -7,7 +7,7 @@
 //! order the V2 `spawn_agent` tool applies them (`tools/handlers/multi_agents_v2/spawn.rs`): the
 //! model/effort overrides first, then the role layer. Omitted values inherit the parent turn config.
 
-use crate::agent::role::apply_role_to_config;
+use crate::agent::role::apply_workflow_role_to_config;
 use crate::config::Config;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
@@ -35,7 +35,8 @@ pub(crate) struct SpawnAgentConfigOverrides {
     /// `opts.effort`: one of `low|medium|high|xhigh|max` (spec §4). `None` inherits the parent turn's
     /// reasoning effort (or the resolved model's default when a new model is selected).
     pub(crate) effort: Option<String>,
-    /// `opts.agentType`: a role name resolved via [`apply_role_to_config`] (spec §6 step 2). `None`
+    /// `opts.agentType`: a role name resolved via [`apply_workflow_role_to_config`] (spec §6 step
+    /// 2). `None`
     /// (or a blank/whitespace-only string, mirroring the V2 `spawn_agent` tool) falls back to
     /// [`DEFAULT_ROLE_NAME`], whose role layer is a no-op that leaves the inherited config untouched.
     pub(crate) agent_type: Option<String>,
@@ -72,12 +73,13 @@ impl SpawnAgentConfigOverrides {
     /// `opts.model` resolves against the session `ModelsManager` and, when present, `opts.effort` is
     /// validated against the *resolved* model's `supported_reasoning_levels`; when only `opts.effort`
     /// is present it is validated against the parent turn's current model. `opts.agentType` resolves
-    /// to a role via [`apply_role_to_config`], falling back to [`DEFAULT_ROLE_NAME`] when absent. Any
+    /// to a role via [`apply_workflow_role_to_config`], falling back to [`DEFAULT_ROLE_NAME`] when
+    /// absent. Any
     /// unresolved model, unsupported effort, or unknown/unavailable role surfaces an actionable
     /// [`FunctionCallError`] rather than silently spawning with the wrong settings or a silent default
-    /// role. Delegates to [`apply_requested_spawn_agent_model_overrides`] and [`apply_role_to_config`]
-    /// so the workflow path and the V2 `spawn_agent` tool share one resolution/validation
-    /// implementation.
+    /// role. Delegates to [`apply_requested_spawn_agent_model_overrides`] and
+    /// [`apply_workflow_role_to_config`] so workflow and ordinary roles share loading semantics
+    /// while the workflow path adds its tighter context boundary.
     pub(crate) async fn apply(
         &self,
         session: &Session,
@@ -114,7 +116,7 @@ impl SpawnAgentConfigOverrides {
         &self,
         config: &mut Config,
     ) -> Result<(), FunctionCallError> {
-        apply_role_to_config(config, self.role_name())
+        apply_workflow_role_to_config(config, self.role_name())
             .await
             .map_err(FunctionCallError::RespondToModel)
     }

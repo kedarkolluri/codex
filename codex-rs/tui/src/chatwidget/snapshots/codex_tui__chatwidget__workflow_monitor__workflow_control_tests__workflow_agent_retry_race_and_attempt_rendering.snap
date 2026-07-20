@@ -1,0 +1,36 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "format!(\"PENDING\\n{pending}\\n\\nRESPONSE BEFORE NOTIFICATION\\n{response_before_notification}\\n\\nUNBOUND GENERATION\\n{unbound}\\n\\nREBOUND GENERATION\\n{rebound}\")"
+---
+PENDING
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms · retrying…
+
+  ↑↓ choose · Enter inspect agent · Esc exit
+
+RESPONSE BEFORE NOTIFICATION
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms · attempt 1 → 2
+
+  ↑↓ choose · Enter inspect agent · Esc exit
+
+UNBOUND GENERATION
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 2 · user retry · ≥0ms · attempt 1 → 2
+
+  ↑↓ choose · Enter inspect agent · Esc exit
+
+REBOUND GENERATION
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 3s
+  1.25K tokens · 3 tools
+  ● root · 0/1 agents · elapsed ≥ 3s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 2 · user retry · 1.25K tok · 3 tools · ≥1.23s · attempt 1 →
+       2
+
+  ↑↓ choose · x skip · r retry · Enter inspect agent · Esc exit

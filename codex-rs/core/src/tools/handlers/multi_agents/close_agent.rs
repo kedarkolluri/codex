@@ -36,9 +36,11 @@ async fn handle_close_agent(
         call_id,
         ..
     } = invocation;
+    ensure_collaboration_sender_allowed(session.as_ref()).await?;
     let arguments = function_arguments(payload)?;
     let args: CloseAgentArgs = parse_arguments(&arguments)?;
     let agent_id = parse_agent_id_target(&args.target)?;
+    ensure_collaboration_target_allowed(session.as_ref(), agent_id).await?;
     let receiver_agent = session.services.agent_control.get_agent_metadata(agent_id);
     let known_agent = receiver_agent.is_some();
     let receiver_agent = receiver_agent.unwrap_or_default();
@@ -95,10 +97,15 @@ async fn handle_close_agent(
             return Err(collab_agent_error(agent_id, err));
         }
     };
-    let result = Box::pin(session.services.agent_control.close_agent(agent_id))
-        .await
-        .map_err(|err| collab_agent_error(agent_id, err))
-        .map(|_| ());
+    let result = Box::pin(
+        session
+            .services
+            .agent_control
+            .close_agent_from_generic_collaboration(agent_id),
+    )
+    .await
+    .map_err(|err| collab_agent_error(agent_id, err))
+    .map(|_| ());
     session
         .emit_turn_item_completed(
             &turn,

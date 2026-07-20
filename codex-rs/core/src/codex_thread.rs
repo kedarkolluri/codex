@@ -3,7 +3,10 @@ use crate::config::ConstraintResult;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::Codex;
 use crate::session::SessionSettingsUpdate;
+use crate::session::StartTurnIfIdleOutcome;
 use crate::session::SteerInputError;
+use crate::tools::code_mode::WorkflowAgentControlAction;
+use crate::tools::code_mode::WorkflowAgentControlDisposition;
 use codex_exec_server::SelectedCapabilityRootsStatus;
 use codex_features::Feature;
 use codex_otel::SessionTelemetry;
@@ -86,6 +89,9 @@ pub struct ThreadConfigSnapshot {
 /// idle turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryStartTurnIfIdleRejectionReason {
+    /// Workflow-managed children accept work only from their owning supervisor;
+    /// extension-driven idle turns would escape that lifecycle.
+    WorkflowManaged,
     /// User/client-triggered mailbox work is already queued and must take
     /// priority over extension-initiated idle work.
     PendingTriggerTurn,
@@ -95,6 +101,28 @@ pub enum TryStartTurnIfIdleRejectionReason {
     /// Another turn or task is active, or the idle reservation was lost before
     /// the automatic turn could start.
     Busy,
+}
+
+/// Result of requesting cancellation for a session-owned Dynamic Workflow run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowStopDisposition {
+    /// This request initiated cancellation and awaited the run cleanup path.
+    Applied,
+    /// Another request had already initiated cancellation; this caller joined its cleanup.
+    AlreadyRequested,
+    /// No active run with this identifier belongs to the thread session.
+    NotRunning,
+}
+
+/// Result of requesting a checkpoint pause for a session-owned Dynamic Workflow run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowPauseDisposition {
+    /// This request initiated the pause and awaited child cleanup and durable publication.
+    Applied,
+    /// Another pause request had already started; this caller joined its cleanup.
+    AlreadyRequested,
+    /// No active run exists, or another terminal cause won first.
+    NotRunning,
 }
 
 /// Rejection returned when an extension asks to start automatic idle work but
@@ -201,6 +229,121 @@ impl CodexThread {
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
         self.codex.submit(op).await
+    }
+
+    pub(crate) async fn submit_user_input_if_idle(
+        &self,
+        op: Op,
+    ) -> CodexResult<StartTurnIfIdleOutcome> {
+        self.codex.submit_user_input_if_idle(op).await
+    }
+
+    /// Resolve and durably start a saved dynamic workflow using this thread's
+    /// effective provider, router, environment, and agent-control services.
+    pub async fn start_saved_workflow(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> CodexResult<String> {
+        if self.is_workflow_managed_agent() {
+            return Err(CodexErr::InvalidRequest(
+                "workflow-managed threads cannot start workflows".to_string(),
+            ));
+        }
+        crate::tools::code_mode::workflow_entry::start_saved_workflow(
+            &self.codex.session,
+            name,
+            args,
+        )
+        .await
+    }
+
+    /// Resume a paused workflow from its immutable durable run artifacts.
+    pub async fn resume_workflow_run(&self, source_run_id: &str) -> CodexResult<String> {
+        if self.is_workflow_managed_agent() {
+            return Err(CodexErr::InvalidRequest(
+                "workflow-managed threads cannot resume workflows".to_string(),
+            ));
+        }
+        crate::tools::code_mode::workflow_entry::resume_saved_workflow(
+            &self.codex.session,
+            source_run_id,
+        )
+        .await
+    }
+
+    /// Stop one Dynamic Workflow owned by this thread and wait for cleanup to finish.
+    pub async fn stop_workflow_run(&self, run_id: &str) -> WorkflowStopDisposition {
+        if self.is_workflow_managed_agent() {
+            return WorkflowStopDisposition::NotRunning;
+        }
+        match self
+            .codex
+            .session
+            .services
+            .code_mode_service
+            .cancel_workflow_run(run_id)
+            .await
+        {
+            crate::tools::code_mode::WorkflowRunCancelOutcome::Applied => {
+                WorkflowStopDisposition::Applied
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::AlreadyRequested => {
+                WorkflowStopDisposition::AlreadyRequested
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::NotRunning => {
+                WorkflowStopDisposition::NotRunning
+            }
+        }
+    }
+
+    /// Pause one Dynamic Workflow owned by this thread and wait for its
+    /// checkpoint cleanup and durable publication to finish.
+    pub async fn pause_workflow_run(&self, run_id: &str) -> WorkflowPauseDisposition {
+        if self.is_workflow_managed_agent() {
+            return WorkflowPauseDisposition::NotRunning;
+        }
+        match self
+            .codex
+            .session
+            .services
+            .code_mode_service
+            .pause_workflow_run(run_id)
+            .await
+        {
+            crate::tools::code_mode::WorkflowRunCancelOutcome::Applied => {
+                WorkflowPauseDisposition::Applied
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::AlreadyRequested => {
+                WorkflowPauseDisposition::AlreadyRequested
+            }
+            crate::tools::code_mode::WorkflowRunCancelOutcome::NotRunning => {
+                WorkflowPauseDisposition::NotRunning
+            }
+        }
+    }
+
+    /// Apply `action` to one exact live workflow-agent generation owned by this thread.
+    ///
+    /// Malformed, foreign, stale, completed, and race-losing selections intentionally collapse to
+    /// [`WorkflowAgentControlDisposition::Unavailable`]. Applied responses are returned only after
+    /// the selected child, worktree, scheduler permit, and terminal journal barrier are clean.
+    pub async fn control_workflow_agent(
+        &self,
+        run_id: &str,
+        node_id: u64,
+        attempt: u32,
+        action: WorkflowAgentControlAction,
+    ) -> WorkflowAgentControlDisposition {
+        if self.is_workflow_managed_agent() {
+            return WorkflowAgentControlDisposition::Unavailable;
+        }
+        self.codex
+            .session
+            .services
+            .code_mode_service
+            .control_workflow_agent(run_id, node_id, attempt, action)
+            .await
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -481,6 +624,11 @@ impl CodexThread {
                 "items must not be empty".to_string(),
             ));
         }
+        if self.is_workflow_managed_agent() {
+            return Err(CodexErr::InvalidRequest(
+                "workflow-managed threads do not accept direct item injection".to_string(),
+            ));
+        }
 
         let turn_context = self.codex.session.new_default_turn().await;
         if self.codex.session.reference_context_item().await.is_none() {
@@ -509,6 +657,16 @@ impl CodexThread {
 
     pub fn session_configured(&self) -> SessionConfiguredEvent {
         self.session_configured.clone()
+    }
+
+    /// Returns whether this thread is owned by a Dynamic Workflows supervisor.
+    ///
+    /// Direct client mutation surfaces must reject these threads so only the owning
+    /// workflow can control their turns and configuration.
+    pub fn is_workflow_managed_agent(&self) -> bool {
+        crate::agent::control::is_workflow_managed_thread_source(
+            self.session_configured.thread_source.as_ref(),
+        )
     }
 
     pub(crate) fn is_running(&self) -> bool {
@@ -556,9 +714,21 @@ impl CodexThread {
 
     pub async fn update_thread_metadata(
         &self,
-        patch: ThreadMetadataPatch,
+        mut patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> ThreadStoreResult<StoredThread> {
+        if crate::agent::control::is_workflow_managed_thread_source(
+            patch.thread_source.as_ref().and_then(Option::as_ref),
+        ) {
+            return Err(ThreadStoreError::InvalidRequest {
+                message:
+                    "workflow-managed thread ownership cannot be assigned through metadata updates"
+                        .to_string(),
+            });
+        }
+        if self.is_workflow_managed_agent() {
+            patch.thread_source = None;
+        }
         let live_thread = self
             .codex
             .session
@@ -571,6 +741,15 @@ impl CodexThread {
 
     /// Appends rollout items through the live thread so derived metadata stays in sync.
     pub async fn append_rollout_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
+        if self.is_workflow_managed_agent()
+            && items
+                .iter()
+                .any(|item| matches!(item, RolloutItem::SessionMeta(_)))
+        {
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "workflow-managed thread metadata cannot be replaced".to_string(),
+            });
+        }
         let live_thread = self
             .codex
             .session
@@ -631,6 +810,9 @@ impl CodexThread {
     /// config snapshot. Thread-scoped layers and session-static settings remain
     /// unchanged.
     pub async fn refresh_runtime_config(&self, next_config: crate::config::Config) {
+        if self.is_workflow_managed_agent() {
+            return;
+        }
         self.codex.session.refresh_runtime_config(next_config).await;
     }
 
@@ -672,6 +854,9 @@ impl CodexThread {
         arguments: Option<serde_json::Value>,
         meta: Option<serde_json::Value>,
     ) -> anyhow::Result<CallToolResult> {
+        if self.is_workflow_managed_agent() {
+            anyhow::bail!("workflow-managed threads do not accept direct MCP tool calls");
+        }
         self.current_mcp_runtime()
             .await
             .manager_arc()
@@ -684,6 +869,7 @@ impl CodexThread {
     }
 
     pub async fn increment_out_of_band_elicitation_count(&self) -> CodexResult<i64> {
+        self.ensure_out_of_band_elicitation_control_allowed()?;
         let mut elicitations = self.out_of_band_elicitations.lock().await;
         let incremented = elicitations.count.checked_add(1).ok_or_else(|| {
             CodexErr::Fatal("out-of-band elicitation count overflowed".to_string())
@@ -696,6 +882,7 @@ impl CodexThread {
     }
 
     pub async fn decrement_out_of_band_elicitation_count(&self) -> CodexResult<i64> {
+        self.ensure_out_of_band_elicitation_control_allowed()?;
         let mut elicitations = self.out_of_band_elicitations.lock().await;
         if elicitations.count == 0 {
             return Err(CodexErr::InvalidRequest(
@@ -708,5 +895,15 @@ impl CodexThread {
             elicitations.registration = None;
         }
         Ok(elicitations.count)
+    }
+
+    fn ensure_out_of_band_elicitation_control_allowed(&self) -> CodexResult<()> {
+        if self.is_workflow_managed_agent() {
+            return Err(CodexErr::InvalidRequest(
+                "workflow-managed threads do not support out-of-band elicitation control"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }

@@ -18,8 +18,13 @@ async fn process_compacted_history_with_test_session(
         .set_previous_turn_settings(previous_turn_settings.cloned())
         .await;
     let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
+    let planned_window = session.plan_auto_compact_window_advance().await;
     let initial_context = session
-        .build_initial_context_with_world_state(&turn_context, world_state.as_ref())
+        .build_initial_context_with_world_state_for_window(
+            &turn_context,
+            world_state.as_ref(),
+            planned_window.ids,
+        )
         .await;
     let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
     let (refreshed, _) = crate::compact_remote::process_compacted_history(
@@ -27,6 +32,7 @@ async fn process_compacted_history_with_test_session(
         &turn_context,
         compacted_history,
         &initial_context_injection,
+        planned_window.ids,
     )
     .await;
     (refreshed, initial_context)

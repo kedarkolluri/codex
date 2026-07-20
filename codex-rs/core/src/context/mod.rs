@@ -18,6 +18,7 @@ mod legacy_model_mismatch_warning;
 mod legacy_unified_exec_process_limit_warning;
 mod model_switch_instructions;
 mod multi_agent_mode_instructions;
+mod multi_agent_usage_hint;
 mod network_rule_saved;
 mod permissions_instructions;
 mod personality_spec_instructions;
@@ -32,6 +33,9 @@ mod token_budget_context;
 mod turn_aborted;
 mod user_instructions;
 mod user_shell_command;
+mod workflow_child_context;
+mod workflow_child_history;
+mod workflow_child_tools;
 pub(crate) mod world_state;
 
 pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
@@ -60,6 +64,7 @@ pub(crate) use legacy_model_mismatch_warning::LegacyModelMismatchWarning;
 pub(crate) use legacy_unified_exec_process_limit_warning::LegacyUnifiedExecProcessLimitWarning;
 pub(crate) use model_switch_instructions::ModelSwitchInstructions;
 pub(crate) use multi_agent_mode_instructions::MultiAgentModeInstructions;
+pub(crate) use multi_agent_usage_hint::MultiAgentUsageHint;
 pub(crate) use network_rule_saved::NetworkRuleSaved;
 pub use permissions_instructions::ApprovalPromptContext;
 pub use permissions_instructions::PermissionsInstructions;
@@ -78,3 +83,25 @@ pub(crate) use token_budget_context::TokenBudgetReminder;
 pub(crate) use turn_aborted::TurnAborted;
 pub(crate) use user_instructions::UserInstructions;
 pub(crate) use user_shell_command::UserShellCommand;
+#[cfg(test)]
+pub(crate) use workflow_child_context::MAX_WORKFLOW_CHILD_CONTEXT_BATCH_BYTES;
+#[cfg(test)]
+pub(crate) use workflow_child_context::MAX_WORKFLOW_CHILD_CONTEXT_BATCH_ITEMS;
+pub(crate) use workflow_child_context::MAX_WORKFLOW_CHILD_CONTEXT_ITEM_BYTES;
+pub(crate) use workflow_child_context::bound_workflow_child_context_items;
+pub(crate) use workflow_child_context::bound_workflow_child_injected_messages;
+#[cfg(test)]
+pub(crate) use workflow_child_history::MAX_WORKFLOW_CHILD_PRE_USER_CONTEXT_BYTES;
+pub(crate) use workflow_child_history::WorkflowChildHistoryAppendMode;
+pub(crate) use workflow_child_history::bound_workflow_child_compacted_history;
+pub(crate) use workflow_child_history::finalize_workflow_child_history_append;
+pub(crate) use workflow_child_history::validate_workflow_child_compacted_history;
+pub(crate) use workflow_child_history::validate_workflow_child_model_history;
+#[cfg(test)]
+pub(crate) use workflow_child_tools::MAX_WORKFLOW_CHILD_OUTPUT_PAYLOAD_BYTES;
+#[cfg(test)]
+pub(crate) use workflow_child_tools::MAX_WORKFLOW_CHILD_TOOL_OUTPUT_TOKENS;
+pub(crate) use workflow_child_tools::bound_workflow_child_output_items;
+pub(crate) use workflow_child_tools::bound_workflow_child_responses_lite_tool_specs;
+pub(crate) use workflow_child_tools::bound_workflow_child_tool_specs;
+pub(crate) use workflow_child_tools::clamp_workflow_child_tool_output_limit;

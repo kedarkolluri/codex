@@ -57,6 +57,7 @@ mod remote_control_cmd;
 #[cfg(target_os = "windows")]
 mod sandbox_setup;
 mod state_db_recovery;
+mod workflow;
 #[cfg(not(windows))]
 mod wsl_paths;
 
@@ -64,6 +65,7 @@ use crate::mcp_cmd::McpCli;
 use crate::plugin_cmd::PluginCli;
 use crate::plugin_cmd::PluginSubcommand;
 use crate::remote_control_cmd::RemoteControlCommand;
+use crate::workflow::WorkflowCommand;
 use doctor::DoctorCommand;
 use state_db_recovery as local_state_db;
 
@@ -209,6 +211,9 @@ enum Subcommand {
 
     /// Inspect feature flags.
     Features(FeaturesCli),
+
+    /// [experimental] Run and manage Dynamic Workflows.
+    Workflow(WorkflowCommand),
 }
 
 #[derive(Debug, Parser)]
@@ -1642,6 +1647,21 @@ async fn cli_main(
                 disable_feature_in_config(&feature).await?;
             }
         },
+        Some(Subcommand::Workflow(workflow_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "workflow",
+            )?;
+            workflow::run(
+                workflow_cli,
+                root_config_overrides.clone(),
+                interactive,
+                arg0_paths,
+                root_strict_config,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -1663,13 +1683,14 @@ fn profile_v2_for_subcommand<'a>(
         | Subcommand::Delete(_)
         | Subcommand::Unarchive(_)
         | Subcommand::Fork(_)
+        | Subcommand::Workflow(_)
         | Subcommand::Mcp(_)
         | Subcommand::Sandbox(_)
         | Subcommand::Debug(DebugCommand {
             subcommand: DebugSubcommand::PromptInput(_),
         }) => Ok(Some(profile_v2)),
         _ => anyhow::bail!(
-            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
+            "--profile only applies to runtime commands and `codex mcp`: `codex`, `codex exec`, `codex review`, `codex resume`, `codex archive`, `codex delete`, `codex unarchive`, `codex fork`, `codex workflow`, `codex mcp`, `codex sandbox`, and `codex debug prompt-input`."
         ),
     }
 }
@@ -2116,6 +2137,7 @@ fn unsupported_subcommand_name_for_strict_config(
         | Some(Subcommand::Delete(_))
         | Some(Subcommand::Unarchive(_))
         | Some(Subcommand::Fork(_))
+        | Some(Subcommand::Workflow(_))
         | Some(Subcommand::Doctor(_)) => None,
         Some(Subcommand::AppServer(app_server)) if app_server.subcommand.is_none() => None,
         Some(Subcommand::AppServer(app_server)) => {
@@ -2694,6 +2716,14 @@ mod tests {
 
         assert!(cli.subcommand.is_none());
         assert_eq!(cli.interactive.prompt.as_deref(), Some("import"));
+    }
+
+    #[test]
+    fn workflow_remains_an_interactive_prompt_after_argument_delimiter() {
+        let cli = MultitoolCli::try_parse_from(["codex", "--", "workflow"]).expect("parse");
+
+        assert!(cli.subcommand.is_none());
+        assert_eq!(cli.interactive.prompt.as_deref(), Some("workflow"));
     }
 
     #[test]

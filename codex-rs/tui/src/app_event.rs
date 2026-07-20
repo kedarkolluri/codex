@@ -28,6 +28,12 @@ use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginUninstallResponse;
 use codex_app_server_protocol::SkillsListResponse;
 use codex_app_server_protocol::ThreadGoalStatus;
+use codex_app_server_protocol::WorkflowAgentControlAction;
+use codex_app_server_protocol::WorkflowAgentControlResponse;
+use codex_app_server_protocol::WorkflowPauseDisposition;
+use codex_app_server_protocol::WorkflowRunStatus;
+use codex_app_server_protocol::WorkflowSaveDisposition;
+use codex_app_server_protocol::WorkflowSaveScope;
 use codex_connectors::AppInfo;
 use codex_file_search::FileMatch;
 use codex_protocol::ThreadId;
@@ -144,6 +150,58 @@ pub(crate) enum KeymapEditIntent {
     ReplaceOne { old_key: String },
 }
 
+/// Identifies the retained full workflow run whose exact durable script can be saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowSaveRunTarget {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) run_id: String,
+    pub(crate) name: String,
+}
+
+/// Identifies one approved workflow registry destination without exposing a filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowSaveTarget {
+    pub(crate) run: WorkflowSaveRunTarget,
+    pub(crate) scope: WorkflowSaveScope,
+}
+
+/// Distinguishes create-only saves from the separately confirmed overwrite request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkflowSaveIntent {
+    Create,
+    Overwrite,
+}
+
+/// Correlates an asynchronous save result with its exact run, destination, and user intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowSaveRequest {
+    pub(crate) target: WorkflowSaveTarget,
+    pub(crate) intent: WorkflowSaveIntent,
+}
+
+/// Identifies one exact workflow run owned by the thread that exposes its monitor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowRunControlTarget {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) run_id: String,
+}
+
+/// Identifies one immutable live generation of a logical workflow-agent node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowAgentControlTarget {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) run_id: String,
+    pub(crate) node_id: u64,
+    pub(crate) attempt: u32,
+}
+
+/// Correlates an asynchronous agent-control response with the exact confirmed target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkflowAgentControlRequest {
+    pub(crate) target: WorkflowAgentControlTarget,
+    pub(crate) action: WorkflowAgentControlAction,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub(crate) enum AppEvent {
@@ -151,6 +209,12 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
+    /// Drill into a workflow-owned child while retaining the monitor return target.
+    SelectWorkflowAgentThread {
+        thread_id: ThreadId,
+        run_id: String,
+        node_id: u64,
+    },
 
     /// Fork the current thread into a transient side conversation.
     StartSide {
@@ -653,6 +717,100 @@ pub(crate) enum AppEvent {
     /// completes.
     SkillsListLoaded {
         result: Result<SkillsListResponse, String>,
+    },
+
+    /// Refresh saved workflow metadata for the active thread's picker.
+    LoadSavedWorkflows {
+        thread_id: ThreadId,
+    },
+
+    /// Start an exact saved workflow name against the thread that issued the command.
+    StartSavedWorkflow {
+        thread_id: ThreadId,
+        name: String,
+        args: Option<serde_json::Value>,
+    },
+
+    /// Reconcile one replayed workflow start against its durable lifecycle projection.
+    RequestWorkflowRead {
+        thread_id: ThreadId,
+        run_id: String,
+        revision: u64,
+    },
+
+    /// Complete one bounded workflow status reconciliation request.
+    WorkflowReadFinished {
+        thread_id: ThreadId,
+        run_id: String,
+        revision: u64,
+        result: Result<WorkflowRunStatus, String>,
+    },
+
+    /// Send the user-confirmed stop request for one explicitly selected workflow run.
+    RequestWorkflowStop {
+        thread_id: ThreadId,
+        run_id: String,
+    },
+
+    /// Complete a workflow stop request without blocking the TUI event loop.
+    WorkflowStopFinished {
+        thread_id: ThreadId,
+        run_id: String,
+        result: Result<codex_app_server_protocol::WorkflowStopDisposition, String>,
+    },
+
+    /// Send the user-confirmed pause request for one explicitly selected workflow run.
+    RequestWorkflowPause {
+        target: WorkflowRunControlTarget,
+    },
+
+    /// Complete a workflow pause request without blocking the TUI event loop.
+    WorkflowPauseFinished {
+        target: WorkflowRunControlTarget,
+        result: Result<WorkflowPauseDisposition, String>,
+    },
+
+    /// Resume one explicitly selected paused run from its durable checkpoint.
+    RequestWorkflowResume {
+        target: WorkflowRunControlTarget,
+    },
+
+    /// Complete a workflow resume request with the fresh successor run identity.
+    WorkflowResumeFinished {
+        target: WorkflowRunControlTarget,
+        result: Result<String, String>,
+    },
+
+    /// Control one immutable, user-confirmed live workflow-agent generation.
+    RequestWorkflowAgentControl {
+        request: WorkflowAgentControlRequest,
+    },
+
+    /// Complete an exact workflow-agent control request.
+    WorkflowAgentControlFinished {
+        request: WorkflowAgentControlRequest,
+        result: Result<WorkflowAgentControlResponse, String>,
+    },
+
+    /// Continue the save flow for the exact durable name of an explicitly selected full run.
+    OpenWorkflowSaveScope {
+        target: WorkflowSaveRunTarget,
+    },
+
+    /// Save one exact durable workflow script using typed create/overwrite intent.
+    RequestWorkflowSave {
+        request: WorkflowSaveRequest,
+    },
+
+    /// Clear a conflict only after the user explicitly chooses the safe cancel action.
+    CancelWorkflowSaveConflict {
+        target: WorkflowSaveTarget,
+    },
+
+    /// Complete a workflow save request without blocking the TUI event loop.
+    WorkflowSaveFinished {
+        request: WorkflowSaveRequest,
+        result: Result<WorkflowSaveDisposition, String>,
     },
 
     /// Begin buffering initial resume replay rows before they are written to scrollback.

@@ -17,6 +17,9 @@ pub(crate) async fn queue_strict_refresh(
         .await?;
     let mut refreshes = Vec::new();
     for thread_id in thread_manager.list_thread_ids().await {
+        if thread_manager.is_workflow_managed_thread(thread_id).await {
+            continue;
+        }
         let thread = thread_manager
             .get_thread(thread_id)
             .await
@@ -35,6 +38,9 @@ pub(crate) async fn queue_best_effort_refresh(
     config_manager: &ConfigManager,
 ) {
     for thread_id in thread_manager.list_thread_ids().await {
+        if thread_manager.is_workflow_managed_thread(thread_id).await {
+            continue;
+        }
         let thread = match thread_manager.get_thread(thread_id).await {
             Ok(thread) => thread,
             Err(err) => {
@@ -107,6 +113,7 @@ mod tests {
     use codex_config::ThreadConfigLoader;
     use codex_config::ThreadConfigSource;
     use codex_config::types::AuthKeyringBackendKind;
+    use codex_core::StartThreadOptions;
     use codex_core::config::ConfigOverrides;
     use codex_core::init_state_db;
     use codex_core::thread_store_from_config;
@@ -115,7 +122,9 @@ mod tests {
     use codex_home::CodexHomeUserInstructionsProvider;
     use codex_login::AuthManager;
     use codex_login::CodexAuth;
+    use codex_protocol::protocol::InitialHistory;
     use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::ThreadSource;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use std::sync::atomic::AtomicUsize;
@@ -135,7 +144,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_effort_refresh_attempts_every_loaded_thread() -> anyhow::Result<()> {
+    async fn best_effort_refresh_skips_workflow_managed_threads() -> anyhow::Result<()> {
         let (_temp_dir, thread_manager, config_manager, loader) = refresh_test_state().await?;
 
         queue_best_effort_refresh(&thread_manager, &config_manager).await;
@@ -253,8 +262,24 @@ mod tests {
                 /*external_time_provider*/ None,
             )
         });
-        thread_manager.start_thread(good_config).await?;
+        thread_manager.start_thread(good_config.clone()).await?;
         thread_manager.start_thread(bad_config).await?;
+        thread_manager
+            .start_thread_with_options(StartThreadOptions {
+                config: good_config,
+                allow_provider_model_fallback: false,
+                initial_history: InitialHistory::New,
+                history_mode: None,
+                session_source: None,
+                thread_source: Some(ThreadSource::Feature("workflow".to_string())),
+                dynamic_tools: Vec::new(),
+                metrics_service_name: None,
+                parent_trace: None,
+                environments: Vec::new(),
+                thread_extension_init: Default::default(),
+                supports_openai_form_elicitation: false,
+            })
+            .await?;
 
         let loader = Arc::new(CountingThreadConfigLoader {
             good_cwd: AbsolutePathBuf::try_from(good_cwd)?,

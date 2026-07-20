@@ -35,8 +35,9 @@ impl ThreadRequestProcessor {
     ) -> Result<ThreadDeleteResponse, JSONRPCErrorError> {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
-
         let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+        self.ensure_thread_subtree_mutation_allowed(&thread_ids)
+            .await?;
 
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;

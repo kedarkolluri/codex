@@ -1,0 +1,51 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"START RESPONSE\\n{starting}\\n\\nRUN BEGIN (>4 ACTIVE)\\n{running}\\n\\nRUN END\\n{completed}\")"
+---
+START RESPONSE
+  … 1 workflow run omitted
+
+◆ Workflow detailed workflow 1  …00000001  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow detailed workflow 2  …00000002  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow detailed workflow 3  …00000003  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◇ Workflow overflow workflow  …ba987654  compact · starting
+
+  Enter inspect agents
+
+RUN BEGIN (>4 ACTIVE)
+  … 1 workflow run omitted
+
+◆ Workflow detailed workflow 1  …00000001  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow detailed workflow 2  …00000002  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow detailed workflow 3  …00000003  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◇ Workflow overflow workflow  …ba987654  compact · running
+
+  Enter inspect agents
+
+RUN END
+  … 1 workflow run omitted
+
+◆ Workflow detailed workflow 1  …00000001  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow detailed workflow 2  …00000002  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◆ Workflow detailed workflow 3  …00000003  running · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+◇ Workflow overflow workflow  …ba987654  compact · completed
+
+  Enter inspect agents

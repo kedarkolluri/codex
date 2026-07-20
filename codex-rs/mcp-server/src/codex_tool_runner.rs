@@ -384,6 +384,7 @@ async fn run_codex_tool_session_inner(
                     | EventMsg::CollabCloseEnd(_)
                     | EventMsg::CollabResumeBegin(_)
                     | EventMsg::CollabResumeEnd(_)
+                    | EventMsg::Workflow(_)
                     | EventMsg::SubAgentActivity(_)
                     | EventMsg::RealtimeConversationStarted(_)
                     | EventMsg::RealtimeConversationSdp(_)

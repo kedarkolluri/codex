@@ -6,6 +6,7 @@
 //! role layer sets them. It does not decide when to spawn a sub-agent or which role to use; the
 //! multi-agent tool handler owns that orchestration.
 
+use super::role_context_bounds;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
@@ -39,16 +40,39 @@ pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
+    apply_role_to_config_with_policy(config, role_name, RoleContextPolicy::Ordinary).await
+}
+
+/// Applies a role for a workflow-managed child, including the tighter model-context bounds that
+/// must not change the behavior of ordinary `spawn_agent` roles.
+pub(crate) async fn apply_workflow_role_to_config(
+    config: &mut Config,
+    role_name: Option<&str>,
+) -> Result<(), String> {
+    apply_role_to_config_with_policy(config, role_name, RoleContextPolicy::Workflow).await
+}
+
+#[derive(Clone, Copy)]
+enum RoleContextPolicy {
+    Ordinary,
+    Workflow,
+}
+
+async fn apply_role_to_config_with_policy(
+    config: &mut Config,
+    role_name: Option<&str>,
+    context_policy: RoleContextPolicy,
+) -> Result<(), String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    apply_role_to_config_inner(config, role_name, &role, context_policy)
         .await
         .map_err(|err| {
-            tracing::warn!("failed to apply role to config: {err}");
+            tracing::warn!(role = role_name, "failed to apply role to config: {err}");
             AGENT_TYPE_UNAVAILABLE_ERROR.to_string()
         })
 }
@@ -57,6 +81,7 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
+    context_policy: RoleContextPolicy,
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
@@ -72,13 +97,17 @@ async fn apply_role_to_config_inner(
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
 
-    *config = reload::build_next_config(
+    let next_config = reload::build_next_config(
         config,
-        role_layer_toml,
+        &role_layer_toml,
         preserve_current_provider,
         preserve_current_service_tier,
     )
     .await?;
+    if matches!(context_policy, RoleContextPolicy::Workflow) {
+        role_context_bounds::validate_effective_role_context(&role_layer_toml, &next_config)?;
+    }
+    *config = next_config;
     Ok(())
 }
 
@@ -126,16 +155,27 @@ pub(crate) fn resolve_role_config<'a>(
         .or_else(|| built_in::configs().get(role_name))
 }
 
+/// Return every role name available to a spawned agent in deterministic order.
+/// User-defined declarations shadow built-ins with the same name, matching
+/// [`resolve_role_config`].
+pub(crate) fn available_role_names(config: &Config) -> BTreeSet<String> {
+    built_in::configs()
+        .keys()
+        .chain(config.agent_roles.keys())
+        .cloned()
+        .collect()
+}
+
 mod reload {
     use super::*;
 
     pub(super) async fn build_next_config(
         config: &Config,
-        role_layer_toml: TomlValue,
+        role_layer_toml: &TomlValue,
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> anyhow::Result<Config> {
-        let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
+        let config_layer_stack = build_config_layer_stack(config, role_layer_toml)?;
         let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
 
         let next_config = Config::load_config_with_layer_stack(
@@ -229,22 +269,15 @@ pub(crate) mod spawn_tool_spec {
         user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
     ) -> String {
         let mut seen = BTreeSet::new();
-        let mut formatted_roles = Vec::new();
-        for (name, declaration) in user_defined_roles {
-            if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
-            }
-        }
-        for (name, declaration) in built_in_roles {
-            if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
-            }
-        }
-
-        format!(
-            "Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.\nAvailable roles:\n{}",
-            formatted_roles.join("\n"),
-        )
+        let entries = user_defined_roles
+            .iter()
+            .chain(built_in_roles)
+            .filter(|(name, _)| seen.insert(name.as_str()))
+            .map(|(name, declaration)| format_role(name, declaration));
+        let header = format!(
+            "Optional type name for the new agent. If omitted, `{DEFAULT_ROLE_NAME}` is used.\nAvailable roles:"
+        );
+        role_context_bounds::bound_role_catalog(&header, entries)
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {

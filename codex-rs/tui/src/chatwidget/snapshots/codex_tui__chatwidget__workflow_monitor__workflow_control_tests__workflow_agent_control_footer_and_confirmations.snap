@@ -1,0 +1,46 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "format!(\"FOOTER\\n{footer}\\n\\nSKIP\\n{skip_popup}\\n\\nRETRY\\n{retry_popup}\")"
+---
+FOOTER
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms
+
+  ↑↓ choose · x skip · r retry · Enter inspect agent · Esc exit
+
+SKIP
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms
+
+  ↑↓ choose · x skip · r retry · Enter inspect agent · Esc exit
+
+
+  Skip workflow agent?
+  worker · run 019f78be-1234-7abc-8def-0123456789ab · attempt 1
+
+  1. Skip selected attempt  Cancel this exact attempt and settle its logical call to null.
+› 2. Cancel                 Keep this agent attempt running.
+
+  Press enter to confirm or esc to go back
+
+RETRY
+◆ Workflow release-check  …456789ab  running · elapsed ≥ 2s
+  0 tokens · 0 tools
+  ● root · 0/1 agents · elapsed ≥ 2s
+  › └─ ● worker  gpt-5.5 · high  running · attempt 1 · ≥0ms
+
+  ↑↓ choose · x skip · r retry · Enter inspect agent · Esc exit
+
+
+  Retry workflow agent?
+  worker · run 019f78be-1234-7abc-8def-0123456789ab · attempt 1
+
+  1. Retry selected attempt  Cancel this exact attempt and schedule a fresh child for the same
+                             logical call.
+› 2. Cancel                  Keep this agent attempt running.
+
+  Press enter to confirm or esc to go back

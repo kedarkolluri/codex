@@ -1,4 +1,5 @@
 use super::input_queue::InputQueue;
+use super::turn_admission::TurnAdmissionRegistry;
 use super::*;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
@@ -56,6 +57,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
+    pub(super) turn_admissions: Arc<TurnAdmissionRegistry>,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -486,6 +488,13 @@ impl Session {
     pub(crate) async fn originator(&self) -> String {
         let state = self.state.lock().await;
         state.session_configuration.originator.clone()
+    }
+
+    pub(crate) async fn is_workflow_managed_agent(&self) -> bool {
+        let state = self.state.lock().await;
+        crate::agent::control::is_workflow_managed_thread_source(
+            state.session_configuration.thread_source.as_ref(),
+        )
     }
 
     #[instrument(name = "session_init", level = "info", skip_all)]
@@ -1172,6 +1181,7 @@ impl Session {
                 active_turn: Mutex::new(None),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
+                turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });
@@ -1269,8 +1279,6 @@ impl Session {
                     mcp_connection_manager,
                 )
                 .await?;
-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
-                .await;
             let session_start_source = match &initial_history {
                 InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
                 InitialHistory::New | InitialHistory::Forked(_) => {
@@ -1279,8 +1287,11 @@ impl Session {
                 InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
             };
 
-            // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
-            Box::pin(sess.record_initial_history(initial_history)).await;
+            // History reconstruction can emit events. We record only after the
+            // SessionConfiguredEvent is emitted.
+            Box::pin(sess.try_record_initial_history(initial_history)).await?;
+            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
+                .await;
             {
                 let mut state = sess.state.lock().await;
                 state.queue_pending_session_start_source(session_start_source);

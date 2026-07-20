@@ -1,0 +1,39 @@
+---
+source: tui/src/chatwidget/workflow_control_tests.rs
+expression: "format!(\"PAUSED\\n{paused}\\n\\nPENDING\\n{pending}\\n\\nRESPONSE FIRST\\n{response_first}\\n\\nRUN BEGIN\\n{resumed}\")"
+---
+PAUSED
+› ◆ Workflow release-check  …456789ac  paused · duration 4s
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · r resume · Enter inspect agents · Esc exit
+
+PENDING
+› ◆ Workflow release-check  …456789ac  paused · duration 4s
+  resume  admitting durable successor…
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+RESPONSE FIRST
+› ◆ Workflow release-check  …456789ac  paused · duration 4s
+  resumed  successor …456789ad
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+◇ Workflow release-check  …456789ad  compact · starting
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+RUN BEGIN
+› ◆ Workflow release-check  …456789ac  paused · duration 4s
+  resumed  successor …456789ad
+  ✓ root · duration 4s
+  budget  0 weighted tokens · unmetered
+
+◆ Workflow release-check  …456789ad  running · resumed from …456789ac · elapsed ≥ 0s
+  ● root · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit

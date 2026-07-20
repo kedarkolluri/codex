@@ -1,4 +1,3 @@
-use super::active_turn_sub_id;
 use super::drain_buffered_final_message;
 use super::format_ordinal_nickname;
 use super::workflow_agent_nickname_preference;
@@ -7,6 +6,9 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::spawn::default_agent_nickname_list;
 use crate::agent::control::spawn_await_opts::SpawnAgentConfigOverrides;
 use crate::agent::control::spawn_await_opts::map_workflow_effort;
+use crate::agent::control::spawn_workspace::SpawnAgentWorkspace;
+use crate::agent::control::workflow_child_progress::WorkflowChildEvent;
+use crate::agent::control::workflow_child_progress::WorkflowChildObserver;
 use crate::agent::registry::AgentRegistry;
 use crate::agent::registry::next_thread_spawn_depth;
 use crate::config::Config;
@@ -33,9 +35,14 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::user_input::UserInput;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_workflow_journal::JournalRecorder;
+use codex_workflow_journal::WorkflowRunMeta;
+use codex_workflow_journal::storage::WorkflowRunPaths;
+use codex_workflow_journal::storage::mint_run_id;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_response_created;
+use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::mount_response_once;
 use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
@@ -48,6 +55,7 @@ use tempfile::TempDir;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 use wiremock::MockServer;
 
 const CHILD_FINAL_MESSAGE: &str = "child final answer";
@@ -203,6 +211,356 @@ async fn spawn_and_await_final_message_uses_registering_path() -> anyhow::Result
         "child rollout file {rollout_file_name} should be keyed by the child thread id {child_thread_id}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellable_spawn_explicitly_reaps_child_before_returning() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let expected_usage = codex_protocol::protocol::TokenUsage {
+        input_tokens: 11,
+        cached_input_tokens: 0,
+        output_tokens: 7,
+        reasoning_output_tokens: 0,
+        total_tokens: 18,
+    };
+    let long_running_command = if cfg!(windows) {
+        "ping -n 31 127.0.0.1 >NUL"
+    } else {
+        "sleep 30"
+    };
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-cancelled"),
+            ev_shell_command_call("call-cancelled", long_running_command),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp-cancelled",
+                    "usage": {
+                        "input_tokens": 11,
+                        "input_tokens_details": null,
+                        "output_tokens": 7,
+                        "output_tokens_details": null,
+                        "total_tokens": 18
+                    }
+                }
+            }),
+        ]),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(&manager, &config).await?;
+    let child_config = build_agent_spawn_config(&base_instructions, parent_turn.as_ref())
+        .expect("build child config");
+    let agent_control = manager.agent_control();
+    let mut thread_created_rx = manager.subscribe_thread_created();
+    let cancellation_token = CancellationToken::new();
+    let spawn = agent_control.spawn_and_await_journaled_with_config_cancellable(
+        child_config,
+        parent_turn.as_ref(),
+        parent_thread_id,
+        vec![UserInput::Text {
+            text: "run until cancelled".to_string(),
+            text_elements: Vec::new(),
+        }],
+        /*final_output_json_schema*/ None,
+        SpawnAgentOptions {
+            environments: Some(parent_turn.environments.to_selections()),
+            ..Default::default()
+        },
+        /*observer*/ None,
+        cancellation_token.clone(),
+    );
+    tokio::pin!(spawn);
+    let child_thread_id = tokio::select! {
+        child_thread_id = thread_created_rx.recv() => child_thread_id.expect("child registered"),
+        outcome = &mut spawn => panic!("child finished before cancellation: {outcome:?}"),
+    };
+    let child = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("hold the registered child through cancellation");
+    let persisted_facts = timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                outcome = &mut spawn => {
+                    panic!("child finished before cancellation: {outcome:?}")
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            let facts = super::workflow_child_progress::child_journal_facts(
+                &agent_control,
+                child_thread_id,
+            )
+            .await;
+            if facts.token_usage == expected_usage && facts.tool_call_count == 1 {
+                break facts;
+            }
+        }
+    })
+    .await
+    .expect("child should persist usage and tool facts before cancellation");
+    assert!(persisted_facts.rollout_path.is_some());
+
+    cancellation_token.cancel();
+    let outcome = timeout(Duration::from_secs(10), &mut spawn)
+        .await
+        .expect("cancellable helper should reap promptly");
+
+    assert!(outcome.cancelled);
+    assert_eq!(outcome.child_thread_id, Some(child_thread_id));
+    assert_eq!(outcome.tokens_spent, Some(7));
+    assert_eq!(outcome.token_usage, expected_usage);
+    assert_eq!(outcome.tool_call_count, 1);
+    let rollout_path = outcome
+        .rollout_path
+        .as_deref()
+        .expect("cancelled outcome should retain its materialized rollout path");
+    assert!(rollout_path.exists());
+    timeout(Duration::from_secs(10), child.wait_until_terminated())
+        .await
+        .expect("reaping must await child session shutdown");
+    assert!(manager.get_thread(child_thread_id).await.is_err());
+    assert!(agent_control.get_agent_metadata(child_thread_id).is_none());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn isolated_workspace_child_is_shutdown_before_success_returns() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-isolated"),
+            ev_assistant_message("msg-isolated", CHILD_FINAL_MESSAGE),
+            ev_completed("resp-isolated"),
+        ]),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let worktree =
+        AbsolutePathBuf::from_absolute_path_checked(codex_home.path().join("isolated-worktree"))?;
+    let git_dir =
+        AbsolutePathBuf::from_absolute_path_checked(codex_home.path().join("isolated-git-dir"))?;
+    std::fs::create_dir(&worktree)?;
+    let manager = build_manager(&config).await;
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(&manager, &config).await?;
+    let child_config = build_agent_spawn_config(&base_instructions, parent_turn.as_ref())
+        .expect("build child config");
+    let agent_control = manager.agent_control();
+    let mut thread_created_rx = manager.subscribe_thread_created();
+    let spawn = agent_control.spawn_and_await_journaled_with_config_cancellable(
+        child_config,
+        parent_turn.as_ref(),
+        parent_thread_id,
+        vec![UserInput::Text {
+            text: "complete in the isolated checkout".to_string(),
+            text_elements: Vec::new(),
+        }],
+        /*final_output_json_schema*/ None,
+        SpawnAgentOptions {
+            environments: Some(parent_turn.environments.to_selections()),
+            spawn_workspace: Some(SpawnAgentWorkspace::isolated_worktree(
+                worktree,
+                git_dir,
+                parent_turn.config.permissions.clone(),
+            )?),
+            ..Default::default()
+        },
+        /*observer*/ None,
+        CancellationToken::new(),
+    );
+    tokio::pin!(spawn);
+    let child_thread_id = tokio::select! {
+        biased;
+        child_thread_id = thread_created_rx.recv() => child_thread_id.expect("child registered"),
+        outcome = &mut spawn => panic!("isolated child finished before registration was observed: {outcome:?}"),
+    };
+    let child = manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("hold isolated child while its turn completes");
+
+    let outcome = timeout(Duration::from_secs(10), &mut spawn)
+        .await
+        .expect("isolated child should complete promptly");
+
+    assert_eq!(outcome.final_text.as_deref(), Some(CHILD_FINAL_MESSAGE));
+    assert!(!outcome.cancelled);
+    timeout(Duration::from_secs(10), child.wait_until_terminated())
+        .await
+        .expect("isolated child session must stop before its workspace owner resumes");
+    assert!(manager.get_thread(child_thread_id).await.is_err());
+    assert!(agent_control.get_agent_metadata(child_thread_id).is_none());
+    Ok(())
+}
+
+/// A deferred workflow child cannot submit its first turn until the host has published and
+/// acknowledged the Begin -> Bound topology prefix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_child_waits_for_binding_ack_before_first_turn() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    mount_sse_once(
+        &server,
+        sse(vec![
+            ev_response_created("resp-bound"),
+            ev_assistant_message("msg-bound", CHILD_FINAL_MESSAGE),
+            ev_completed("resp-bound"),
+        ]),
+    )
+    .await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(&manager, &config).await?;
+    let child_config = build_agent_spawn_config(&base_instructions, parent_turn.as_ref())
+        .expect("build child config");
+    let agent_control = manager.agent_control();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let observer = WorkflowChildObserver::new(event_tx);
+    let spawn = agent_control.spawn_and_await_journaled_with_config(
+        child_config,
+        parent_turn.as_ref(),
+        parent_thread_id,
+        vec![UserInput::Text {
+            text: "run only after binding".to_string(),
+            text_elements: Vec::new(),
+        }],
+        /*final_output_json_schema*/ None,
+        SpawnAgentOptions {
+            environments: Some(parent_turn.environments.to_selections()),
+            ..Default::default()
+        },
+        Some(observer),
+    );
+    tokio::pin!(spawn);
+
+    let (child_thread_id, acknowledged) = tokio::select! {
+        event = event_rx.recv() => match event.expect("binding event") {
+            WorkflowChildEvent::Bound {
+                child_thread_id,
+                acknowledged,
+            } => (child_thread_id, acknowledged),
+            WorkflowChildEvent::Progress(progress) => {
+                panic!("progress preceded workflow child binding: {progress:?}")
+            }
+        },
+        outcome = &mut spawn => panic!("spawn finished before binding acknowledgment: {outcome:?}"),
+    };
+
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("mock server request log")
+            .is_empty(),
+        "the child must not issue its first model request before Bound is acknowledged"
+    );
+    let child_thread = manager.get_thread(child_thread_id).await?;
+    assert!(
+        child_thread
+            .codex
+            .session
+            .active_turn
+            .lock()
+            .await
+            .is_none()
+    );
+
+    acknowledged
+        .send(Ok(()))
+        .expect("spawn should still be awaiting the binding acknowledgment");
+    let outcome = timeout(Duration::from_secs(30), &mut spawn)
+        .await
+        .expect("spawn should finish after binding is acknowledged");
+    assert_eq!(outcome.final_text.as_deref(), Some(CHILD_FINAL_MESSAGE));
+    assert_eq!(outcome.child_thread_id, Some(child_thread_id));
+    Ok(())
+}
+
+/// A configured journal is a fail-closed durability boundary: if its binding append fails, the
+/// deferred child is reaped and never starts a turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_child_journal_failure_prevents_first_turn() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let codex_home = TempDir::new()?;
+    let config = test_config_for_server(&codex_home, &server).await?;
+    let manager = build_manager(&config).await;
+    let (parent_thread_id, base_instructions, parent_turn) =
+        parent_spawn_context(&manager, &config).await?;
+    let child_config = build_agent_spawn_config(&base_instructions, parent_turn.as_ref())
+        .expect("build child config");
+    let agent_control = manager.agent_control();
+    let mut thread_created_rx = manager.subscribe_thread_created();
+
+    let run_id = mint_run_id();
+    let paths = WorkflowRunPaths::new(codex_home.path(), &run_id);
+    let meta = WorkflowRunMeta::new(
+        run_id,
+        /*parent_run_id*/ None,
+        "blake3:script".to_string(),
+        "blake3:args".to_string(),
+        "binding failure".to_string(),
+        Some(1_000),
+        codex_workflow_journal::KEY_ALGO_VERSION,
+        "2026-07-18T00:00:00Z".to_string(),
+    );
+    let recorder = Arc::new(JournalRecorder::new(&paths, &meta).await?);
+    recorder.shutdown().await?;
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let observer = WorkflowChildObserver::new(event_tx).with_binding_journal(recorder, 7, 0);
+
+    let outcome = timeout(
+        Duration::from_secs(30),
+        agent_control.spawn_and_await_journaled_with_config(
+            child_config,
+            parent_turn.as_ref(),
+            parent_thread_id,
+            vec![UserInput::Text {
+                text: "must never run".to_string(),
+                text_elements: Vec::new(),
+            }],
+            /*final_output_json_schema*/ None,
+            SpawnAgentOptions {
+                environments: Some(parent_turn.environments.to_selections()),
+                ..Default::default()
+            },
+            Some(observer),
+        ),
+    )
+    .await
+    .expect("journal failure should resolve promptly");
+
+    assert!(outcome.final_text.is_none());
+    assert!(outcome.child_thread_id.is_none());
+    assert!(!outcome.cancelled);
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server request log");
+    let turn_requests = requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST" && request.url.path() == "/responses")
+        .collect::<Vec<_>>();
+    assert!(
+        turn_requests.is_empty(),
+        "a child whose binding was not durable must never issue a first-turn request: \
+         {turn_requests:#?}"
+    );
+    let child_thread_id = thread_created_rx
+        .try_recv()
+        .expect("the deferred child should have registered before binding failed");
+    assert!(manager.get_thread(child_thread_id).await.is_err());
+    assert!(agent_control.get_agent_metadata(child_thread_id).is_none());
+    assert!(event_rx.try_recv().is_err(), "Bound must not be announced");
     Ok(())
 }
 
@@ -681,19 +1039,23 @@ async fn submit_and_await_active_turn(
             thread_settings: Default::default(),
         })
         .await?;
-    loop {
-        if child_thread
-            .codex
-            .session
-            .active_turn
-            .lock()
-            .await
-            .is_some()
-        {
-            break;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if child_thread
+                .codex
+                .session
+                .active_turn
+                .lock()
+                .await
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("submitted turn should become active before timeout");
     Ok(submission_id)
 }
 
@@ -751,6 +1113,7 @@ async fn await_first_turn_returns_none_when_a_foreign_turn_is_active() -> anyhow
                 text_elements: Vec::new(),
             }],
             /*final_output_json_schema*/ None,
+            /*observer*/ None,
         ),
     )
     .await
@@ -760,53 +1123,6 @@ async fn await_first_turn_returns_none_when_a_foreign_turn_is_active() -> anyhow
         result, None,
         "a prompt that would be steered into a foreign turn must resolve to None, never the \
          foreign turn's message"
-    );
-
-    Ok(())
-}
-
-/// `active_turn_sub_id` (the signal the helper uses to detect foreign steering) reports `None` for
-/// an idle deferred child and the running turn's id once a turn is active.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn active_turn_sub_id_reflects_running_turn() -> anyhow::Result<()> {
-    let server = start_mock_server().await;
-    mount_response_once(
-        &server,
-        sse_response(sse(vec![
-            ev_response_created("resp-child"),
-            ev_assistant_message("msg-child", CHILD_FINAL_MESSAGE),
-            ev_completed("resp-child"),
-        ]))
-        .set_delay(Duration::from_secs(30)),
-    )
-    .await;
-
-    let codex_home = TempDir::new()?;
-    let config = test_config_for_server(&codex_home, &server).await?;
-    let manager = build_manager(&config).await;
-    let (parent_thread_id, base_instructions, parent_turn) =
-        parent_spawn_context(&manager, &config).await?;
-    let agent_control = manager.agent_control();
-
-    let child_thread_id = spawn_deferred_child(
-        &manager,
-        &base_instructions,
-        parent_turn.as_ref(),
-        parent_thread_id,
-    )
-    .await?;
-    let state = agent_control.upgrade().expect("state should be alive");
-    let child_thread = state.get_thread(child_thread_id).await?;
-
-    // Deferred spawn submits no prompt: the child runs no turn of its own.
-    assert_eq!(active_turn_sub_id(&child_thread).await, None);
-
-    // A fresh turn on an idle child is stamped with its submission id.
-    let submission_id = submit_and_await_active_turn(&child_thread, "start a turn").await?;
-    assert_eq!(
-        active_turn_sub_id(&child_thread).await.as_deref(),
-        Some(submission_id.as_str()),
-        "the running turn's id should match the submission id of the fresh turn"
     );
 
     Ok(())

@@ -38,6 +38,7 @@ use super::WireWaitRequest;
 use crate::AgentCallOpts;
 use crate::AgentSpawnOutcome;
 use crate::ExecuteRequest;
+use crate::WorkflowBudgetSnapshot;
 
 fn session_id() -> SessionId {
     SessionId::new("session-1").expect("valid session ID")
@@ -108,6 +109,8 @@ fn execute_request() -> WireExecuteRequest {
         workflow: false,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 
@@ -676,7 +679,7 @@ fn workflow_flag_defaults_to_false_for_legacy_payloads() {
 }
 
 #[test]
-fn workflow_args_and_run_id_survive_wire_round_trip() {
+fn workflow_args_run_id_and_replay_entries_survive_wire_round_trip() {
     // The invocation `args` JSON and host-minted `run_id` must round-trip through
     // the wire request in both directions so a remote code-mode host installs the
     // read-only `args` / `workflow.runId` globals for the workflow isolate.
@@ -684,6 +687,17 @@ fn workflow_args_and_run_id_survive_wire_round_trip() {
         workflow: true,
         args: Some(json!({ "foo": 1, "nested": { "bar": true } })),
         run_id: Some("0192f000-0000-7000-8000-000000000000".to_string()),
+        replay_entries: vec![json!({
+            "ordinal": 0,
+            "key": "blake3:prior",
+            "return": "cached",
+            "tokens_spent": 17,
+        })],
+        workflow_budget: Some(WorkflowBudgetSnapshot {
+            total: Some(100),
+            spent: 17,
+            remaining: Some(83),
+        }),
         ..execute_request()
     };
     let workflow_domain = ExecuteRequest::try_from(workflow_wire.clone())
@@ -699,6 +713,25 @@ fn workflow_args_and_run_id_survive_wire_round_trip() {
         "run_id must decode"
     );
     assert_eq!(
+        workflow_domain.replay_entries,
+        vec![json!({
+            "ordinal": 0,
+            "key": "blake3:prior",
+            "return": "cached",
+            "tokens_spent": 17,
+        })],
+        "replay seed must decode before isolate execution"
+    );
+    assert_eq!(
+        workflow_domain.workflow_budget,
+        Some(WorkflowBudgetSnapshot {
+            total: Some(100),
+            spent: 17,
+            remaining: Some(83),
+        }),
+        "initial budget snapshot must decode before isolate execution"
+    );
+    assert_eq!(
         WireExecuteRequest::try_from(workflow_domain).expect("domain converts back to the wire"),
         workflow_wire,
         "args + run_id must re-encode identically",
@@ -706,16 +739,126 @@ fn workflow_args_and_run_id_survive_wire_round_trip() {
 }
 
 #[test]
-fn plain_exec_omits_args_and_run_id_on_the_wire() {
+fn plain_exec_omits_workflow_only_fields_on_the_wire() {
     // A plain code-mode exec (and any workflow run that carries no args/run id)
     // must skip both keys so the wire bytes stay byte-identical to the pre-`args`
     // format an older `deny_unknown_fields` host accepts.
     let plain = execute_request();
     assert!(plain.args.is_none() && plain.run_id.is_none());
+    assert!(plain.replay_entries.is_empty());
+    assert!(plain.workflow_budget.is_none());
     let encoded = serde_json::to_value(&plain).expect("serialize plain exec");
     assert!(
-        encoded.get("args").is_none() && encoded.get("run_id").is_none(),
-        "plain exec must not carry `args`/`run_id` keys, got: {encoded}"
+        encoded.get("args").is_none()
+            && encoded.get("run_id").is_none()
+            && encoded.get("replay_entries").is_none()
+            && encoded.get("workflow_budget").is_none(),
+        "plain exec must not carry workflow-only keys, got: {encoded}"
+    );
+}
+
+#[test]
+fn workflow_journal_delegate_requests_survive_wire_round_trip() {
+    for (id, request, encoded_request) in [
+        (
+            19,
+            DelegateRequest::JournalPhase {
+                cell_id: cell_id("cell-1"),
+                title: "inspect".to_string(),
+            },
+            json!({
+                "type": "workflow/phase",
+                "cellId": "cell-1",
+                "title": "inspect",
+            }),
+        ),
+        (
+            20,
+            DelegateRequest::JournalLog {
+                cell_id: cell_id("cell-1"),
+                message: "found it".to_string(),
+            },
+            json!({
+                "type": "workflow/log",
+                "cellId": "cell-1",
+                "message": "found it",
+            }),
+        ),
+        (
+            21,
+            DelegateRequest::ReplayAgent {
+                cell_id: cell_id("cell-1"),
+                node_id: 4,
+                parent_node_id: Some(2),
+                phase: Some("inspect".to_string()),
+                entry: json!({ "ordinal": 0, "return": "cached" }),
+            },
+            json!({
+                "type": "workflow/replayAgent",
+                "cellId": "cell-1",
+                "nodeId": 4,
+                "parentNodeId": 2,
+                "phase": "inspect",
+                "entry": { "ordinal": 0, "return": "cached" },
+            }),
+        ),
+        (
+            22,
+            DelegateRequest::WorkflowBudget {
+                cell_id: cell_id("cell-1"),
+            },
+            json!({
+                "type": "workflow/budget",
+                "cellId": "cell-1",
+            }),
+        ),
+    ] {
+        assert_wire_round_trip(
+            HostToClient::DelegateRequest {
+                id: delegate_request_id(/*value*/ id),
+                session_id: session_id(),
+                request,
+            },
+            json!({
+                "type": "delegate/request",
+                "id": id,
+                "sessionId": "session-1",
+                "request": encoded_request,
+            }),
+        );
+    }
+}
+
+#[test]
+fn workflow_budget_delegate_response_survives_wire_round_trip() {
+    assert_wire_round_trip(
+        ClientToHost::DelegateResponse {
+            id: delegate_request_id(/*value*/ 22),
+            result: WireResult::Ok {
+                value: DelegateResponse::WorkflowBudget {
+                    snapshot: Some(WorkflowBudgetSnapshot {
+                        total: Some(100),
+                        spent: 40,
+                        remaining: Some(60),
+                    }),
+                },
+            },
+        },
+        json!({
+            "type": "delegate/response",
+            "id": 22,
+            "result": {
+                "status": "ok",
+                "value": {
+                    "type": "workflow/budget",
+                    "snapshot": {
+                        "total": 100,
+                        "spent": 40,
+                        "remaining": 60,
+                    },
+                },
+            },
+        }),
     );
 }
 
@@ -730,6 +873,9 @@ fn spawn_agent_delegate_request_survives_wire_round_trip() {
             session_id: session_id(),
             request: DelegateRequest::SpawnAgent {
                 cell_id: cell_id("cell-1"),
+                node_id: 9,
+                parent_node_id: Some(3),
+                phase: Some("inspect".to_string()),
                 prompt: "summarize the repo".to_string(),
                 ordinal: 7,
                 opts: Box::new(AgentCallOpts {
@@ -746,6 +892,9 @@ fn spawn_agent_delegate_request_survives_wire_round_trip() {
             "request": {
                 "type": "agent/spawn",
                 "cellId": "cell-1",
+                "nodeId": 9,
+                "parentNodeId": 3,
+                "phase": "inspect",
                 "prompt": "summarize the repo",
                 "ordinal": 7,
                 "opts": { "schema": { "type": "object" }, "model": "gpt-5" },

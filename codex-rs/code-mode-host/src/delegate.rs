@@ -8,6 +8,8 @@ use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::ToolInvocationFuture;
+use codex_code_mode_protocol::WorkflowBudgetSnapshotFuture;
+use codex_code_mode_protocol::WorkflowHostProgress;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateResponse;
 use codex_code_mode_protocol::host::SessionId;
@@ -48,7 +50,8 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 DelegateResponse::ToolResult { result } => Ok(result),
                 DelegateResponse::NotificationDelivered
                 | DelegateResponse::AgentSpawned { .. }
-                | DelegateResponse::WorkflowSpawned { .. } => {
+                | DelegateResponse::WorkflowSpawned { .. }
+                | DelegateResponse::WorkflowBudget { .. } => {
                     Err("code-mode client returned an invalid tool result".to_string())
                 }
             }
@@ -79,9 +82,29 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                 DelegateResponse::NotificationDelivered => Ok(()),
                 DelegateResponse::ToolResult { .. }
                 | DelegateResponse::AgentSpawned { .. }
-                | DelegateResponse::WorkflowSpawned { .. } => {
+                | DelegateResponse::WorkflowSpawned { .. }
+                | DelegateResponse::WorkflowBudget { .. } => {
                     Err("code-mode client returned an invalid notification result".to_string())
                 }
+            }
+        })
+    }
+
+    fn workflow_budget_snapshot<'a>(&'a self, cell_id: CellId) -> WorkflowBudgetSnapshotFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::WorkflowBudget {
+                        cell_id: cell_id.into(),
+                    },
+                    CancellationToken::new(),
+                )
+                .await?
+            {
+                DelegateResponse::WorkflowBudget { snapshot } => Ok(snapshot),
+                _ => Err("code-mode client returned an invalid budget result".to_string()),
             }
         })
     }
@@ -94,6 +117,9 @@ impl CodeModeSessionDelegate for RemoteDelegate {
     fn spawn_agent<'a>(
         &'a self,
         cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         opts: AgentCallOpts,
@@ -106,6 +132,9 @@ impl CodeModeSessionDelegate for RemoteDelegate {
                     self.session_id.clone(),
                     DelegateRequest::SpawnAgent {
                         cell_id: cell_id.into(),
+                        node_id,
+                        parent_node_id,
+                        phase,
                         prompt,
                         ordinal,
                         opts: Box::new(opts),
@@ -148,6 +177,102 @@ impl CodeModeSessionDelegate for RemoteDelegate {
             {
                 Ok(DelegateResponse::WorkflowSpawned { outcome }) => outcome.into(),
                 Ok(_) | Err(_) => AgentSpawnOutcome::Failed,
+            }
+        })
+    }
+
+    fn journal_phase<'a>(&'a self, cell_id: CellId, title: String) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::JournalPhase {
+                        cell_id: cell_id.into(),
+                        title,
+                    },
+                    CancellationToken::new(),
+                )
+                .await?
+            {
+                DelegateResponse::NotificationDelivered => Ok(()),
+                _ => Err("code-mode client returned an invalid phase result".to_string()),
+            }
+        })
+    }
+
+    fn journal_log<'a>(&'a self, cell_id: CellId, message: String) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::JournalLog {
+                        cell_id: cell_id.into(),
+                        message,
+                    },
+                    CancellationToken::new(),
+                )
+                .await?
+            {
+                DelegateResponse::NotificationDelivered => Ok(()),
+                _ => Err("code-mode client returned an invalid log result".to_string()),
+            }
+        })
+    }
+
+    fn replay_agent<'a>(
+        &'a self,
+        cell_id: CellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
+        entry: JsonValue,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::ReplayAgent {
+                        cell_id: cell_id.into(),
+                        node_id,
+                        parent_node_id,
+                        phase,
+                        entry,
+                    },
+                    CancellationToken::new(),
+                )
+                .await?
+            {
+                DelegateResponse::NotificationDelivered => Ok(()),
+                _ => Err("code-mode client returned an invalid replay result".to_string()),
+            }
+        })
+    }
+
+    fn workflow_progress<'a>(
+        &'a self,
+        cell_id: CellId,
+        progress: WorkflowHostProgress,
+    ) -> NotificationFuture<'a> {
+        Box::pin(async move {
+            match self
+                .peer
+                .call(
+                    self.session_id.clone(),
+                    DelegateRequest::WorkflowProgress {
+                        cell_id: cell_id.into(),
+                        progress: Box::new(progress),
+                    },
+                    CancellationToken::new(),
+                )
+                .await?
+            {
+                DelegateResponse::NotificationDelivered => Ok(()),
+                _ => {
+                    Err("code-mode client returned an invalid workflow progress result".to_string())
+                }
             }
         })
     }

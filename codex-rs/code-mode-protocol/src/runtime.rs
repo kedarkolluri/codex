@@ -44,6 +44,33 @@ pub struct ExecuteRequest {
     /// Serde-defaulted and skipped when absent for wire back-compat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Prior-run journal `agent_call` lines seeding prefix replay for a resumed
+    /// workflow. The entries ride with the execute request because they must be
+    /// installed before the workflow body starts; a delegate callback would be
+    /// too late for a process-owned host, whose cell is not routable client-side
+    /// until the execute request has returned its cell id.
+    ///
+    /// Raw JSON keeps the protocol crate independent of the workflow-journal
+    /// crate. Fresh runs and plain code-mode execs leave this empty, preserving
+    /// the pre-workflow wire shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay_entries: Vec<JsonValue>,
+    /// Initial run-local workflow budget view. The runtime installs a local,
+    /// monotonic mirror from this value and refreshes it after budget-affecting
+    /// host callbacks. Absent for plain code-mode cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_budget: Option<WorkflowBudgetSnapshot>,
+}
+
+/// Serializable view of one workflow run's effective budget.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkflowBudgetSnapshot {
+    /// Effective ceiling, or `None` when this run and its ancestors are unmetered.
+    pub total: Option<u64>,
+    /// Output tokens charged to the effective view so far.
+    pub spent: u64,
+    /// Remaining effective headroom, or `None` when unmetered.
+    pub remaining: Option<u64>,
 }
 
 /// Serde predicate: skip a `bool` field when it is `false`. Takes `&bool`

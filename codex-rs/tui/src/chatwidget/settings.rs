@@ -97,6 +97,10 @@ impl ChatWidget {
                 self.update_collaboration_mode_indicator();
             }
         }
+        if feature == Feature::Workflow {
+            self.workflow_feature_configured_enabled = enabled;
+            self.sync_workflow_command_enabled();
+        }
         if feature == Feature::MentionsV2 {
             self.sync_mentions_v2_enabled();
         }
@@ -294,6 +298,15 @@ impl ChatWidget {
     pub(super) fn sync_goal_command_enabled(&mut self) {
         self.bottom_pane
             .set_goal_command_enabled(self.config.features.enabled(Feature::Goals));
+    }
+
+    pub(super) fn sync_workflow_command_enabled(&mut self) {
+        self.bottom_pane
+            .set_workflow_command_enabled(self.config.features.enabled(Feature::Workflow));
+    }
+
+    pub(crate) fn set_workflow_feature_configured_enabled(&mut self, enabled: bool) {
+        self.workflow_feature_configured_enabled = enabled;
     }
 
     pub(super) fn sync_mentions_v2_enabled(&mut self) {

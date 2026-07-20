@@ -16,6 +16,7 @@
 //! 3.  We do **not** walk past the project root.
 
 use crate::config::Config;
+use crate::context::ContextualUserFragment;
 use crate::context::UserInstructions as ContextUserInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use codex_config::ConfigLayerSource;
@@ -42,11 +43,80 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// When both user and project AGENTS.md docs are present, they will be
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+const ENTRY_SEPARATOR: &str = "\n\n";
 
 // Metadata probes are cheap and the exec-server transport already bounds total in-flight calls.
 // This covers typical project hierarchies in one remote round trip without monopolizing that
 // transport when independent startup discovery runs concurrently.
 const MAX_CONCURRENT_ANCESTOR_PROBES: usize = 256;
+
+/// Tracks the complete model-visible cost introduced by project docs. Host-provided instructions
+/// are deliberately excluded, but the shared fragment wrapper, project transition, environment
+/// labels, inter-entry separators, and lossy UTF-8 expansion all consume this budget.
+struct ProjectDocContextBudget {
+    remaining_bytes: usize,
+    has_user_instructions: bool,
+    project_entry_count: usize,
+}
+
+impl ProjectDocContextBudget {
+    fn new(max_bytes: usize, has_user_instructions: bool) -> Self {
+        Self {
+            remaining_bytes: max_bytes,
+            has_user_instructions,
+            project_entry_count: 0,
+        }
+    }
+
+    fn next_entry_overhead(
+        &self,
+        environment_id: &str,
+        cwd: &PathUri,
+        environment_has_entry: bool,
+    ) -> usize {
+        let mut overhead = if self.project_entry_count == 0 {
+            let wrapper_bytes = ContextUserInstructions {
+                directory: None,
+                text: String::new(),
+            }
+            .render()
+            .len();
+            wrapper_bytes.saturating_add(
+                self.has_user_instructions
+                    .then_some(AGENTS_MD_SEPARATOR.len())
+                    .unwrap_or_default(),
+            )
+        } else {
+            ENTRY_SEPARATOR.len()
+        };
+
+        if !environment_has_entry {
+            let cwd_bytes = cwd.inferred_native_path_string().len();
+            let single_environment_label_bytes = " for ".len().saturating_add(cwd_bytes);
+            let multiple_environment_label_bytes = "for `"
+                .len()
+                .saturating_add(environment_id.len())
+                .saturating_add("` with root ".len())
+                .saturating_add(cwd_bytes)
+                .saturating_add(ENTRY_SEPARATOR.len());
+            overhead = overhead.saturating_add(
+                single_environment_label_bytes.max(multiple_environment_label_bytes),
+            );
+        }
+        overhead
+    }
+
+    fn available_text_bytes(&self, overhead: usize) -> usize {
+        self.remaining_bytes.saturating_sub(overhead)
+    }
+
+    fn commit_entry(&mut self, overhead: usize, text_bytes: usize) {
+        self.remaining_bytes = self
+            .remaining_bytes
+            .saturating_sub(overhead.saturating_add(text_bytes));
+        self.project_entry_count = self.project_entry_count.saturating_add(1);
+    }
+}
 
 /// Loads project AGENTS.md content and combines it with host-provided user
 /// instructions.
@@ -56,13 +126,21 @@ pub(crate) async fn load_project_instructions(
     environments: &TurnEnvironmentSnapshot,
 ) -> Option<LoadedAgentsMd> {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
+    let mut project_doc_budget = ProjectDocContextBudget::new(
+        config.project_doc_max_bytes,
+        loaded.user_instructions.is_some(),
+    );
     for turn_environment in &environments.turn_environments {
+        if project_doc_budget.remaining_bytes == 0 {
+            break;
+        }
         let filesystem = turn_environment.environment.get_filesystem();
         match read_agents_md(
             config,
             filesystem.as_ref(),
             &turn_environment.environment_id,
             turn_environment.cwd(),
+            &mut project_doc_budget,
         )
         .await
         {
@@ -91,10 +169,9 @@ async fn read_agents_md(
     fs: &dyn ExecutorFileSystem,
     environment_id: &str,
     cwd: &PathUri,
+    project_doc_budget: &mut ProjectDocContextBudget,
 ) -> io::Result<Option<LoadedAgentsMd>> {
-    let max_total = config.project_doc_max_bytes;
-
-    if max_total == 0 {
+    if project_doc_budget.remaining_bytes == 0 {
         return Ok(None);
     }
 
@@ -103,11 +180,14 @@ async fn read_agents_md(
         return Ok(None);
     }
 
-    let mut remaining: u64 = max_total as u64;
     let mut loaded = LoadedAgentsMd::default();
+    let mut environment_has_entry = false;
 
     for p in paths {
-        if remaining == 0 {
+        let overhead =
+            project_doc_budget.next_entry_overhead(environment_id, cwd, environment_has_entry);
+        let available_bytes = project_doc_budget.available_text_bytes(overhead);
+        if available_bytes == 0 {
             break;
         }
 
@@ -116,21 +196,33 @@ async fn read_agents_md(
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        let size = data.len() as u64;
-        if size > remaining {
-            data.truncate(remaining as usize);
+        let source_size = data.len();
+        if source_size > available_bytes {
+            data.truncate(available_bytes);
         }
 
-        if size > remaining {
+        let mut text = String::from_utf8_lossy(&data).into_owned();
+        let mut text_was_truncated = false;
+        if text.len() > available_bytes {
+            let mut retained_bytes = available_bytes;
+            while !text.is_char_boundary(retained_bytes) {
+                retained_bytes -= 1;
+            }
+            text.truncate(retained_bytes);
+            text_was_truncated = true;
+        }
+
+        if source_size > available_bytes || text_was_truncated {
             tracing::warn!(
                 path = %p,
-                remaining_bytes = remaining,
+                remaining_bytes = available_bytes,
                 "project doc exceeds remaining budget; truncating"
             );
         }
 
-        let text = String::from_utf8_lossy(&data).to_string();
         if !text.trim().is_empty() {
+            project_doc_budget.commit_entry(overhead, text.len());
+            environment_has_entry = true;
             loaded.entries.push(InstructionEntry {
                 contents: text,
                 provenance: InstructionProvenance::Project {
@@ -139,7 +231,6 @@ async fn read_agents_md(
                     cwd: cwd.clone(),
                 },
             });
-            remaining = remaining.saturating_sub(data.len() as u64);
         }
     }
 

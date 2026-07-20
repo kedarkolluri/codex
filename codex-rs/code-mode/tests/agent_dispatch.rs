@@ -27,6 +27,8 @@ use codex_code_mode::InProcessCodeModeSession;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::RuntimeResponse;
 use codex_code_mode::ToolInvocationFuture;
+use codex_code_mode::WorkflowBudgetSnapshot;
+use codex_code_mode::WorkflowBudgetSnapshotFuture;
 use serde_json::Value as JsonValue;
 use serde_json::json;
 use tokio::sync::Barrier;
@@ -104,6 +106,9 @@ impl CodeModeSessionDelegate for FixtureAgentDelegate {
     fn spawn_agent<'a>(
         &'a self,
         _cell_id: CellId,
+        _node_id: u64,
+        _parent_node_id: Option<u64>,
+        _phase: Option<String>,
         prompt: String,
         _ordinal: u64,
         _opts: AgentCallOpts,
@@ -132,6 +137,20 @@ impl CodeModeSessionDelegate for FixtureAgentDelegate {
         })
     }
 
+    fn workflow_budget_snapshot<'a>(
+        &'a self,
+        _cell_id: CellId,
+    ) -> WorkflowBudgetSnapshotFuture<'a> {
+        let spent = (self.spawn_calls() as u64).saturating_mul(40).min(100);
+        Box::pin(async move {
+            Ok(Some(WorkflowBudgetSnapshot {
+                total: Some(100),
+                spent,
+                remaining: Some(100 - spent),
+            }))
+        })
+    }
+
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
@@ -148,6 +167,8 @@ fn workflow_request(source: &str) -> ExecuteRequest {
         workflow: true,
         args: None,
         run_id: None,
+        replay_entries: Vec::new(),
+        workflow_budget: None,
     }
 }
 
@@ -201,6 +222,52 @@ async fn agent_call_resolves_to_child_final_text() {
     );
     // The `agent()` event dispatched to `spawn_agent` exactly once.
     assert_eq!(delegate.spawn_calls(), 1);
+}
+
+/// The in-process host starts from the serializable run snapshot and refreshes
+/// the isolate-owned mirror before settling an `agent()` promise.
+#[tokio::test]
+async fn workflow_budget_refreshes_after_agent_in_process() {
+    let delegate = Arc::new(FixtureAgentDelegate::new(|_| {
+        AgentSpawnOutcome::Completed(JsonValue::String("done".to_string()))
+    }));
+    let mut request = workflow_request(
+        r#"
+text(String(budget.spent()));
+text(String(budget.remaining()));
+await agent("p");
+text(String(budget.spent()));
+text(String(budget.remaining()));
+"#,
+    );
+    request.workflow_budget = Some(WorkflowBudgetSnapshot {
+        total: Some(100),
+        spent: 0,
+        remaining: Some(100),
+    });
+    let service = InProcessCodeModeSession::with_delegate(delegate);
+    let response = tokio::time::timeout(Duration::from_secs(30), async {
+        service
+            .execute(request)
+            .await
+            .expect("start workflow cell")
+            .initial_response()
+            .await
+            .expect("workflow cell result")
+    })
+    .await
+    .expect("workflow completed before timeout");
+    service.shutdown().await.expect("shutdown service");
+
+    assert_eq!(
+        result_texts(&response),
+        vec![
+            "0".to_string(),
+            "100".to_string(),
+            "40".to_string(),
+            "60".to_string(),
+        ]
+    );
 }
 
 /// A structured-output `agent(prompt, {schema})` whose host resolves to a JSON *object* surfaces in

@@ -84,6 +84,38 @@ async fn list_threads(mcp: &mut TestAppServer) -> Result<ThreadListResponse> {
 }
 
 #[tokio::test]
+async fn thread_fork_rejects_reserved_workflow_thread_source() -> Result<()> {
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri())?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let request_id = mcp
+        .send_thread_fork_request(ThreadForkParams {
+            thread_id: ThreadId::new().to_string(),
+            thread_source: Some(ThreadSource::Feature("workflow".to_string())),
+            ..Default::default()
+        })
+        .await?;
+    let error: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+
+    assert_eq!(error.error.code, -32600);
+    assert_eq!(
+        error.error.message,
+        "thread source `workflow` is reserved for workflow supervisors"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_fork_creates_new_thread_and_emits_started() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;

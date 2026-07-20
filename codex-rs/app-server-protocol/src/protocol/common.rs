@@ -665,6 +665,60 @@ client_request_definitions! {
         serialization: global_shared_read("config"),
         response: v2::SkillsListResponse,
     },
+    #[experimental("workflow/list")]
+    WorkflowList => "workflow/list" {
+        params: v2::WorkflowListParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::WorkflowListResponse,
+    },
+    #[experimental("workflow/read")]
+    WorkflowRead => "workflow/read" {
+        params: v2::WorkflowReadParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::WorkflowReadResponse,
+    },
+    #[experimental("workflow/start")]
+    WorkflowStart => "workflow/start" {
+        params: v2::WorkflowStartParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::WorkflowStartResponse,
+    },
+    #[experimental("workflow/save")]
+    WorkflowSave => "workflow/save" {
+        params: v2::WorkflowSaveParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::WorkflowSaveResponse,
+    },
+    #[experimental("workflow/stop")]
+    WorkflowStop => "workflow/stop" {
+        params: v2::WorkflowStopParams,
+        // Intentionally concurrent: overlapping callers atomically join the
+        // same thread-owned cleanup and can distinguish who requested it.
+        serialization: None,
+        response: v2::WorkflowStopResponse,
+    },
+    #[experimental("workflow/pause")]
+    WorkflowPause => "workflow/pause" {
+        params: v2::WorkflowPauseParams,
+        // Intentionally concurrent: overlapping callers atomically join the
+        // same checkpoint barrier and can distinguish who requested it.
+        serialization: None,
+        response: v2::WorkflowPauseResponse,
+    },
+    #[experimental("workflow/resume")]
+    WorkflowResume => "workflow/resume" {
+        params: v2::WorkflowResumeParams,
+        serialization: thread_id(params.thread_id),
+        response: v2::WorkflowResumeResponse,
+    },
+    #[experimental("workflow/agent/control")]
+    WorkflowAgentControl => "workflow/agent/control" {
+        params: v2::WorkflowAgentControlParams,
+        // Intentionally concurrent: same-action duplicates join one cleanup,
+        // while conflicting actions race through core's immutable first writer.
+        serialization: None,
+        response: v2::WorkflowAgentControlResponse,
+    },
     SkillsExtraRootsSet => "skills/extraRoots/set" {
         params: v2::SkillsExtraRootsSetParams,
         serialization: global("config"),
@@ -1364,10 +1418,37 @@ macro_rules! server_request_definitions {
 
 /// Generates `ServerNotification` enum and helpers, including a JSON Schema
 /// exporter for each notification.
+macro_rules! experimental_notification_method_entry {
+    ([#[experimental($reason:expr)] $($rest:tt)*] [$wire:literal]) => {
+        $wire
+    };
+    ([#[experimental($reason:expr)] $($rest:tt)*] []) => {
+        $reason
+    };
+    ([#[$other:meta] $($rest:tt)*] $wire:tt) => {
+        experimental_notification_method_entry!([$($rest)*] $wire)
+    };
+    ([] $wire:tt) => {
+        ""
+    };
+}
+
+macro_rules! experimental_notification_type_entry {
+    ([#[experimental($reason:expr)] $($rest:tt)*] $payload:ty) => {
+        stringify!($payload)
+    };
+    ([#[$other:meta] $($rest:tt)*] $payload:ty) => {
+        experimental_notification_type_entry!([$($rest)*] $payload)
+    };
+    ([] $payload:ty) => {
+        ""
+    };
+}
+
 macro_rules! server_notification_definitions {
     (
         $(
-            $(#[$variant_meta:meta])*
+            $(#[$($variant_meta:tt)*])*
             $variant:ident $(=> $wire:literal)? ( $payload:ty )
         ),* $(,)?
     ) => {
@@ -1387,7 +1468,7 @@ macro_rules! server_notification_definitions {
         #[strum(serialize_all = "camelCase")]
         pub enum ServerNotification {
             $(
-                $(#[$variant_meta])*
+                $(#[$($variant_meta)*])*
                 $(#[serde(rename = $wire)] #[ts(rename = $wire)] #[strum(serialize = $wire)])?
                 $variant($payload),
             )*
@@ -1417,6 +1498,20 @@ macro_rules! server_notification_definitions {
             $(schemas.push(crate::export::write_json_schema::<$payload>(out_dir, stringify!($payload))?);)*
             Ok(schemas)
         }
+
+        pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_METHODS: &[&str] = &[
+            $(
+                experimental_notification_method_entry!(
+                    [$(#[$($variant_meta)*])*]
+                    [$($wire)?]
+                ),
+            )*
+        ];
+        pub(crate) const EXPERIMENTAL_SERVER_NOTIFICATION_TYPES: &[&str] = &[
+            $(
+                experimental_notification_type_entry!([$(#[$($variant_meta)*])*] $payload),
+            )*
+        ];
     };
 }
 /// Notifications sent from the client to the server.
@@ -1610,13 +1705,6 @@ pub struct FuzzyFileSearchSessionCompletedNotification {
     pub session_id: String,
 }
 
-/// Notification emitted when watched saved-workflow files change.
-///
-/// Treat this as an invalidation signal and re-discover saved workflows when
-/// refreshed workflow metadata is needed. Mirrors [`v2::SkillsChangedNotification`].
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS, Default)]
-pub struct WorkflowsChangedNotification {}
-
 server_notification_definitions! {
     /// NEW NOTIFICATIONS
     Error => "error" (v2::ErrorNotification),
@@ -1627,7 +1715,27 @@ server_notification_definitions! {
     ThreadUnarchived => "thread/unarchived" (v2::ThreadUnarchivedNotification),
     ThreadClosed => "thread/closed" (v2::ThreadClosedNotification),
     SkillsChanged => "skills/changed" (v2::SkillsChangedNotification),
-    WorkflowsChanged => "workflows/changed" (WorkflowsChangedNotification),
+    WorkflowsChanged => "workflows/changed" (v2::WorkflowsChangedNotification),
+    #[experimental("workflow/started")]
+    WorkflowStarted => "workflow/started" (v2::WorkflowStartedNotification),
+    #[experimental("workflow/phase/changed")]
+    WorkflowPhaseChanged => "workflow/phase/changed" (v2::WorkflowPhaseChangedNotification),
+    #[experimental("workflow/group/started")]
+    WorkflowGroupStarted => "workflow/group/started" (v2::WorkflowGroupStartedNotification),
+    #[experimental("workflow/group/completed")]
+    WorkflowGroupCompleted => "workflow/group/completed" (v2::WorkflowGroupCompletedNotification),
+    #[experimental("workflow/agent/started")]
+    WorkflowAgentStarted => "workflow/agent/started" (v2::WorkflowAgentStartedNotification),
+    #[experimental("workflow/agent/bound")]
+    WorkflowAgentBound => "workflow/agent/bound" (v2::WorkflowAgentBoundNotification),
+    #[experimental("workflow/agent/updated")]
+    WorkflowAgentUpdated => "workflow/agent/updated" (v2::WorkflowAgentUpdatedNotification),
+    #[experimental("workflow/agent/completed")]
+    WorkflowAgentCompleted => "workflow/agent/completed" (v2::WorkflowAgentCompletedNotification),
+    #[experimental("workflow/log")]
+    WorkflowLog => "workflow/log" (v2::WorkflowLogNotification),
+    #[experimental("workflow/completed")]
+    WorkflowCompleted => "workflow/completed" (v2::WorkflowCompletedNotification),
     ThreadNameUpdated => "thread/name/updated" (v2::ThreadNameUpdatedNotification),
     ThreadGoalUpdated => "thread/goal/updated" (v2::ThreadGoalUpdatedNotification),
     ThreadGoalCleared => "thread/goal/cleared" (v2::ThreadGoalClearedNotification),
@@ -1879,6 +1987,111 @@ mod tests {
             skills_list.serialization_scope(),
             Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
         );
+
+        let workflow_list = ClientRequest::WorkflowList {
+            request_id: request_id(),
+            params: v2::WorkflowListParams {
+                thread_id: "thread-a".to_string(),
+                cursor: None,
+                limit: None,
+            },
+        };
+        assert_eq!(
+            workflow_list.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "thread-a".to_string()
+            })
+        );
+
+        let workflow_read = ClientRequest::WorkflowRead {
+            request_id: request_id(),
+            params: v2::WorkflowReadParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+            },
+        };
+        assert_eq!(
+            workflow_read.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "thread-a".to_string()
+            })
+        );
+
+        let workflow_start = ClientRequest::WorkflowStart {
+            request_id: request_id(),
+            params: v2::WorkflowStartParams {
+                thread_id: "thread-a".to_string(),
+                name: "release-audit".to_string(),
+                args: None,
+            },
+        };
+        assert_eq!(
+            workflow_start.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "thread-a".to_string()
+            })
+        );
+
+        let workflow_save = ClientRequest::WorkflowSave {
+            request_id: request_id(),
+            params: v2::WorkflowSaveParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+                name: "release-audit".to_string(),
+                scope: v2::WorkflowSaveScope::Project,
+                overwrite: false,
+            },
+        };
+        assert_eq!(
+            workflow_save.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "thread-a".to_string()
+            })
+        );
+
+        let workflow_stop = ClientRequest::WorkflowStop {
+            request_id: request_id(),
+            params: v2::WorkflowStopParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+            },
+        };
+        assert_eq!(workflow_stop.serialization_scope(), None);
+
+        let workflow_pause = ClientRequest::WorkflowPause {
+            request_id: request_id(),
+            params: v2::WorkflowPauseParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+            },
+        };
+        assert_eq!(workflow_pause.serialization_scope(), None);
+
+        let workflow_resume = ClientRequest::WorkflowResume {
+            request_id: request_id(),
+            params: v2::WorkflowResumeParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+            },
+        };
+        assert_eq!(
+            workflow_resume.serialization_scope(),
+            Some(ClientRequestSerializationScope::Thread {
+                thread_id: "thread-a".to_string()
+            })
+        );
+
+        let workflow_agent_control = ClientRequest::WorkflowAgentControl {
+            request_id: request_id(),
+            params: v2::WorkflowAgentControlParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+                node_id: 7,
+                attempt: 2,
+                action: v2::WorkflowAgentControlAction::Retry,
+            },
+        };
+        assert_eq!(workflow_agent_control.serialization_scope(), None);
 
         let skills_extra_roots_set = ClientRequest::SkillsExtraRootsSet {
             request_id: request_id(),
@@ -3550,6 +3763,283 @@ mod tests {
         };
         let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
         assert_eq!(reason, Some("mock/experimentalMethod"));
+    }
+
+    #[test]
+    fn workflow_list_is_marked_experimental() {
+        let request = ClientRequest::WorkflowList {
+            request_id: RequestId::Integer(1),
+            params: v2::WorkflowListParams {
+                thread_id: "thread-a".to_string(),
+                cursor: None,
+                limit: None,
+            },
+        };
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
+        assert_eq!(reason, Some("workflow/list"));
+    }
+
+    #[test]
+    fn workflow_read_is_marked_experimental() {
+        let request = ClientRequest::WorkflowRead {
+            request_id: RequestId::Integer(1),
+            params: v2::WorkflowReadParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+            },
+        };
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
+        assert_eq!(reason, Some("workflow/read"));
+    }
+
+    #[test]
+    fn workflow_start_is_marked_experimental() {
+        let request = ClientRequest::WorkflowStart {
+            request_id: RequestId::Integer(1),
+            params: v2::WorkflowStartParams {
+                thread_id: "thread-a".to_string(),
+                name: "release-audit".to_string(),
+                args: Some(serde_json::json!({"target": "main"})),
+            },
+        };
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
+        assert_eq!(reason, Some("workflow/start"));
+    }
+
+    #[test]
+    fn workflow_stop_is_marked_experimental() {
+        let request = ClientRequest::WorkflowStop {
+            request_id: RequestId::Integer(1),
+            params: v2::WorkflowStopParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+            },
+        };
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
+        assert_eq!(reason, Some("workflow/stop"));
+    }
+
+    #[test]
+    fn workflow_controls_are_marked_experimental() {
+        let requests = [
+            (
+                ClientRequest::WorkflowPause {
+                    request_id: RequestId::Integer(1),
+                    params: v2::WorkflowPauseParams {
+                        thread_id: "thread-a".to_string(),
+                        run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+                    },
+                },
+                "workflow/pause",
+            ),
+            (
+                ClientRequest::WorkflowResume {
+                    request_id: RequestId::Integer(2),
+                    params: v2::WorkflowResumeParams {
+                        thread_id: "thread-a".to_string(),
+                        run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+                    },
+                },
+                "workflow/resume",
+            ),
+            (
+                ClientRequest::WorkflowAgentControl {
+                    request_id: RequestId::Integer(3),
+                    params: v2::WorkflowAgentControlParams {
+                        thread_id: "thread-a".to_string(),
+                        run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+                        node_id: 7,
+                        attempt: 0,
+                        action: v2::WorkflowAgentControlAction::Skip,
+                    },
+                },
+                "workflow/agent/control",
+            ),
+        ];
+        for (request, expected_reason) in requests {
+            assert_eq!(
+                crate::experimental_api::ExperimentalApi::experimental_reason(&request),
+                Some(expected_reason)
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_control_params_reject_secret_and_ambiguous_fields() {
+        let run_id = "0198d9a4-9c96-7e11-8b05-f7aa47280743";
+        for forbidden_field in ["source", "path", "args", "name"] {
+            for (method, mut params) in [
+                (
+                    "pause",
+                    serde_json::json!({"threadId":"thread-a","runId":run_id}),
+                ),
+                (
+                    "resume",
+                    serde_json::json!({"threadId":"thread-a","runId":run_id}),
+                ),
+                (
+                    "agent control",
+                    serde_json::json!({
+                        "threadId":"thread-a",
+                        "runId":run_id,
+                        "nodeId":7,
+                        "attempt":0,
+                        "action":"skip",
+                    }),
+                ),
+            ] {
+                params[forbidden_field] = serde_json::json!("untrusted input");
+                let error = match method {
+                    "pause" => serde_json::from_value::<v2::WorkflowPauseParams>(params)
+                        .expect_err("pause must reject unexpected input"),
+                    "resume" => serde_json::from_value::<v2::WorkflowResumeParams>(params)
+                        .expect_err("resume must reject unexpected input"),
+                    "agent control" => {
+                        serde_json::from_value::<v2::WorkflowAgentControlParams>(params)
+                            .expect_err("agent control must reject unexpected input")
+                    }
+                    _ => unreachable!("closed test method set"),
+                };
+                assert!(error.to_string().contains("unknown field"));
+            }
+        }
+
+        for action in ["interrupt", "restart", "SKIP"] {
+            serde_json::from_value::<v2::WorkflowAgentControlParams>(serde_json::json!({
+                "threadId":"thread-a",
+                "runId":run_id,
+                "nodeId":7,
+                "attempt":0,
+                "action":action,
+            }))
+            .expect_err("agent action must be the closed camelCase skip/retry enum");
+        }
+    }
+
+    #[test]
+    fn workflow_control_responses_use_typed_camel_case_dispositions() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_value(v2::WorkflowPauseResponse {
+                disposition: v2::WorkflowPauseDisposition::AlreadyRequested,
+            })?,
+            serde_json::json!({"disposition":"alreadyRequested"})
+        );
+        assert_eq!(
+            serde_json::to_value(v2::WorkflowAgentControlResponse::RetryScheduled { attempt: 3 })?,
+            serde_json::json!({"disposition":"retryScheduled","attempt":3})
+        );
+        assert_eq!(
+            serde_json::to_value(v2::WorkflowAgentControlResponse::RetryLimitReached)?,
+            serde_json::json!({"disposition":"retryLimitReached"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_save_is_marked_experimental() {
+        let request = ClientRequest::WorkflowSave {
+            request_id: RequestId::Integer(1),
+            params: v2::WorkflowSaveParams {
+                thread_id: "thread-a".to_string(),
+                run_id: "0198d9a4-9c96-7e11-8b05-f7aa47280743".to_string(),
+                name: "release-audit".to_string(),
+                scope: v2::WorkflowSaveScope::Personal,
+                overwrite: false,
+            },
+        };
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&request);
+        assert_eq!(reason, Some("workflow/save"));
+    }
+
+    #[test]
+    fn workflow_save_response_uses_typed_dispositions() -> anyhow::Result<()> {
+        for (disposition, value) in [
+            (v2::WorkflowSaveDisposition::Created, "created"),
+            (v2::WorkflowSaveDisposition::Overwritten, "overwritten"),
+            (v2::WorkflowSaveDisposition::Conflict, "conflict"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(v2::WorkflowSaveResponse { disposition })?,
+                serde_json::json!({"disposition": value})
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_save_rejects_unexpected_or_incomplete_input() {
+        for forbidden_field in ["source", "path", "args"] {
+            let mut params = serde_json::json!({
+                "threadId": "thread-a",
+                "runId": "0198d9a4-9c96-7e11-8b05-f7aa47280743",
+                "name": "release-audit",
+                "scope": "project",
+                "overwrite": false,
+            });
+            params[forbidden_field] = serde_json::json!("untrusted input");
+            let error = serde_json::from_value::<v2::WorkflowSaveParams>(params)
+                .expect_err("unexpected workflow save input must be rejected");
+            assert!(error.to_string().contains("unknown field"));
+        }
+
+        let missing_overwrite = serde_json::json!({
+            "threadId": "thread-a",
+            "runId": "0198d9a4-9c96-7e11-8b05-f7aa47280743",
+            "name": "release-audit",
+            "scope": "project",
+        });
+        let error = serde_json::from_value::<v2::WorkflowSaveParams>(missing_overwrite)
+            .expect_err("overwrite must be explicit");
+        assert!(error.to_string().contains("missing field `overwrite`"));
+
+        let codex_home_scope = serde_json::json!({
+            "threadId": "thread-a",
+            "runId": "0198d9a4-9c96-7e11-8b05-f7aa47280743",
+            "name": "release-audit",
+            "scope": "codexHome",
+            "overwrite": false,
+        });
+        serde_json::from_value::<v2::WorkflowSaveParams>(codex_home_scope)
+            .expect_err("save scope must be project or personal");
+    }
+
+    #[test]
+    fn workflow_stop_response_uses_typed_camel_case_dispositions() -> anyhow::Result<()> {
+        assert_eq!(
+            serde_json::to_value(v2::WorkflowStopResponse {
+                disposition: v2::WorkflowStopDisposition::Applied,
+            })?,
+            serde_json::json!({"disposition": "applied"})
+        );
+        assert_eq!(
+            serde_json::to_value(v2::WorkflowStopResponse {
+                disposition: v2::WorkflowStopDisposition::AlreadyRequested,
+            })?,
+            serde_json::json!({"disposition": "alreadyRequested"})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workflows_changed_notification_remains_stable() {
+        let notification =
+            ServerNotification::WorkflowsChanged(v2::WorkflowsChangedNotification::default());
+        let reason = crate::experimental_api::ExperimentalApi::experimental_reason(&notification);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn workflow_start_rejects_raw_source_and_path_fields() {
+        for forbidden_field in ["source", "path"] {
+            let mut params = serde_json::json!({
+                "threadId": "thread-a",
+                "name": "release-audit",
+            });
+            params[forbidden_field] = serde_json::json!("untrusted input");
+            let error = serde_json::from_value::<v2::WorkflowStartParams>(params)
+                .expect_err("raw workflow input must be rejected");
+            assert!(error.to_string().contains("unknown field"));
+        }
     }
 
     #[test]

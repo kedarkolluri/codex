@@ -1,0 +1,19 @@
+---
+source: tui/src/chatwidget/tests/workflows.rs
+expression: "render_bottom_popup(&chat, 100)"
+---
+  Saved workflows
+  The workflow registry could not be refreshed.
+
+›    Could not load saved workflows  registry unavailable detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail detail detail detail detail detail detail detail
+                                     detail d…
+
+  Press esc to go back

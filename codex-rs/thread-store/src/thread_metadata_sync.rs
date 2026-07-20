@@ -12,6 +12,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadMemoryMode;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::UserMessageEvent;
 use codex_protocol::protocol::strip_user_message_prefix;
 use codex_protocol::protocol::user_message_preview;
@@ -209,7 +210,10 @@ impl ThreadMetadataSync {
                 RolloutItem::SessionMeta(meta_line) if meta_line.meta.id == self.thread_id => {
                     update.created_at = parse_session_timestamp(meta_line.meta.timestamp.as_str());
                     update.source = Some(meta_line.meta.source.clone());
-                    update.thread_source = Some(meta_line.meta.thread_source.clone());
+                    update.thread_source = merge_thread_source_updates(
+                        update.thread_source.take(),
+                        Some(meta_line.meta.thread_source.clone()),
+                    );
                     update.agent_nickname = Some(meta_line.meta.agent_nickname.clone());
                     update.agent_role = Some(meta_line.meta.agent_role.clone());
                     update.agent_path = Some(meta_line.meta.agent_path.clone());
@@ -306,10 +310,31 @@ impl ThreadMetadataSync {
             return;
         };
         match self.pending_update.as_mut() {
-            Some(pending_update) => pending_update.merge(update),
+            Some(pending_update) => {
+                let thread_source = merge_thread_source_updates(
+                    pending_update.thread_source.take(),
+                    update.thread_source.clone(),
+                );
+                pending_update.merge(update);
+                pending_update.thread_source = thread_source;
+            }
             None => self.pending_update = Some(update),
         }
         self.pending_update_generation = self.pending_update_generation.wrapping_add(1);
+    }
+}
+
+fn merge_thread_source_updates(
+    current: Option<Option<ThreadSource>>,
+    next: Option<Option<ThreadSource>>,
+) -> Option<Option<ThreadSource>> {
+    let workflow_managed = |source: Option<&ThreadSource>| matches!(source, Some(ThreadSource::Feature(feature)) if feature == "workflow");
+    if workflow_managed(current.as_ref().and_then(Option::as_ref)) {
+        current
+    } else if workflow_managed(next.as_ref().and_then(Option::as_ref)) {
+        next
+    } else {
+        next.or(current)
     }
 }
 
@@ -383,6 +408,7 @@ mod tests {
     use codex_protocol::protocol::ThreadGoal;
     use codex_protocol::protocol::ThreadGoalStatus;
     use codex_protocol::protocol::ThreadGoalUpdatedEvent;
+    use codex_protocol::protocol::ThreadSource;
     use codex_protocol::protocol::TurnStartedEvent;
     use codex_protocol::protocol::UserMessageEvent;
     use codex_protocol::user_input::UserInput;
@@ -573,6 +599,38 @@ mod tests {
             .is_some(),
             "the first append should flush resume metadata together with append metadata"
         );
+    }
+
+    #[test]
+    fn workflow_thread_source_is_sticky_across_resume_and_append_metadata() {
+        let workflow_source = ThreadSource::Feature("workflow".to_string());
+        let other_source = ThreadSource::Feature("other".to_string());
+
+        for (resume_source, append_source) in [
+            (Some(workflow_source.clone()), Some(other_source.clone())),
+            (Some(workflow_source.clone()), None),
+            (Some(other_source), Some(workflow_source.clone())),
+            (None, Some(workflow_source.clone())),
+        ] {
+            let thread_id = ThreadId::new();
+            let mut resumed_meta = session_meta(thread_id);
+            resumed_meta.meta.thread_source = resume_source;
+            let mut sync = ThreadMetadataSync::for_resume(&resume_params(
+                thread_id,
+                vec![RolloutItem::SessionMeta(resumed_meta)],
+            ));
+            let mut appended_meta = session_meta(thread_id);
+            appended_meta.meta.thread_source = append_source;
+
+            let update = sync
+                .observe_appended_items(&[RolloutItem::SessionMeta(appended_meta)])
+                .expect("session metadata append should produce an update");
+
+            assert_eq!(
+                update.patch.thread_source,
+                Some(Some(workflow_source.clone()))
+            );
+        }
     }
 
     fn resume_params(thread_id: ThreadId, history: Vec<RolloutItem>) -> ResumeThreadParams {

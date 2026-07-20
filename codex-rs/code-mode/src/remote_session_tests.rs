@@ -91,6 +91,8 @@ async fn provider_falls_back_to_in_process_session_when_host_is_missing() {
             workflow: false,
             args: None,
             run_id: None,
+            replay_entries: Vec::new(),
+            workflow_budget: None,
         })
         .await
         .expect("execute fallback session")
@@ -125,6 +127,8 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
             workflow: false,
             args: None,
             run_id: None,
+            replay_entries: Vec::new(),
+            workflow_budget: None,
         })
         .await
         .err()

@@ -1,5 +1,6 @@
 use crate::SkillsService;
 use crate::agent::AgentControl;
+use crate::agent::control::is_workflow_managed_thread_source;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -13,6 +14,7 @@ use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
 use crate::session::INITIAL_SUBMIT_ID;
+use crate::session::StartTurnIfIdleOutcome;
 use crate::session::resolve_multi_agent_version;
 use crate::tasks::InterruptedTurnHistoryMarker;
 use crate::tasks::interrupted_turn_history_marker;
@@ -84,6 +86,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::RwLock;
+use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tracing::instrument;
 use tracing::warn;
@@ -229,9 +232,14 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
     pub(crate) agent_control: AgentControl,
     pub(crate) session_source: SessionSource,
     pub(crate) parent_thread_id: Option<ThreadId>,
+    pub(crate) thread_source: Option<ThreadSource>,
     pub(crate) inherited_environments: Option<TurnEnvironmentSnapshot>,
     pub(crate) inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
 }
+
+/// Reader budget for fresh spawn registration. Recursive collaboration mutations acquire the
+/// complete budget, while each concurrent spawn holds one permit through edge persistence.
+pub(crate) const GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS: u32 = 1 << 20;
 
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
 /// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
@@ -255,6 +263,9 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
+    /// Serializes generic recursive collaboration mutations against child registration across all
+    /// `AgentControl` handles backed by this manager.
+    generic_collaboration_subtree_gate: Semaphore,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -357,6 +368,9 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
+                generic_collaboration_subtree_gate: Semaphore::new(
+                    GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS as usize,
+                ),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -475,6 +489,9 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
+                generic_collaboration_subtree_gate: Semaphore::new(
+                    GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS as usize,
+                ),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
             }),
@@ -569,6 +586,12 @@ impl ThreadManager {
         self.state.get_thread(thread_id).await
     }
 
+    /// Returns whether either live or persisted authority marks this thread as
+    /// owned by a Dynamic Workflows supervisor.
+    pub async fn is_workflow_managed_thread(&self, thread_id: ThreadId) -> bool {
+        self.state.is_workflow_managed_thread(thread_id).await
+    }
+
     /// Updates metadata for loaded and cold threads through one entrypoint.
     ///
     /// Loaded threads route through `CodexThread`/`LiveThread`, so metadata changes stay ordered
@@ -577,9 +600,16 @@ impl ThreadManager {
     pub async fn update_thread_metadata(
         &self,
         thread_id: ThreadId,
-        patch: ThreadMetadataPatch,
+        mut patch: ThreadMetadataPatch,
         include_archived: bool,
     ) -> CodexResult<StoredThread> {
+        if is_workflow_managed_thread_source(patch.thread_source.as_ref().and_then(Option::as_ref))
+        {
+            return Err(CodexErr::InvalidRequest(
+                "workflow-managed thread ownership cannot be assigned through metadata updates"
+                    .to_string(),
+            ));
+        }
         if let Ok(thread) = self.get_thread(thread_id).await {
             if thread.config_snapshot().await.ephemeral {
                 return Err(CodexErr::InvalidRequest(format!(
@@ -590,6 +620,24 @@ impl ThreadManager {
                 .update_thread_metadata(patch, include_archived)
                 .await
                 .map_err(|err| thread_store_metadata_update_error(thread_id, err));
+        }
+        let stored_thread = self
+            .state
+            .thread_store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived,
+                include_history: false,
+            })
+            .await
+            .map_err(|err| match err {
+                ThreadStoreError::ThreadNotFound { thread_id } => {
+                    CodexErr::ThreadNotFound(thread_id)
+                }
+                err => thread_store_metadata_update_error(thread_id, err),
+            })?;
+        if is_workflow_managed_thread_source(stored_thread.thread_source.as_ref()) {
+            patch.thread_source = None;
         }
         self.state
             .thread_store
@@ -1025,6 +1073,11 @@ impl ThreadManager {
         parent_trace: Option<W3cTraceContext>,
         supports_openai_form_elicitation: bool,
     ) -> CodexResult<NewThread> {
+        if initial_history_workflow_thread_source(&history).is_some() {
+            return Err(CodexErr::InvalidRequest(
+                "workflow-managed threads cannot be forked".to_string(),
+            ));
+        }
         // `forked_from_id()` describes this history's existing lineage. When
         // forking a resumed thread, the child copies the resumed thread itself.
         let source_thread_id = match &history {
@@ -1087,7 +1140,31 @@ impl ThreadManager {
     }
 }
 
+fn initial_history_workflow_thread_source(history: &InitialHistory) -> Option<&ThreadSource> {
+    history
+        .get_rollout_items()
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line
+                .meta
+                .thread_source
+                .as_ref()
+                .filter(|source| is_workflow_managed_thread_source(Some(*source))),
+            RolloutItem::ResponseItem(_)
+            | RolloutItem::Compacted(_)
+            | RolloutItem::EventMsg(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::WorldState(_) => None,
+        })
+}
+
 impl ThreadManagerState {
+    pub(crate) fn generic_collaboration_subtree_gate(&self) -> &Semaphore {
+        &self.generic_collaboration_subtree_gate
+    }
+
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {
         self.agent_graph_store.clone()
     }
@@ -1133,6 +1210,24 @@ impl ThreadManagerState {
         }
     }
 
+    pub(crate) async fn is_workflow_managed_thread(&self, thread_id: ThreadId) -> bool {
+        if self
+            .get_thread(thread_id)
+            .await
+            .is_ok_and(|thread| thread.is_workflow_managed_agent())
+        {
+            return true;
+        }
+
+        self.read_stored_thread(ReadThreadParams {
+            thread_id,
+            include_archived: true,
+            include_history: false,
+        })
+        .await
+        .is_ok_and(|thread| is_workflow_managed_thread_source(thread.thread_source.as_ref()))
+    }
+
     pub(crate) async fn read_stored_thread(
         &self,
         params: ReadThreadParams,
@@ -1167,6 +1262,21 @@ impl ThreadManagerState {
             log.push((thread_id, op.clone()));
         }
         thread.submit(op).await
+    }
+
+    /// Submit user input whose fresh-turn admission is decided by the serialized session loop.
+    pub(crate) async fn send_user_input_if_idle(
+        &self,
+        thread_id: ThreadId,
+        op: Op,
+    ) -> CodexResult<StartTurnIfIdleOutcome> {
+        let thread = self.get_thread(thread_id).await?;
+        if let Some(ops_log) = &self.ops_log
+            && let Ok(mut log) = ops_log.lock()
+        {
+            log.push((thread_id, op.clone()));
+        }
+        thread.submit_user_input_if_idle(op).await
     }
 
     /// Remove a thread from the manager by ID, returning it when present.
@@ -1400,12 +1510,13 @@ impl ThreadManagerState {
             agent_control,
             session_source,
             parent_thread_id,
+            thread_source,
             inherited_environments,
             inherited_exec_policy,
         } = options;
         let environments =
             default_thread_environment_selections(self.environment_manager.as_ref(), &config.cwd);
-        let thread_source = initial_history.get_resumed_thread_source();
+        let thread_source = thread_source.or_else(|| initial_history.get_resumed_thread_source());
         Box::pin(self.spawn_thread_with_source(
             config,
             initial_history,
@@ -1538,6 +1649,22 @@ impl ThreadManagerState {
         supports_openai_form_elicitation: bool,
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
+        let persisted_workflow_thread_source =
+            initial_history_workflow_thread_source(&initial_history);
+        let thread_source = match &initial_history {
+            InitialHistory::Forked(_) if persisted_workflow_thread_source.is_some() => {
+                return Err(CodexErr::InvalidRequest(
+                    "workflow-managed threads cannot be forked".to_string(),
+                ));
+            }
+            InitialHistory::Resumed(_) if persisted_workflow_thread_source.is_some() => {
+                persisted_workflow_thread_source.cloned()
+            }
+            InitialHistory::New
+            | InitialHistory::Cleared
+            | InitialHistory::Resumed(_)
+            | InitialHistory::Forked(_) => thread_source,
+        };
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
         if let InitialHistory::Resumed(resumed) = &initial_history {
             let mut threads = self.threads.write().await;

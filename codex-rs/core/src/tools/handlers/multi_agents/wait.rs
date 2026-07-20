@@ -60,9 +60,13 @@ impl Handler {
             call_id,
             ..
         } = invocation;
+        ensure_collaboration_sender_allowed(session.as_ref()).await?;
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
         let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        for receiver_thread_id in &receiver_thread_ids {
+            ensure_collaboration_target_allowed(session.as_ref(), *receiver_thread_id).await?;
+        }
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {

@@ -519,6 +519,8 @@ mod thread_processor;
 mod token_usage_replay;
 mod turn_processor;
 mod windows_sandbox_processor;
+mod workflow_event_replay;
+mod workflow_processor;
 
 pub(crate) use account_processor::AccountRequestProcessor;
 pub(crate) use apps_processor::AppsRequestProcessor;
@@ -542,6 +544,7 @@ pub(crate) use thread_goal_processor::ThreadGoalRequestProcessor;
 pub(crate) use thread_processor::ThreadRequestProcessor;
 pub(crate) use turn_processor::TurnRequestProcessor;
 pub(crate) use windows_sandbox_processor::WindowsSandboxRequestProcessor;
+pub(crate) use workflow_processor::WorkflowRequestProcessor;
 
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
@@ -553,6 +556,115 @@ use crate::thread_state::ThreadState;
 use crate::thread_state::ThreadStateManager;
 use token_usage_replay::latest_token_usage_turn_id_from_rollout_items;
 use token_usage_replay::send_thread_token_usage_update_to_connection;
+
+const DIRECT_MUTATION_TO_WORKFLOW_MANAGED_THREAD_ERROR: &str =
+    "direct mutation is not allowed for workflow-managed threads";
+
+fn is_workflow_managed_thread_source(
+    thread_source: Option<&codex_protocol::protocol::ThreadSource>,
+) -> bool {
+    matches!(
+        thread_source,
+        Some(codex_protocol::protocol::ThreadSource::Feature(feature)) if feature == "workflow"
+    )
+}
+
+fn ensure_workflow_managed_thread_source_mutation_allowed(
+    thread_source: Option<&codex_protocol::protocol::ThreadSource>,
+) -> Result<(), JSONRPCErrorError> {
+    if is_workflow_managed_thread_source(thread_source) {
+        return Err(invalid_request(
+            DIRECT_MUTATION_TO_WORKFLOW_MANAGED_THREAD_ERROR,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_client_thread_source_allowed(
+    thread_source: Option<&codex_app_server_protocol::ThreadSource>,
+) -> Result<(), JSONRPCErrorError> {
+    if matches!(
+        thread_source,
+        Some(codex_app_server_protocol::ThreadSource::Feature(feature)) if feature == "workflow"
+    ) {
+        return Err(invalid_request(
+            "thread source `workflow` is reserved for workflow supervisors",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_workflow_managed_thread_mutation_allowed(
+    thread: &CodexThread,
+) -> Result<(), JSONRPCErrorError> {
+    if thread.is_workflow_managed_agent() {
+        return Err(invalid_request(
+            DIRECT_MUTATION_TO_WORKFLOW_MANAGED_THREAD_ERROR,
+        ));
+    }
+    Ok(())
+}
+
+fn is_workflow_managed_initial_history(initial_history: &InitialHistory) -> bool {
+    is_workflow_managed_rollout_items(initial_history.get_rollout_items())
+}
+
+fn is_workflow_managed_rollout_items(items: &[RolloutItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::SessionMeta(meta_line)
+                if is_workflow_managed_thread_source(meta_line.meta.thread_source.as_ref())
+        )
+    })
+}
+
+fn ensure_workflow_managed_rollout_items_mutation_allowed(
+    items: &[RolloutItem],
+) -> Result<(), JSONRPCErrorError> {
+    if is_workflow_managed_rollout_items(items) {
+        return Err(invalid_request(
+            DIRECT_MUTATION_TO_WORKFLOW_MANAGED_THREAD_ERROR,
+        ));
+    }
+    Ok(())
+}
+
+fn thread_resume_has_configuration_overrides(params: &ThreadResumeParams) -> bool {
+    let ThreadResumeParams {
+        thread_id: _,
+        history: _,
+        path: _,
+        model,
+        model_provider,
+        service_tier,
+        cwd,
+        runtime_workspace_roots,
+        approval_policy,
+        approvals_reviewer,
+        sandbox,
+        permissions,
+        config,
+        base_instructions,
+        developer_instructions,
+        personality,
+        exclude_turns: _,
+        initial_turns_page: _,
+    } = params;
+    model.is_some()
+        || model_provider.is_some()
+        || service_tier.is_some()
+        || cwd.is_some()
+        || runtime_workspace_roots.is_some()
+        || approval_policy.is_some()
+        || approvals_reviewer.is_some()
+        || sandbox.is_some()
+        || permissions.is_some()
+        || config.is_some()
+        || base_instructions.is_some()
+        || developer_instructions.is_some()
+        || personality.is_some()
+}
 
 fn resolve_request_cwd(cwd: Option<PathBuf>) -> Result<Option<AbsolutePathBuf>, JSONRPCErrorError> {
     cwd.map(|cwd| {

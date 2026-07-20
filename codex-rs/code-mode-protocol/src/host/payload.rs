@@ -164,6 +164,13 @@ pub struct WireExecuteRequest {
     /// for the same wire back-compat reason as [`Self::args`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Mirrors [`ExecuteRequest::replay_entries`]. Empty for ordinary exec and
+    /// fresh workflow runs, so legacy request JSON remains unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay_entries: Vec<JsonValue>,
+    /// Initial run-local budget view for workflow cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_budget: Option<crate::WorkflowBudgetSnapshot>,
 }
 
 /// Serde predicate: skip a `bool` field when it is `false`. Takes `&bool`
@@ -186,6 +193,8 @@ impl TryFrom<ExecuteRequest> for WireExecuteRequest {
             workflow: value.workflow,
             args: value.args,
             run_id: value.run_id,
+            replay_entries: value.replay_entries,
+            workflow_budget: value.workflow_budget,
         })
     }
 }
@@ -203,6 +212,8 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
             workflow: value.workflow,
             args: value.args,
             run_id: value.run_id,
+            replay_entries: value.replay_entries,
+            workflow_budget: value.workflow_budget,
         })
     }
 }

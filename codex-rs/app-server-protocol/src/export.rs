@@ -17,6 +17,8 @@ use crate::protocol::common::EXPERIMENTAL_CLIENT_METHODS;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES;
 use crate::protocol::common::EXPERIMENTAL_SERVER_METHODS;
+use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_METHODS;
+use crate::protocol::common::EXPERIMENTAL_SERVER_NOTIFICATION_TYPES;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -48,6 +50,27 @@ const EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES: &[&str] = &[
     "RemoteControlClient",
     "RemoteControlClientsListOrder",
     "ThreadBackgroundTerminal",
+    "WorkflowAgentControlAction",
+    "WorkflowMetadata",
+    "WorkflowPauseDisposition",
+    "WorkflowRunStatus",
+    "WorkflowSaveDisposition",
+    "WorkflowSaveScope",
+    "WorkflowScope",
+    "WorkflowStopDisposition",
+];
+// `ts-rs` exports notification payload dependencies as standalone SDK files.
+// These types are reachable only through experimental notification arms, so
+// stable generation must remove them along with the direct payload types.
+const EXPERIMENTAL_SERVER_NOTIFICATION_DEPENDENCY_TYPES: &[&str] = &[
+    "ProcessOutputStream",
+    "RealtimeConversationVersion",
+    "ThreadRealtimeAudioChunk",
+    "ThreadSettings",
+    "WorkflowAgentAttemptReason",
+    "WorkflowGroupKind",
+    "WorkflowPhaseStatus",
+    "WorkflowRunTerminalReason",
 ];
 const SPECIAL_DEFINITIONS: &[&str] = &[
     "ClientNotification",
@@ -56,6 +79,10 @@ const SPECIAL_DEFINITIONS: &[&str] = &[
     "ServerRequest",
 ];
 const FLAT_V2_SHARED_DEFINITIONS: &[&str] = &["ClientRequest", "ServerNotification"];
+const TYPESCRIPT_COMPATIBILITY_REEXPORTS: &[(&str, &str)] = &[(
+    "WorkflowsChangedNotification.ts",
+    "export type { WorkflowsChangedNotification } from \"./v2/WorkflowsChangedNotification\";\n",
+)];
 const V1_CLIENT_REQUEST_METHODS: &[&str] =
     &["getConversationSummary", "gitDiffToRemote", "getAuthStatus"];
 const EXCLUDED_SERVER_NOTIFICATION_METHODS_FOR_JSON: &[&str] = &["rawResponseItem/completed"];
@@ -132,6 +159,7 @@ pub fn generate_ts_with_options(
     if !options.experimental_api {
         filter_experimental_ts(out_dir)?;
     }
+    write_typescript_compatibility_reexports(out_dir)?;
 
     if options.generate_indices {
         generate_index_ts(out_dir)?;
@@ -258,6 +286,11 @@ fn filter_experimental_ts(out_dir: &Path) -> Result<()> {
     // post-processing because they encode method/field information locally.
     filter_request_ts(out_dir, "ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS)?;
     filter_request_ts(out_dir, "ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS)?;
+    filter_request_ts(
+        out_dir,
+        "ServerNotification.ts",
+        EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+    )?;
     filter_experimental_type_fields_ts(out_dir, &registered_fields)?;
     remove_generated_type_files(out_dir, &experimental_method_types, "ts")?;
     Ok(())
@@ -269,6 +302,10 @@ pub(crate) fn filter_experimental_ts_tree(tree: &mut BTreeMap<PathBuf, String>) 
     for (file_name, experimental_methods) in [
         ("ClientRequest.ts", EXPERIMENTAL_CLIENT_METHODS),
         ("ServerRequest.ts", EXPERIMENTAL_SERVER_METHODS),
+        (
+            "ServerNotification.ts",
+            EXPERIMENTAL_SERVER_NOTIFICATION_METHODS,
+        ),
     ] {
         if let Some(content) = tree.get_mut(Path::new(file_name)) {
             *content = filter_request_ts_contents(std::mem::take(content), experimental_methods);
@@ -413,6 +450,7 @@ fn filter_experimental_schema(bundle: &mut Value) -> Result<()> {
     filter_experimental_fields_in_definitions(bundle, &registered_fields);
     prune_experimental_methods(bundle, EXPERIMENTAL_CLIENT_METHODS);
     prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_METHODS);
+    prune_experimental_methods(bundle, EXPERIMENTAL_SERVER_NOTIFICATION_METHODS);
     remove_experimental_method_type_definitions(bundle);
     Ok(())
 }
@@ -571,6 +609,11 @@ fn experimental_method_types() -> HashSet<String> {
     collect_experimental_type_names(EXPERIMENTAL_CLIENT_METHOD_DEPENDENCY_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES, &mut type_names);
     collect_experimental_type_names(EXPERIMENTAL_SERVER_METHOD_RESPONSE_TYPES, &mut type_names);
+    collect_experimental_type_names(EXPERIMENTAL_SERVER_NOTIFICATION_TYPES, &mut type_names);
+    collect_experimental_type_names(
+        EXPERIMENTAL_SERVER_NOTIFICATION_DEPENDENCY_TYPES,
+        &mut type_names,
+    );
     type_names
 }
 
@@ -2004,6 +2047,20 @@ fn trim_trailing_whitespace_in_ts_files(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+fn write_typescript_compatibility_reexports(out_dir: &Path) -> Result<()> {
+    for (relative_path, content) in TYPESCRIPT_COMPATIBILITY_REEXPORTS {
+        let path = out_dir.join(relative_path);
+        fs::write(&path, content).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn add_typescript_compatibility_reexports_tree(tree: &mut BTreeMap<PathBuf, String>) {
+    for (relative_path, content) in TYPESCRIPT_COMPATIBILITY_REEXPORTS {
+        tree.insert(PathBuf::from(relative_path), (*content).to_string());
+    }
+}
+
 pub(crate) fn trim_trailing_line_whitespace(content: &str) -> String {
     let mut trimmed = String::with_capacity(content.len());
     for line in content.split_inclusive('\n') {
@@ -2129,6 +2186,8 @@ mod tests {
             client_request_ts.contains("MockExperimentalMethodParams"),
             false
         );
+        assert_eq!(client_request_ts.contains("workflow/read"), false);
+        assert_eq!(client_request_ts.contains("WorkflowReadParams"), false);
         let server_request_ts = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("ServerRequest.ts"))
@@ -2136,6 +2195,21 @@ mod tests {
         )?;
         assert_eq!(server_request_ts.contains("currentTime/read"), false);
         assert_eq!(server_request_ts.contains("CurrentTimeReadParams"), false);
+        let server_notification_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("ServerNotification.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing ServerNotification.ts fixture"))?,
+        )?;
+        assert_eq!(server_notification_ts.contains("workflows/changed"), true);
+        assert_eq!(
+            server_notification_ts.contains("WorkflowsChangedNotification"),
+            true
+        );
+        assert_eq!(server_notification_ts.contains("workflow/started"), false);
+        assert_eq!(
+            server_notification_ts.contains("WorkflowStartedNotification"),
+            false
+        );
         let typescript_index = std::str::from_utf8(
             fixture_tree
                 .get(Path::new("index.ts"))
@@ -2156,6 +2230,17 @@ mod tests {
             fixture_tree.contains_key(Path::new("v2/MockExperimentalMethodResponse.ts")),
             false
         );
+        for type_name in [
+            "WorkflowReadParams",
+            "WorkflowReadResponse",
+            "WorkflowRunStatus",
+        ] {
+            assert_eq!(
+                fixture_tree.contains_key(&Path::new("v2").join(format!("{type_name}.ts"))),
+                false,
+                "stable TypeScript leaked experimental {type_name}"
+            );
+        }
         assert_eq!(
             fixture_tree.contains_key(Path::new("v2/CurrentTimeReadParams.ts")),
             false
@@ -2172,7 +2257,53 @@ mod tests {
             fixture_tree.contains_key(Path::new("v2/RemoteControlClientsListOrder.ts")),
             false
         );
-
+        let workflows_changed_compatibility_ts = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("WorkflowsChangedNotification.ts"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing root WorkflowsChangedNotification.ts compatibility fixture"
+                    )
+                })?,
+        )?;
+        assert_eq!(
+            workflows_changed_compatibility_ts,
+            "export type { WorkflowsChangedNotification } from \"./v2/WorkflowsChangedNotification\";\n"
+        );
+        assert_eq!(
+            typescript_index.contains("export type { WorkflowsChangedNotification }"),
+            true,
+            "root TypeScript index must preserve the legacy workflow notification export"
+        );
+        assert_eq!(
+            fixture_tree.contains_key(Path::new("v2/WorkflowsChangedNotification.ts")),
+            true,
+            "stable v2 workflow invalidation notification must be emitted"
+        );
+        assert_eq!(
+            fixture_tree.contains_key(Path::new("v2/WorkflowStartedNotification.ts")),
+            false,
+            "stable TypeScript must not emit an experimental notification payload"
+        );
+        let v2_typescript_index = std::str::from_utf8(
+            fixture_tree
+                .get(Path::new("v2/index.ts"))
+                .ok_or_else(|| anyhow::anyhow!("missing v2/index.ts fixture"))?,
+        )?;
+        assert_eq!(
+            v2_typescript_index.contains("export type { WorkflowsChangedNotification }"),
+            true
+        );
+        for type_name in EXPERIMENTAL_SERVER_NOTIFICATION_DEPENDENCY_TYPES {
+            for path in generated_type_paths(type_name, "ts") {
+                assert_eq!(
+                    fixture_tree.contains_key(&path),
+                    false,
+                    "stable TypeScript leaked experimental notification dependency {type_name} at {}",
+                    path.display()
+                );
+            }
+        }
         let mut undefined_offenders = Vec::new();
         let mut optional_nullable_offenders = BTreeSet::new();
         for (path, contents) in &fixture_tree {
@@ -2363,10 +2494,20 @@ mod tests {
         Ok(schema_root)
     }
 
+    fn generated_type_paths(type_name: &str, extension: &str) -> [PathBuf; 3] {
+        let file_name = format!("{type_name}.{extension}");
+        [
+            PathBuf::from(&file_name),
+            Path::new("v1").join(&file_name),
+            Path::new("v2").join(file_name),
+        ]
+    }
+
     #[test]
     fn generate_ts_with_experimental_api_retains_experimental_entries() -> Result<()> {
         let client_request_ts = ClientRequest::export_to_string()?;
         assert_eq!(client_request_ts.contains("mock/experimentalMethod"), true);
+        assert_eq!(client_request_ts.contains("workflow/read"), true);
         assert_eq!(
             client_request_ts.contains("MockExperimentalMethodParams"),
             true
@@ -2381,6 +2522,10 @@ mod tests {
                 .contains("MockExperimentalMethodResponse"),
             true
         );
+        assert_eq!(
+            v2::WorkflowReadResponse::export_to_string()?.contains("WorkflowRunStatus"),
+            true
+        );
 
         let thread_start_ts = v2::ThreadStartParams::export_to_string()?;
         assert_eq!(thread_start_ts.contains("mockExperimentalField"), true);
@@ -2390,6 +2535,47 @@ mod tests {
             command_execution_request_approval_ts.contains("additionalPermissions"),
             true
         );
+
+        let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
+        generate_ts_with_options(
+            &output_dir,
+            None,
+            GenerateTsOptions {
+                generate_indices: true,
+                ensure_headers: false,
+                run_prettier: false,
+                experimental_api: true,
+            },
+        )?;
+        let server_notification_ts = fs::read_to_string(output_dir.join("ServerNotification.ts"))?;
+        assert_eq!(server_notification_ts.contains("workflows/changed"), true);
+        assert_eq!(server_notification_ts.contains("workflow/started"), true);
+        assert_eq!(
+            server_notification_ts.contains("WorkflowStartedNotification"),
+            true
+        );
+        assert_eq!(
+            fs::read_to_string(output_dir.join("WorkflowsChangedNotification.ts"))?,
+            "export type { WorkflowsChangedNotification } from \"./v2/WorkflowsChangedNotification\";\n"
+        );
+        assert!(fs::read_to_string(output_dir.join("index.ts"))?.contains(
+            "export type { WorkflowsChangedNotification } from \"./WorkflowsChangedNotification\";"
+        ));
+        assert_eq!(
+            output_dir
+                .join("v2")
+                .join("WorkflowsChangedNotification.ts")
+                .exists(),
+            true
+        );
+        assert_eq!(
+            output_dir
+                .join("v2")
+                .join("WorkflowStartedNotification.ts")
+                .exists(),
+            true
+        );
+        let _cleanup = fs::remove_dir_all(&output_dir);
 
         Ok(())
     }
@@ -2864,7 +3050,30 @@ permissionProfile?: string | null};
             client_request_json.contains("mock/experimentalMethod"),
             false
         );
+        assert_eq!(client_request_json.contains("workflow/read"), false);
         assert_eq!(output_dir.join("EventMsg.json").exists(), false);
+        let server_notification_json =
+            fs::read_to_string(output_dir.join("ServerNotification.json"))?;
+        assert_eq!(server_notification_json.contains("workflows/changed"), true);
+        assert_eq!(server_notification_json.contains("workflow/started"), false);
+        assert_eq!(
+            server_notification_json.contains("WorkflowStartedNotification"),
+            false
+        );
+        assert_eq!(
+            output_dir
+                .join("v2")
+                .join("WorkflowsChangedNotification.json")
+                .exists(),
+            true
+        );
+        assert_eq!(
+            output_dir
+                .join("v2")
+                .join("WorkflowStartedNotification.json")
+                .exists(),
+            false
+        );
 
         let bundle_json =
             fs::read_to_string(output_dir.join("codex_app_server_protocol.schemas.json"))?;
@@ -2875,6 +3084,11 @@ permissionProfile?: string | null};
             bundle_json.contains("MockExperimentalMethodResponse"),
             false
         );
+        assert_eq!(bundle_json.contains("workflows/changed"), true);
+        assert_eq!(bundle_json.contains("workflow/started"), false);
+        assert_eq!(bundle_json.contains("WorkflowReadParams"), false);
+        assert_eq!(bundle_json.contains("WorkflowReadResponse"), false);
+        assert_eq!(bundle_json.contains("WorkflowRunStatus"), false);
         let flat_v2_bundle_json =
             fs::read_to_string(output_dir.join("codex_app_server_protocol.v2.schemas.json"))?;
         assert_eq!(flat_v2_bundle_json.contains("mockExperimentalField"), false);
@@ -2892,6 +3106,13 @@ permissionProfile?: string | null};
             flat_v2_bundle_json.contains("RemoteControlClientsListOrder"),
             false
         );
+        for type_name in EXPERIMENTAL_SERVER_NOTIFICATION_DEPENDENCY_TYPES {
+            assert_eq!(
+                flat_v2_bundle_json.contains(type_name),
+                false,
+                "stable JSON leaked experimental notification dependency {type_name}"
+            );
+        }
         assert_eq!(flat_v2_bundle_json.contains("#/definitions/v2/"), false);
         assert_eq!(
             flat_v2_bundle_json.contains("\"title\": \"CodexAppServerProtocolV2\""),
@@ -2958,6 +3179,26 @@ permissionProfile?: string | null};
                 .exists(),
             false
         );
+        for type_name in ["WorkflowReadParams", "WorkflowReadResponse"] {
+            assert_eq!(
+                output_dir
+                    .join("v2")
+                    .join(format!("{type_name}.json"))
+                    .exists(),
+                false,
+                "stable JSON emitted experimental {type_name}"
+            );
+        }
+        for type_name in EXPERIMENTAL_SERVER_NOTIFICATION_DEPENDENCY_TYPES {
+            for path in generated_type_paths(type_name, "json") {
+                assert_eq!(
+                    output_dir.join(&path).exists(),
+                    false,
+                    "stable JSON emitted experimental notification dependency {type_name} at {}",
+                    path.display()
+                );
+            }
+        }
         assert_eq!(
             output_dir
                 .join("v2")
@@ -2985,7 +3226,7 @@ permissionProfile?: string | null};
     }
 
     #[test]
-    fn generate_json_includes_remote_control_methods_with_experimental_api() -> Result<()> {
+    fn generate_json_includes_experimental_methods_and_notifications() -> Result<()> {
         let output_dir = std::env::temp_dir().join(format!("codex_schema_{}", Uuid::now_v7()));
         fs::create_dir(&output_dir)?;
         generate_json_with_experimental(&output_dir, /*experimental_api*/ true)?;
@@ -2995,6 +3236,27 @@ permissionProfile?: string | null};
         assert!(client_request_json.contains("remoteControl/pairing/status"));
         assert!(client_request_json.contains("remoteControl/client/list"));
         assert!(client_request_json.contains("remoteControl/client/revoke"));
+        let server_notification_json =
+            fs::read_to_string(output_dir.join("ServerNotification.json"))?;
+        assert!(server_notification_json.contains("workflows/changed"));
+        assert!(server_notification_json.contains("workflow/started"));
+        assert!(server_notification_json.contains("WorkflowStartedNotification"));
+        assert!(
+            output_dir
+                .join("v2")
+                .join("WorkflowsChangedNotification.json")
+                .exists()
+        );
+        assert!(
+            output_dir
+                .join("v2")
+                .join("WorkflowStartedNotification.json")
+                .exists()
+        );
+        let bundle_json =
+            fs::read_to_string(output_dir.join("codex_app_server_protocol.schemas.json"))?;
+        assert!(bundle_json.contains("workflow/started"));
+        assert!(bundle_json.contains("WorkflowStartedNotification"));
         for schema in [
             "RemoteControlPairingStartParams.json",
             "RemoteControlPairingStartResponse.json",

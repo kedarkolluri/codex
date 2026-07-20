@@ -14,6 +14,8 @@ use crate::session::SteerInputError;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::session::SessionSettingsUpdate;
+use crate::session::turn_admission::TurnAdmissionOutcome;
+use crate::state::ActiveTurn;
 
 use crate::config::Config;
 use crate::review_prompts::resolve_review_request;
@@ -207,6 +209,34 @@ pub(super) async fn user_input_or_turn_inner(
     else {
         unreachable!();
     };
+    let turn_admission = sess.turn_admissions.take(&sub_id);
+    if sess.is_workflow_managed_agent().await && turn_admission.is_none() {
+        sess.send_event_raw(Event {
+            id: sub_id,
+            msg: EventMsg::Error(ErrorEvent {
+                message: "direct user input is not allowed for workflow-managed threads"
+                    .to_string(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            }),
+        })
+        .await;
+        return;
+    }
+    let (turn_admission, reserved_turn_state) = match turn_admission {
+        Some(turn_admission) => {
+            let mut active_turn = sess.active_turn.lock().await;
+            if active_turn.is_some() {
+                turn_admission.resolve(TurnAdmissionOutcome::Busy);
+                return;
+            }
+            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
+            (
+                Some(turn_admission),
+                Some(Arc::clone(&active_turn.turn_state)),
+            )
+        }
+        None => (None, None),
+    };
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
     let mut updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await
@@ -215,9 +245,24 @@ pub(super) async fn user_input_or_turn_inner(
     };
     updates.final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
-        // new_turn_with_sub_id already emits the error event.
-        return;
+    let current_context = match sess.new_turn_with_sub_id(sub_id.clone(), updates).await {
+        Ok(current_context) => current_context,
+        Err(error) => {
+            if let Some(reserved_turn_state) = reserved_turn_state.as_ref() {
+                let mut active_turn = sess.active_turn.lock().await;
+                if active_turn.as_ref().is_some_and(|active_turn| {
+                    active_turn.task.is_none()
+                        && Arc::ptr_eq(&active_turn.turn_state, reserved_turn_state)
+                }) {
+                    *active_turn = None;
+                }
+            }
+            if let Some(turn_admission) = turn_admission {
+                turn_admission.resolve(TurnAdmissionOutcome::Failed(error.to_string()));
+            }
+            // new_turn_with_sub_id already emits the error event.
+            return;
+        }
     };
     if emit_thread_settings_applied {
         sess.send_event_raw_without_materializing_rollout(Event {
@@ -228,6 +273,42 @@ pub(super) async fn user_input_or_turn_inner(
     }
     sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
         .await;
+    if let Some(turn_admission) = turn_admission {
+        if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
+            current_context
+                .turn_metadata_state
+                .set_responsesapi_client_metadata(responsesapi_client_metadata);
+        }
+        current_context.session_telemetry.user_prompt(&items);
+        sess.refresh_mcp_servers_if_requested(
+            &current_context,
+            Some(sess.mcp_elicitation_reviewer()),
+        )
+        .await;
+        let additional_context_input = {
+            let mut state = sess.state.lock().await;
+            state.additional_context.merge(additional_context)
+        };
+        let mut task_input = additional_context_input
+            .into_iter()
+            .map(ResponseItem::from)
+            .map(TurnInput::ResponseItem)
+            .collect::<Vec<_>>();
+        if !items.is_empty() {
+            task_input.push(TurnInput::UserInput {
+                content: items,
+                client_id: client_user_message_id,
+            });
+        }
+        sess.start_task(
+            Arc::clone(&current_context),
+            task_input,
+            crate::tasks::RegularTask::new(),
+        )
+        .await;
+        turn_admission.resolve(TurnAdmissionOutcome::Started);
+        return;
+    }
     match sess
         .steer_input(
             items.clone(),
@@ -292,6 +373,13 @@ pub async fn inter_agent_communication(
     sub_id: String,
     communication: InterAgentCommunication,
 ) {
+    if sess.is_workflow_managed_agent().await {
+        warn!(
+            thread_id = %sess.thread_id(),
+            "discarded mailbox communication addressed to a workflow-managed child"
+        );
+        return;
+    }
     let trigger_turn = communication.trigger_turn;
     sess.input_queue
         .enqueue_mailbox_communication(communication)
@@ -535,8 +623,20 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
+    if let Err(err) = sess
+        .apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
+        .await
+    {
+        sess.send_event_raw(Event {
+            id: turn_context.sub_id.clone(),
+            msg: EventMsg::Error(ErrorEvent {
+                message: format!("failed to validate rollback replay: {err}"),
+                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
+            }),
+        })
         .await;
+        return;
+    }
     sess.services
         .agent_control
         .rollout_budget()
@@ -711,15 +811,67 @@ pub async fn review(
     }
 }
 
+pub(super) fn workflow_managed_restricted_operation(op: &Op) -> Option<&'static str> {
+    match op {
+        Op::CleanBackgroundTerminals => Some("background terminal cleanup"),
+        Op::RealtimeConversationStart(_)
+        | Op::RealtimeConversationAudio(_)
+        | Op::RealtimeConversationText(_)
+        | Op::RealtimeConversationSpeech(_)
+        | Op::RealtimeConversationClose => Some("realtime conversation control"),
+        Op::ThreadSettings { .. } => Some("thread settings updates"),
+        Op::Compact => Some("manual compaction"),
+        Op::ThreadRollback { .. } => Some("thread rollback"),
+        Op::SetThreadMemoryMode { .. } => Some("thread memory mode updates"),
+        Op::RunUserShellCommand { .. } => Some("manual shell commands"),
+        Op::Review { .. } => Some("review"),
+        Op::ApproveGuardianDeniedAction { .. } => Some("Guardian denied-action approval"),
+        Op::RefreshMcpServers { .. } => Some("MCP server refresh"),
+        Op::ReloadUserConfig => Some("user config reload"),
+        _ => None,
+    }
+}
+
+pub(super) async fn reject_workflow_managed_operation(
+    sess: &Session,
+    sub_id: String,
+    operation: &'static str,
+) -> bool {
+    if !sess.is_workflow_managed_agent().await {
+        return false;
+    }
+
+    warn!(
+        thread_id = %sess.thread_id(),
+        operation,
+        "rejected direct mutation of a workflow-managed child"
+    );
+    sess.send_event_raw(Event {
+        id: sub_id,
+        msg: EventMsg::Error(ErrorEvent {
+            message: format!("workflow-managed threads do not support {operation}"),
+            codex_error_info: Some(CodexErrorInfo::BadRequest),
+        }),
+    })
+    .await;
+    true
+}
+
 pub(super) async fn submission_loop(
     sess: Arc<Session>,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
 ) {
+    let turn_admission_loop_guard = sess.turn_admissions.loop_guard();
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
     while let Ok(sub) = rx_sub.recv().await {
         debug!(?sub, "Submission");
+        if let Some(operation) = workflow_managed_restricted_operation(&sub.op)
+            && reject_workflow_managed_operation(&sess, sub.id.clone(), operation).await
+        {
+            continue;
+        }
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {
             match sub.op.clone() {
@@ -857,6 +1009,9 @@ pub(super) async fn submission_loop(
             break;
         }
     }
+    // No queued admission can be dispatched after the receive loop ends. Resolve those callers
+    // before potentially-long runtime and persistence teardown; the guard still covers panics.
+    drop(turn_admission_loop_guard);
     // If the submission loop exits because the channel closed without an
     // explicit shutdown op, still run session teardown.
     if !shutdown_received {

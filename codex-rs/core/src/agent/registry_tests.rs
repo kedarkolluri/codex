@@ -276,6 +276,47 @@ fn released_nickname_stays_used_until_pool_reset() {
 }
 
 #[test]
+fn restored_nickname_reclaims_history_but_avoids_live_collisions() {
+    let registry = Arc::new(AgentRegistry::default());
+
+    let mut first = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve first slot");
+    let first_name = first
+        .reserve_agent_nickname_with_preference(&["alpha"], /*preferred*/ None)
+        .expect("reserve first agent name");
+    let first_id = ThreadId::new();
+    first.commit(AgentMetadata {
+        agent_id: Some(first_id),
+        agent_nickname: Some(first_name.clone()),
+        ..Default::default()
+    });
+    registry.release_spawned_thread(first_id);
+
+    let mut resumed = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve resumed slot");
+    assert_eq!(
+        resumed.reserve_restored_agent_nickname(&first_name),
+        "alpha"
+    );
+    let resumed_id = ThreadId::new();
+    resumed.commit(AgentMetadata {
+        agent_id: Some(resumed_id),
+        agent_nickname: Some(first_name.clone()),
+        ..Default::default()
+    });
+
+    let mut colliding = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve colliding slot");
+    assert_eq!(
+        colliding.reserve_restored_agent_nickname(&first_name),
+        "alpha-2"
+    );
+}
+
+#[test]
 fn repeated_resets_advance_the_ordinal_suffix() {
     let registry = Arc::new(AgentRegistry::default());
 

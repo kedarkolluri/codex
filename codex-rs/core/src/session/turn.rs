@@ -58,6 +58,7 @@ use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::ToolArgumentDiffConsumer;
+use crate::tools::router::CollaborationToolAccess;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
@@ -173,7 +174,7 @@ pub(crate) async fn run_turn(
         turn_diff_display_roots(turn_context.as_ref()),
     );
 
-    let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
+    let Some((mut injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
         &sess,
         first_step_context.as_ref(),
         &input,
@@ -183,6 +184,9 @@ pub(crate) async fn run_turn(
     else {
         return Ok(None);
     };
+    if sess.is_workflow_managed_agent().await {
+        injection_items = crate::context::bound_workflow_child_context_items(injection_items);
+    }
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return Ok(None);
@@ -493,16 +497,19 @@ async fn run_hooks_and_record_inputs(
             blocked_input = true;
             record_additional_contexts(sess, turn_context, hook_outcome.additional_contexts).await;
         } else {
-            if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty()) {
-                accepted_user_input = true;
-            }
-            record_pending_input(
+            let prompt_rejected = record_pending_input(
                 sess,
                 turn_context,
                 input_item.clone(),
                 hook_outcome.additional_contexts,
             )
             .await;
+            if prompt_rejected {
+                blocked_input = true;
+            } else if matches!(input_item, TurnInput::UserInput { content, .. } if !content.is_empty())
+            {
+                accepted_user_input = true;
+            }
         }
     }
     blocked_input && !accepted_user_input
@@ -1088,9 +1095,23 @@ pub(crate) fn build_prompt(
     turn_context: &TurnContext,
     base_instructions: BaseInstructions,
 ) -> Prompt {
+    let tools = router.model_visible_specs();
+    let workflow_managed_agent = crate::agent::control::is_workflow_managed_thread_source(
+        turn_context.turn_metadata_state.thread_source(),
+    );
+    let tools = if workflow_managed_agent {
+        crate::context::bound_workflow_child_tool_specs(tools)
+    } else {
+        tools
+    };
+    let tools = if workflow_managed_agent && turn_context.model_info.use_responses_lite {
+        crate::context::bound_workflow_child_responses_lite_tool_specs(tools)
+    } else {
+        tools
+    };
     Prompt {
         input,
-        tools: router.model_visible_specs(),
+        tools,
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
@@ -1131,16 +1152,21 @@ async fn run_sampling_request(
         Arc::clone(&step_context),
         Arc::clone(&turn_diff_tracker),
     );
-    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
-        &sess,
-        Arc::clone(&step_context),
-        Arc::clone(&router),
-        Arc::clone(&turn_diff_tracker),
-    );
+    let _code_mode_worker = sess
+        .services
+        .code_mode_service
+        .start_turn_worker(
+            &sess,
+            Arc::clone(&step_context),
+            Arc::clone(&router),
+            Arc::clone(&turn_diff_tracker),
+        )
+        .await;
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
     let mut initial_input = Some(input);
     let mut original_input = None;
+    let workflow_managed_agent = sess.is_workflow_managed_agent().await;
     loop {
         let prompt_input = if let Some(input) = initial_input.take() {
             input
@@ -1149,6 +1175,13 @@ async fn run_sampling_request(
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         };
+        if workflow_managed_agent {
+            crate::context::validate_workflow_child_model_history(&prompt_input).map_err(|_| {
+                CodexErr::InvalidRequest(
+                    "workflow child history exceeds model-context limits".to_string(),
+                )
+            })?;
+        }
         let prompt = build_prompt(
             prompt_input,
             router.as_ref(),
@@ -1345,6 +1378,11 @@ pub(crate) async fn built_tools(
             tool_suggest_candidates,
             extension_tool_executors: extension_tool_executors(sess),
             dynamic_tools: turn_context.dynamic_tools.as_slice(),
+            collaboration_tool_access: if sess.is_workflow_managed_agent().await {
+                CollaborationToolAccess::Disabled
+            } else {
+                CollaborationToolAccess::Enabled
+            },
         },
         &sess.services.tool_search_handler_cache,
     )))
@@ -1608,6 +1646,7 @@ pub(super) fn realtime_text_for_event(msg: &EventMsg) -> Option<(String, Option<
         | EventMsg::CollabCloseEnd(_)
         | EventMsg::CollabResumeBegin(_)
         | EventMsg::CollabResumeEnd(_)
+        | EventMsg::Workflow(_)
         | EventMsg::SubAgentActivity(_) => None,
     }
 }

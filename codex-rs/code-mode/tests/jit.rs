@@ -20,6 +20,8 @@ async fn code_mode_runs_with_jit_disabled() {
             workflow: false,
             args: None,
             run_id: None,
+            replay_entries: Vec::new(),
+            workflow_budget: None,
         })
         .await
         .expect("start code-mode cell");

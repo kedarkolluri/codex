@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+enum AgentRegistration {
+    Known,
+    Unknown,
+}
+
 impl AgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
     /// persisted spawn-edge state.
@@ -26,9 +32,35 @@ impl AgentControl {
 
     /// Mark `agent_id` as explicitly closed in persisted spawn-edge state, then shut down the
     /// agent and any live descendants reached from the in-memory tree.
+    #[cfg(test)]
     pub(crate) async fn close_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
+        let registration = self.mark_agent_closed(agent_id).await?;
+        normalize_close_result(
+            Box::pin(self.shutdown_agent_tree(agent_id)).await,
+            registration,
+        )
+    }
+
+    pub(super) async fn close_agent_with_captured_descendants(
+        &self,
+        agent_id: ThreadId,
+        descendant_ids: Vec<ThreadId>,
+    ) -> CodexResult<String> {
+        let registration = self.mark_agent_closed(agent_id).await?;
+        normalize_close_result(
+            self.shutdown_captured_agent_tree(agent_id, descendant_ids)
+                .await,
+            registration,
+        )
+    }
+
+    async fn mark_agent_closed(&self, agent_id: ThreadId) -> CodexResult<AgentRegistration> {
         let state = self.upgrade()?;
-        let known_agent = self.state.agent_metadata_for_thread(agent_id).is_some();
+        let registration = if self.state.agent_metadata_for_thread(agent_id).is_some() {
+            AgentRegistration::Known
+        } else {
+            AgentRegistration::Unknown
+        };
         match state.get_thread(agent_id).await {
             Ok(thread) => {
                 if !thread.config_snapshot().await.ephemeral
@@ -43,7 +75,9 @@ impl AgentControl {
                     warn!("failed to persist thread-spawn edge status for {agent_id}: {err}");
                 }
             }
-            Err(CodexErr::ThreadNotFound(_)) if known_agent => {
+            Err(CodexErr::ThreadNotFound(_))
+                if matches!(registration, AgentRegistration::Known) =>
+            {
                 if let Some(agent_graph_store) = state.agent_graph_store()
                     && let Err(err) = agent_graph_store
                         .set_thread_spawn_edge_status(
@@ -62,17 +96,22 @@ impl AgentControl {
                 warn!("failed to inspect agent before close {agent_id}: {err}");
             }
         }
-        match Box::pin(self.shutdown_agent_tree(agent_id)).await {
-            Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) if known_agent => {
-                Ok(String::new())
-            }
-            result => result,
-        }
+        Ok(registration)
     }
 
     /// Shut down `agent_id` and any live descendants reachable from the in-memory spawn tree.
+    #[cfg(test)]
     pub(crate) async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String> {
         let descendant_ids = self.live_thread_spawn_descendants(agent_id).await?;
+        self.shutdown_captured_agent_tree(agent_id, descendant_ids)
+            .await
+    }
+
+    async fn shutdown_captured_agent_tree(
+        &self,
+        agent_id: ThreadId,
+        descendant_ids: Vec<ThreadId>,
+    ) -> CodexResult<String> {
         let result = self.shutdown_live_agent(agent_id).await;
         for descendant_id in descendant_ids {
             match self.shutdown_live_agent(descendant_id).await {
@@ -81,5 +120,19 @@ impl AgentControl {
             }
         }
         result
+    }
+}
+
+fn normalize_close_result(
+    result: CodexResult<String>,
+    registration: AgentRegistration,
+) -> CodexResult<String> {
+    match result {
+        Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied)
+            if matches!(registration, AgentRegistration::Known) =>
+        {
+            Ok(String::new())
+        }
+        result => result,
     }
 }

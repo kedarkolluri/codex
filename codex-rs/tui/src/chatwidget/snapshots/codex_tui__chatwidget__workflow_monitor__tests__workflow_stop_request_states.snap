@@ -1,0 +1,38 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "format!(\"PENDING\\n{pending}\\n\\nAPPLIED\\n{applied}\\n\\nALREADY REQUESTED\\n{already_requested}\\n\\nFAILED\\n{failed}\\n\\nINACTIVE\\n{inactive}\")"
+---
+PENDING
+› ◆ Workflow release-check  run-stop  running · elapsed ≥ 1s
+  stop  requesting cancellation…
+  ● work · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+APPLIED
+› ◆ Workflow release-check  run-stop  running · elapsed ≥ 1s
+  stop  cancellation applied
+  ● work · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+ALREADY REQUESTED
+› ◆ Workflow joined-stop  run-stop  running · elapsed ≥ 1s
+  stop  workflow was already stopped
+  ● work · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit
+
+FAILED
+› ◆ Workflow failed-stop  run-stop  running · elapsed ≥ 1s
+  stop failed  remote cleanup failed
+  ● work · elapsed ≥ 0s
+
+  ↑↓ choose run/agent · x stop workflow · p pause · Enter inspect agents · Esc exit
+
+INACTIVE
+› ◆ Workflow inactive-stop  run-stop  interrupted · duration 8s
+  ✓ work · duration 7s
+  budget  12 / 100 weighted tokens
+
+  ↑↓ choose run/agent · Enter inspect agents · Esc exit

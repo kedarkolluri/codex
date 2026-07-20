@@ -14,6 +14,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSource;
 use codex_state::BackfillStatus;
 use codex_state::ThreadMetadataBuilder;
 use pretty_assertions::assert_eq;
@@ -342,6 +343,69 @@ async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_f
 }
 
 #[tokio::test]
+async fn backfill_sessions_keeps_workflow_source_across_metadata_disagreement() {
+    let dir = tempdir().expect("tempdir");
+    let codex_home = dir.path().to_path_buf();
+    let workflow_source = ThreadSource::Feature("workflow".to_string());
+    let other_source = ThreadSource::Feature("other".to_string());
+    let cases = [
+        (
+            "2026-01-27T12-34-56",
+            "2026-01-27T12:34:56Z",
+            Uuid::new_v4(),
+            workflow_source.clone(),
+            other_source.clone(),
+        ),
+        (
+            "2026-01-27T12-35-56",
+            "2026-01-27T12:35:56Z",
+            Uuid::new_v4(),
+            other_source,
+            workflow_source.clone(),
+        ),
+    ];
+    let mut fixtures = Vec::new();
+    for (filename_ts, event_ts, thread_uuid, rollout_source, sqlite_source) in cases {
+        let rollout_path = write_rollout_in_sessions(
+            codex_home.as_path(),
+            filename_ts,
+            event_ts,
+            thread_uuid,
+            /*git*/ None,
+        );
+        set_rollout_thread_source(rollout_path.as_path(), rollout_source);
+        fixtures.push((thread_uuid, rollout_path, sqlite_source));
+    }
+
+    let runtime = codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+    for (_, rollout_path, sqlite_source) in &fixtures {
+        let mut existing = extract_metadata_from_rollout(rollout_path, "test-provider")
+            .await
+            .expect("extract rollout metadata")
+            .metadata;
+        existing.thread_source = Some(sqlite_source.clone());
+        runtime
+            .upsert_thread(&existing)
+            .await
+            .expect("seed existing metadata");
+    }
+
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
+
+    for (thread_uuid, _, _) in fixtures {
+        let thread_id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
+        let persisted = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("get thread")
+            .expect("thread should exist");
+        assert_eq!(persisted.thread_source, Some(workflow_source.clone()));
+    }
+}
+
+#[tokio::test]
 async fn backfill_sessions_normalizes_cwd_before_upsert() {
     let dir = tempdir().expect("tempdir");
     let codex_home = dir.path().to_path_buf();
@@ -438,4 +502,30 @@ fn write_rollout_in_sessions_with_cwd(
     let mut file = File::create(&path).expect("create rollout");
     writeln!(file, "{json}").expect("write rollout");
     path
+}
+
+fn set_rollout_thread_source(path: &Path, thread_source: ThreadSource) {
+    let contents = std::fs::read_to_string(path).expect("read rollout");
+    let mut lines = contents.lines();
+    let mut first_line: RolloutLine = serde_json::from_str(
+        lines
+            .next()
+            .expect("rollout fixture must contain session metadata"),
+    )
+    .expect("parse rollout line");
+    let RolloutItem::SessionMeta(session_meta) = &mut first_line.item else {
+        panic!("rollout fixture must begin with session metadata");
+    };
+    session_meta.meta.thread_source = Some(thread_source);
+
+    let mut file = File::create(path).expect("rewrite rollout");
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&first_line).expect("serialize rollout line")
+    )
+    .expect("write session metadata");
+    for line in lines {
+        writeln!(file, "{line}").expect("write rollout item");
+    }
 }

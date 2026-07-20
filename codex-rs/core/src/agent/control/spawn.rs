@@ -1,8 +1,17 @@
 use super::residency::is_v2_resident_session_source;
 use super::*;
+use crate::agent::role_context_bounds;
+use crate::config::is_legacy_default_multi_agent_v2_usage_hint_text;
+use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentModeInstructions;
+use crate::context::MultiAgentUsageHint;
 use codex_extension_api::ExtensionDataInit;
 
 const AGENT_NAMES: &str = include_str!("../agent_names.txt");
+const WORKFLOW_CHILD_CONFIG_REJECTED: &str =
+    "workflow child configuration exceeds model-context limits";
+const WORKFLOW_CHILD_FORK_REJECTED: &str =
+    "workflow-managed child sessions cannot fork parent history";
 
 struct SpawnAgentThreadInheritance {
     environments: Option<TurnEnvironmentSnapshot>,
@@ -83,20 +92,67 @@ fn keep_forked_rollout_item(item: &RolloutItem, preserve_reference_context_item:
     }
 }
 
-fn is_multi_agent_v2_usage_hint_message(item: &ResponseItem, usage_hint_texts: &[String]) -> bool {
+fn sanitize_multi_agent_v2_context_message(
+    item: &mut ResponseItem,
+    usage_hint_texts: &[String],
+) -> bool {
     let ResponseItem::Message { role, content, .. } = item else {
-        return false;
+        return true;
     };
     if role != "developer" {
-        return false;
+        return true;
     }
-    let [ContentItem::InputText { text }] = content.as_slice() else {
-        return false;
-    };
+    content.retain(|content_item| {
+        let ContentItem::InputText { text } = content_item else {
+            return true;
+        };
+        !MultiAgentUsageHint::matches_text(text)
+            && !MultiAgentModeInstructions::matches_text(text)
+            && !is_legacy_default_multi_agent_v2_usage_hint_text(text)
+            && !usage_hint_texts
+                .iter()
+                .any(|usage_hint_text| usage_hint_text == text)
+    });
+    !content.is_empty()
+}
 
-    usage_hint_texts
-        .iter()
-        .any(|usage_hint_text| usage_hint_text == text)
+fn enforce_workflow_child_spawn_bounds(
+    config: &mut Config,
+    parent_completion_delivery: ParentCompletionDelivery,
+    fork_mode: Option<&SpawnAgentForkMode>,
+) -> CodexResult<()> {
+    if parent_completion_delivery != ParentCompletionDelivery::WorkflowSupervisor {
+        return Ok(());
+    }
+    if fork_mode.is_some() {
+        return Err(CodexErr::InvalidRequest(
+            WORKFLOW_CHILD_FORK_REJECTED.to_string(),
+        ));
+    }
+    role_context_bounds::bound_workflow_child_context(config)
+        .map_err(|_| CodexErr::InvalidRequest(WORKFLOW_CHILD_CONFIG_REJECTED.to_string()))
+}
+
+fn resumed_parent_completion_delivery(
+    thread_id: ThreadId,
+    stored_thread_source: Option<&ThreadSource>,
+    initial_history: &InitialHistory,
+) -> ParentCompletionDelivery {
+    let workflow_managed_history = initial_history.get_rollout_items().iter().any(|item| {
+        matches!(
+            item,
+            RolloutItem::SessionMeta(meta_line)
+                if meta_line.meta.id == thread_id
+                    && is_workflow_managed_thread_source(
+                        meta_line.meta.thread_source.as_ref(),
+                    )
+        )
+    });
+    if is_workflow_managed_thread_source(stored_thread_source) || workflow_managed_history {
+        ParentCompletionDelivery::WorkflowSupervisor
+    } else {
+        ParentCompletionDelivery::NotifyParent
+    }
 }
 
 impl AgentControl {
@@ -175,7 +231,7 @@ impl AgentControl {
 
     pub(crate) async fn ensure_v2_agent_loaded(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
     ) -> CodexResult<()> {
         let state = self.upgrade()?;
@@ -194,6 +250,7 @@ impl AgentControl {
                 include_history: true,
             })
             .await?;
+        let stored_thread_source = stored_thread.thread_source.clone();
         let stored_source = stored_thread.source.clone();
         let stored_parent_thread_id = stored_thread.parent_thread_id;
         let history = stored_thread
@@ -205,9 +262,19 @@ impl AgentControl {
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
         });
+        let parent_completion_delivery = resumed_parent_completion_delivery(
+            thread_id,
+            stored_thread_source.as_ref(),
+            &initial_history,
+        );
         if initial_history.get_multi_agent_version() != Some(MultiAgentVersion::V2) {
             return Err(CodexErr::ThreadNotFound(thread_id));
         }
+        enforce_workflow_child_spawn_bounds(
+            &mut config,
+            parent_completion_delivery,
+            /*fork_mode*/ None,
+        )?;
         let residency_slot = self
             .reserve_v2_residency_slot(&state, &config, Some(thread_id))
             .await?;
@@ -232,6 +299,7 @@ impl AgentControl {
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
+                thread_source: stored_thread_source,
                 inherited_environments,
                 inherited_exec_policy,
             })
@@ -255,12 +323,30 @@ impl AgentControl {
 
     async fn spawn_agent_internal(
         &self,
-        config: Config,
+        mut config: Config,
         initial_input: SpawnInitialInput,
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
-        let state = self.upgrade()?;
+        let gate_state = self.upgrade()?;
+        let _subtree_guard = gate_state
+            .generic_collaboration_subtree_gate()
+            .try_acquire()
+            .map_err(|_| {
+                CodexErr::InvalidRequest(
+                    "agent spawn is unavailable during a recursive collaboration mutation"
+                        .to_string(),
+                )
+            })?;
+        if let Some(spawn_workspace) = options.spawn_workspace.as_ref() {
+            spawn_workspace.apply(&mut config);
+        }
+        enforce_workflow_child_spawn_bounds(
+            &mut config,
+            options.parent_completion_delivery,
+            options.fork_mode.as_ref(),
+        )?;
+        let state = Arc::clone(&gate_state);
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
                 &InitialHistory::New,
@@ -308,6 +394,10 @@ impl AgentControl {
                 agent_role,
                 ..
             })) => {
+                let nickname_reservation = match options.preferred_agent_nickname.clone() {
+                    Some(preferred) => AgentNicknameReservation::Preferred(preferred),
+                    None => AgentNicknameReservation::RandomPool,
+                };
                 let (session_source, agent_metadata) = self.prepare_thread_spawn(
                     &mut reservation,
                     &config,
@@ -315,7 +405,8 @@ impl AgentControl {
                     depth,
                     agent_path,
                     agent_role,
-                    options.preferred_agent_nickname.clone(),
+                    nickname_reservation,
+                    options.parent_completion_delivery,
                 )?;
                 (Some(session_source), agent_metadata)
             }
@@ -343,7 +434,10 @@ impl AgentControl {
                     session_source,
                     options.parent_thread_id,
                     /*forked_from_thread_id*/ None,
-                    /*thread_source*/ Some(ThreadSource::Subagent),
+                    /*thread_source*/
+                    Some(thread_source_for_parent_completion_delivery(
+                        options.parent_completion_delivery,
+                    )),
                     /*metrics_service_name*/ None,
                     inheritance.environments,
                     inheritance.exec_policy,
@@ -560,23 +654,26 @@ impl AgentControl {
                 Vec::new()
             };
         let preserve_reference_context_item = matches!(fork_mode, SpawnAgentForkMode::FullHistory);
-        forked_rollout_items.retain(|item| {
-            keep_forked_rollout_item(item, preserve_reference_context_item)
-                && !matches!(
-                    item,
-                    RolloutItem::ResponseItem(response_item)
-                        if is_multi_agent_v2_usage_hint_message(
-                            response_item,
-                            &multi_agent_v2_usage_hint_texts_to_filter,
-                        )
-                )
+        forked_rollout_items.retain_mut(|item| {
+            if !keep_forked_rollout_item(item, preserve_reference_context_item) {
+                return false;
+            }
+            match item {
+                RolloutItem::ResponseItem(response_item) => {
+                    sanitize_multi_agent_v2_context_message(
+                        response_item,
+                        &multi_agent_v2_usage_hint_texts_to_filter,
+                    )
+                }
+                _ => true,
+            }
         });
         for item in &mut forked_rollout_items {
             if let RolloutItem::Compacted(compacted) = item
                 && let Some(replacement_history) = compacted.replacement_history.as_mut()
             {
-                replacement_history.retain(|response_item| {
-                    !is_multi_agent_v2_usage_hint_message(
+                replacement_history.retain_mut(|response_item| {
+                    sanitize_multi_agent_v2_context_message(
                         response_item,
                         &multi_agent_v2_usage_hint_texts_to_filter,
                     )
@@ -585,14 +682,13 @@ impl AgentControl {
         }
         if preserve_reference_context_item
             && multi_agent_version == MultiAgentVersion::V2
+            && options.parent_completion_delivery != ParentCompletionDelivery::WorkflowSupervisor
             && let Some(subagent_usage_hint_text) =
                 config.multi_agent_v2.subagent_usage_hint_text.clone()
-            && let Some(subagent_usage_hint_message) =
-                crate::context_manager::updates::build_developer_update_item(vec![
-                    subagent_usage_hint_text,
-                ])
         {
-            forked_rollout_items.push(RolloutItem::ResponseItem(subagent_usage_hint_message));
+            forked_rollout_items.push(RolloutItem::ResponseItem(ContextualUserFragment::into(
+                MultiAgentUsageHint::new(&subagent_usage_hint_text),
+            )));
         }
         let mut thread_extension_init = ExtensionDataInit::new();
         thread_extension_init.insert(selected_capability_roots);
@@ -603,7 +699,10 @@ impl AgentControl {
                 InitialHistory::Forked(forked_rollout_items),
                 self.clone(),
                 session_source,
-                /*thread_source*/ Some(ThreadSource::Subagent),
+                /*thread_source*/
+                Some(thread_source_for_parent_completion_delivery(
+                    options.parent_completion_delivery,
+                )),
                 /*parent_thread_id*/ Some(parent_thread_id),
                 /*forked_from_thread_id*/ Some(parent_thread_id),
                 inherited_environments,
@@ -615,11 +714,48 @@ impl AgentControl {
     }
 
     /// Resume an existing agent thread from a recorded rollout file.
+    #[cfg(test)]
     pub(crate) async fn resume_agent_from_rollout(
         &self,
         config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
+    ) -> CodexResult<ThreadId> {
+        Box::pin(
+            self.resume_agent_from_rollout_with_optional_captured_descendants(
+                config,
+                thread_id,
+                session_source,
+                /*captured_children_by_parent*/ None,
+            ),
+        )
+        .await
+    }
+
+    pub(super) async fn resume_agent_from_rollout_with_captured_descendants(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+        session_source: SessionSource,
+        captured_children_by_parent: HashMap<ThreadId, Vec<ThreadId>>,
+    ) -> CodexResult<ThreadId> {
+        Box::pin(
+            self.resume_agent_from_rollout_with_optional_captured_descendants(
+                config,
+                thread_id,
+                session_source,
+                Some(captured_children_by_parent),
+            ),
+        )
+        .await
+    }
+
+    async fn resume_agent_from_rollout_with_optional_captured_descendants(
+        &self,
+        config: Config,
+        thread_id: ThreadId,
+        session_source: SessionSource,
+        mut captured_children_by_parent: Option<HashMap<ThreadId, Vec<ThreadId>>>,
     ) -> CodexResult<ThreadId> {
         let root_depth = thread_spawn_depth(&session_source).unwrap_or(0);
         let (resumed_thread_id, resumed_multi_agent_version) = Box::pin(
@@ -632,25 +768,35 @@ impl AgentControl {
         {
             return Ok(resumed_thread_id);
         }
-        let Some(agent_graph_store) = state.agent_graph_store() else {
+        let agent_graph_store = state.agent_graph_store();
+        if captured_children_by_parent.is_none() && agent_graph_store.is_none() {
             return Ok(resumed_thread_id);
-        };
+        }
 
         let mut resume_queue = VecDeque::from([(thread_id, root_depth)]);
         while let Some((parent_thread_id, parent_depth)) = resume_queue.pop_front() {
-            let child_ids = match agent_graph_store
-                .list_thread_spawn_children(
-                    parent_thread_id,
-                    Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
-                )
-                .await
-            {
-                Ok(child_ids) => child_ids,
-                Err(err) => {
-                    warn!(
-                        "failed to load persisted thread-spawn children for {parent_thread_id}: {err}"
-                    );
+            let child_ids = if let Some(children_by_parent) = captured_children_by_parent.as_mut() {
+                children_by_parent
+                    .remove(&parent_thread_id)
+                    .unwrap_or_default()
+            } else {
+                let Some(agent_graph_store) = agent_graph_store.as_ref() else {
                     continue;
+                };
+                match agent_graph_store
+                    .list_thread_spawn_children(
+                        parent_thread_id,
+                        Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
+                    )
+                    .await
+                {
+                    Ok(child_ids) => child_ids,
+                    Err(err) => {
+                        warn!(
+                            "failed to load persisted thread-spawn children for {parent_thread_id}: {err}"
+                        );
+                        continue;
+                    }
                 }
             };
 
@@ -692,7 +838,7 @@ impl AgentControl {
 
     async fn resume_single_agent_from_rollout(
         &self,
-        config: Config,
+        mut config: Config,
         thread_id: ThreadId,
         session_source: SessionSource,
     ) -> CodexResult<(ThreadId, MultiAgentVersion)> {
@@ -712,6 +858,7 @@ impl AgentControl {
             .map_err(|err| CodexErr::InvalidRequest(format!("invalid stored agent path: {err}")))?;
         let resumed_agent_nickname = stored_thread.agent_nickname.clone();
         let resumed_agent_role = stored_thread.agent_role.clone();
+        let stored_thread_source = stored_thread.thread_source.clone();
         let history = stored_thread
             .history
             .ok_or_else(|| CodexErr::ThreadNotFound(thread_id))?
@@ -721,6 +868,16 @@ impl AgentControl {
             history: Arc::new(history),
             rollout_path: stored_thread.rollout_path,
         });
+        let parent_completion_delivery = resumed_parent_completion_delivery(
+            thread_id,
+            stored_thread_source.as_ref(),
+            &initial_history,
+        );
+        enforce_workflow_child_spawn_bounds(
+            &mut config,
+            parent_completion_delivery,
+            /*fork_mode*/ None,
+        )?;
         let parent_thread_id = stored_thread.parent_thread_id;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -747,7 +904,11 @@ impl AgentControl {
                 depth,
                 agent_path.or(resumed_agent_path),
                 resumed_agent_role,
-                resumed_agent_nickname,
+                match resumed_agent_nickname {
+                    Some(restored) => AgentNicknameReservation::Restored(restored),
+                    None => AgentNicknameReservation::RandomPool,
+                },
+                parent_completion_delivery,
             )?,
             other => (other, AgentMetadata::default()),
         };
@@ -766,6 +927,7 @@ impl AgentControl {
                 agent_control: self.clone(),
                 session_source,
                 parent_thread_id,
+                thread_source: stored_thread_source,
                 inherited_environments,
                 inherited_exec_policy,
             })
@@ -799,3 +961,7 @@ impl AgentControl {
         Ok((resumed_thread.thread_id, multi_agent_version))
     }
 }
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;

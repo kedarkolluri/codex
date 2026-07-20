@@ -1187,6 +1187,373 @@ async fn resume_stopped_thread_from_rollout_preserves_thread_source() {
 }
 
 #[tokio::test]
+async fn resumed_workflow_thread_source_cannot_be_overridden() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let workflow_thread_source = ThreadSource::Feature("workflow".to_string());
+    let source = manager
+        .start_thread_with_options(StartThreadOptions {
+            config: config.clone(),
+            allow_provider_model_fallback: false,
+            initial_history: InitialHistory::New,
+            history_mode: None,
+            session_source: None,
+            thread_source: Some(workflow_thread_source.clone()),
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: Vec::new(),
+            thread_extension_init: Default::default(),
+            supports_openai_form_elicitation: false,
+        })
+        .await
+        .expect("start workflow-managed source thread");
+    source.thread.ensure_rollout_materialized().await;
+    source
+        .thread
+        .flush_rollout()
+        .await
+        .expect("flush workflow-managed source rollout");
+    let rollout_path = source
+        .thread
+        .rollout_path()
+        .expect("workflow-managed source rollout path");
+    let initial_history = RolloutRecorder::get_rollout_history(&rollout_path)
+        .await
+        .expect("read workflow-managed source rollout");
+    source
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown workflow-managed source thread");
+    let _ = manager.remove_thread(&source.thread_id).await;
+
+    let resumed = manager
+        .start_thread_with_options(StartThreadOptions {
+            config,
+            allow_provider_model_fallback: false,
+            initial_history,
+            history_mode: None,
+            session_source: None,
+            thread_source: Some(ThreadSource::User),
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: Vec::new(),
+            thread_extension_init: Default::default(),
+            supports_openai_form_elicitation: false,
+        })
+        .await
+        .expect("resume workflow-managed thread");
+
+    assert_eq!(
+        resumed.thread.config_snapshot().await.thread_source,
+        Some(workflow_thread_source.clone())
+    );
+    let config_before_refresh = resumed.thread.config().await;
+    resumed
+        .thread
+        .refresh_runtime_config((*config_before_refresh).clone())
+        .await;
+    assert!(Arc::ptr_eq(
+        &config_before_refresh,
+        &resumed.thread.config().await
+    ));
+    for result in [
+        resumed
+            .thread
+            .increment_out_of_band_elicitation_count()
+            .await,
+        resumed
+            .thread
+            .decrement_out_of_band_elicitation_count()
+            .await,
+    ] {
+        let CodexErr::InvalidRequest(message) =
+            result.expect_err("workflow elicitation control must be rejected")
+        else {
+            panic!("workflow elicitation control returned an unexpected error");
+        };
+        assert_eq!(
+            message,
+            "workflow-managed threads do not support out-of-band elicitation control"
+        );
+    }
+    let start_error = resumed
+        .thread
+        .start_saved_workflow("must-not-start", serde_json::Value::Null)
+        .await
+        .expect_err("workflow child must not start a top-level workflow");
+    let resume_error = resumed
+        .thread
+        .resume_workflow_run("00000000-0000-0000-0000-000000000000")
+        .await
+        .expect_err("workflow child must not resume a top-level workflow");
+    for (error, expected_message) in [
+        (
+            start_error,
+            "workflow-managed threads cannot start workflows",
+        ),
+        (
+            resume_error,
+            "workflow-managed threads cannot resume workflows",
+        ),
+    ] {
+        let CodexErr::InvalidRequest(message) = error else {
+            panic!("workflow entrypoint returned an unexpected error");
+        };
+        assert_eq!(message, expected_message);
+    }
+    assert_eq!(
+        resumed.thread.stop_workflow_run("must-not-stop").await,
+        crate::WorkflowStopDisposition::NotRunning
+    );
+    assert_eq!(
+        resumed.thread.pause_workflow_run("must-not-pause").await,
+        crate::WorkflowPauseDisposition::NotRunning
+    );
+    assert_eq!(
+        resumed
+            .thread
+            .control_workflow_agent(
+                "must-not-control",
+                /*node_id*/ 0,
+                /*attempt*/ 0,
+                crate::WorkflowAgentControlAction::Skip,
+            )
+            .await,
+        crate::WorkflowAgentControlDisposition::Unavailable
+    );
+    let injection_error = resumed
+        .thread
+        .inject_response_items(vec![user_msg("must not steer workflow child work")])
+        .await
+        .expect_err("workflow child must reject direct item injection");
+    let CodexErr::InvalidRequest(message) = injection_error else {
+        panic!("workflow child injection returned an unexpected error");
+    };
+    assert_eq!(
+        message,
+        "workflow-managed threads do not accept direct item injection"
+    );
+    let mcp_tool_error = resumed
+        .thread
+        .call_mcp_tool("must-not-call", "must-not-call", None, None)
+        .await
+        .expect_err("workflow child must reject direct MCP tool calls");
+    assert_eq!(
+        mcp_tool_error.to_string(),
+        "workflow-managed threads do not accept direct MCP tool calls"
+    );
+
+    let live_metadata = resumed
+        .thread
+        .update_thread_metadata(
+            ThreadMetadataPatch {
+                thread_source: Some(Some(ThreadSource::User)),
+                ..Default::default()
+            },
+            /*include_archived*/ false,
+        )
+        .await
+        .expect("update workflow child display metadata");
+    assert_eq!(
+        live_metadata.thread_source,
+        Some(workflow_thread_source.clone())
+    );
+
+    let append_error = resumed
+        .thread
+        .append_rollout_items(&[RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                id: resumed.thread_id,
+                thread_source: Some(ThreadSource::User),
+                ..SessionMeta::default()
+            },
+            git: None,
+        })])
+        .await
+        .expect_err("workflow child session metadata replacement must fail closed");
+    let ThreadStoreError::InvalidRequest { message } = append_error else {
+        panic!("unexpected workflow metadata append error");
+    };
+    assert_eq!(
+        message,
+        "workflow-managed thread metadata cannot be replaced"
+    );
+
+    resumed
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown resumed workflow thread");
+    let _ = manager.remove_thread(&resumed.thread_id).await;
+    assert!(
+        manager
+            .agent_control()
+            .is_workflow_managed_agent(resumed.thread_id)
+            .await
+    );
+
+    let cold_metadata = manager
+        .update_thread_metadata(
+            resumed.thread_id,
+            ThreadMetadataPatch {
+                thread_source: Some(None),
+                ..Default::default()
+            },
+            /*include_archived*/ false,
+        )
+        .await
+        .expect("update cold workflow child display metadata");
+    assert_eq!(cold_metadata.thread_source, Some(workflow_thread_source));
+}
+
+#[tokio::test]
+async fn metadata_updates_cannot_assign_workflow_thread_ownership() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let thread = manager
+        .start_thread(config)
+        .await
+        .expect("start ordinary thread");
+    thread.thread.ensure_rollout_materialized().await;
+    thread.thread.flush_rollout().await.expect("flush rollout");
+    let workflow_patch = || ThreadMetadataPatch {
+        thread_source: Some(Some(ThreadSource::Feature("workflow".to_string()))),
+        ..Default::default()
+    };
+
+    let live_error = thread
+        .thread
+        .update_thread_metadata(workflow_patch(), /*include_archived*/ false)
+        .await
+        .expect_err("live metadata update must not assign workflow ownership");
+    let ThreadStoreError::InvalidRequest { message } = live_error else {
+        panic!("unexpected live metadata update error: {live_error}");
+    };
+    assert_eq!(
+        message,
+        "workflow-managed thread ownership cannot be assigned through metadata updates"
+    );
+
+    thread
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown ordinary thread");
+    let _ = manager.remove_thread(&thread.thread_id).await;
+
+    let cold_error = manager
+        .update_thread_metadata(
+            thread.thread_id,
+            workflow_patch(),
+            /*include_archived*/ false,
+        )
+        .await
+        .expect_err("cold metadata update must not assign workflow ownership");
+    let CodexErr::InvalidRequest(message) = cold_error else {
+        panic!("unexpected cold metadata update error: {cold_error}");
+    };
+    assert_eq!(
+        message,
+        "workflow-managed thread ownership cannot be assigned through metadata updates"
+    );
+}
+
+#[tokio::test]
+async fn workflow_managed_history_cannot_be_downgraded_or_forked() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    );
+    let workflow_history = || {
+        InitialHistory::Forked(vec![RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                thread_source: Some(ThreadSource::Feature("workflow".to_string())),
+                ..SessionMeta::default()
+            },
+            git: None,
+        })])
+    };
+
+    let direct_start = manager
+        .start_thread_with_options(StartThreadOptions {
+            config: config.clone(),
+            allow_provider_model_fallback: false,
+            initial_history: workflow_history(),
+            history_mode: None,
+            session_source: None,
+            thread_source: Some(ThreadSource::User),
+            dynamic_tools: Vec::new(),
+            metrics_service_name: None,
+            parent_trace: None,
+            environments: Vec::new(),
+            thread_extension_init: Default::default(),
+            supports_openai_form_elicitation: false,
+        })
+        .await;
+    let direct_start_error = match direct_start {
+        Ok(_) => panic!("workflow-managed forked history must not be started"),
+        Err(err) => err,
+    };
+    let message = match direct_start_error {
+        CodexErr::InvalidRequest(message) => message,
+        err => panic!("unexpected direct-start error: {err}"),
+    };
+    assert_eq!(message, "workflow-managed threads cannot be forked");
+
+    let result = manager
+        .fork_thread_from_history(
+            ForkSnapshot::Interrupted,
+            config,
+            workflow_history(),
+            Some(ThreadSource::User),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await;
+    let err = match result {
+        Ok(_) => panic!("workflow-managed history must not be forked"),
+        Err(err) => err,
+    };
+    let message = match err {
+        CodexErr::InvalidRequest(message) => message,
+        err => panic!("unexpected fork error: {err}"),
+    };
+
+    assert_eq!(message, "workflow-managed threads cannot be forked");
+}
+
+#[tokio::test]
 async fn subtree_listing_uses_injected_graph_store_without_state_db() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

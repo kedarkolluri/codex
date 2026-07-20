@@ -1,0 +1,345 @@
+{
+  "files": {
+    ".github/dynamic-workflows-uat/codex-control.config.toml.in": {
+      "sha256": "555106afca38a7c4c7301c49f57b9b119c98a2a9d31d881689b044899931bed8"
+    },
+    ".github/dynamic-workflows-uat/fixture_manifest.py": {
+      "sha256": "5817d331d43c6a71c6adf8094e0f17f5fccd528b601421d4e614fc98acd9684e"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-agent-control.js": {
+      "sha256": "dc6e585cdaace3ac1197d855b92ffe4fdd170416b18567a8ce073c288890092c"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-budget.js": {
+      "sha256": "cbc90cd0aecaeca2a3532a7ab79cd2b47ab3d33c103d7ee192d0d75f8bc2de72"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-failure-null.js": {
+      "sha256": "bfd8ae2553f40c81ab8173218eb805a47ccd5ab6ebc97bc69d12068dc8208707"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-monitor.js": {
+      "sha256": "c1245b4a78ffdf7b9b731ef2d68e257d110e98265076efb2c85c1c0bc3fa72a0"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-nested-child.js": {
+      "sha256": "d7259a44a68f6b77f43547a60c44b649739b1ade4e28d182d0a2b1221d09602b"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-nested-grandchild.js": {
+      "sha256": "f6e7929f0db37dcc13472ac016d9a6f679204b5b3aceaeb1bfb16028bbac3d1c"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-nested-parent.js": {
+      "sha256": "bd71d801e5974d94d98a14f148dda71af8538189d88cbe714cc725bac65dd181"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-parallel-barrier.js": {
+      "sha256": "4f50160f92ede59a8a206483ee09a709a5cb10dab5e39d1c99e248ab0cd9eb42"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-pause.js": {
+      "sha256": "48a1cb855eafb5c3dc9d64caaf39ded5a2728062605d8b48a492732f36bdcb9a"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-pipeline-stagger.js": {
+      "sha256": "ee0738d822eb7197f110077d58051efe6134ecabd47138eac0afde1e170b4fa5"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-save.js": {
+      "sha256": "eeec0d7ac80917d3b8214ad6da0e68848f9f947b0e689457c4f0ccac1a6b29fb"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-stop.js": {
+      "sha256": "1d944e00fcdbcee83cd2c95dd63d51a309e11ea8be2885cd7ef7ee83eca933fe"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-worktree.js": {
+      "sha256": "874385471a4fb70c2ff7ca0b04c2b25f065ebe28b135d1d19786834ffe92d847"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/.claude/workflows/uat-zero.js": {
+      "sha256": "f38c3c5d1b904f560690565f101661ee65409b2a84c3b96a9306d78a9ed66dfa"
+    },
+    ".github/dynamic-workflows-uat/fixtures/claude-project/README.md": {
+      "sha256": "faa7fd5a8879fdcc1f5c8269e62895cfc4fcf10433c122de1005816c7ca8bb04"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-home/workflows/uat-save.js": {
+      "sha256": "de41e246f8bddbd319e4f92a72f03bb224b5a0c48f3909bc4f7ae42ef2367cd7"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-agent-control.js": {
+      "sha256": "16c60b2859adfe14907d92c8850665d3617a85e9cef896191b5afcdbb4ead294"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-budget.js": {
+      "sha256": "6a120f4a33142bfd91f03a6ba42f4c694dc2790393d6a0404d72005c8e0b7ede"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-failure-null.js": {
+      "sha256": "e8042ae8cec582e8354848f8274f89d0583ecbbfb524f89c797836e400c4d4b6"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-monitor.js": {
+      "sha256": "105faba85a4f963d6d3989bbb56b8d9eab0fd8bb3e6e74acc30aec021de513cc"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-nested-child.js": {
+      "sha256": "02093429296b41e03c9bd76c2f5c835b8a25fd4a0bd3a3e7c92b9c6e74adc37a"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-nested-grandchild.js": {
+      "sha256": "6acc2cfc087b7389f26f0b59361d275379e999ead9f876b2ff0066fe6ae59d5f"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-nested-parent.js": {
+      "sha256": "25849d44af5c12b9a9b937c799559f3cd130c09f9f3650c4849df5ebd685d317"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-parallel-barrier.js": {
+      "sha256": "ace48b43111cd9b300d2cd7b82a85ef78cdfa3d546f202640c0997f3eff6c7fc"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-pause.js": {
+      "sha256": "ee479935c532ae122dd55fb3a8102f4173ae3eb8d72a58093fd72d60c285e691"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-pipeline-stagger.js": {
+      "sha256": "e9563877a0ed4115fd0a57f2f8501979656d5c5bb29b3508312d0db30b951866"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-stop.js": {
+      "sha256": "90a054010f2ccaf6138a5d1ad1cc5dd47c394833a225b3bc1f13cd53d2ba88c1"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-worktree.js": {
+      "sha256": "4d9b74a296d1d2b8f4336eb5e86ba93fc5089bb4e57763fa9f9e67e5b125f1ab"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/.codex/workflows/uat-zero.js": {
+      "sha256": "2599f76920129674f8bc98b14561acac829634f4e8012b5ba03acaa0af44b5f5"
+    },
+    ".github/dynamic-workflows-uat/fixtures/codex-project/README.md": {
+      "sha256": "c54e9b31784e33039b5e6bec8abcc63a7716a78fc672fd3d29ba1fd33aff107d"
+    },
+    ".github/dynamic-workflows-uat/mock_responses_server.py": {
+      "sha256": "3b66e35660c0249b9438a896c0ffd4f40af48db6591a6ecf75d05d8dbd7b6f7c"
+    },
+    ".github/dynamic-workflows-uat/test_mock_responses_server.py": {
+      "sha256": "c05123e27870d8a4a2f7d3cdd7fca4b69e6913359731f16292fbdcfc1b63ab1c"
+    },
+    ".github/dynamic-workflows-uat/test_transcript_verifier.py": {
+      "sha256": "535c7a9bed6002938cf27509275a55b00327309ba5ccea401af550c55d5d06d6"
+    },
+    ".github/dynamic-workflows-uat/transcript_verifier.py": {
+      "sha256": "9a5ff37e16b4c212c2cfb849338337740b63e45d7d2950452271b34dc9d1bfee"
+    }
+  },
+  "geometry": {
+    "columns": 120,
+    "rows": 36
+  },
+  "notes": {
+    "cancellation_lanes": "Stop, the pre-checkpoint pause attempt, selected-agent skip, and the pre-retry canceled attempt intentionally end after their tool phase; they must not be counted as final replies.",
+    "selected_agent": "Selected-agent control lanes target agent-a."
+  },
+  "route_expectations": [
+    {
+      "expected_request_count": 4,
+      "lane": "baseline/monitor",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "monitor-a"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "monitor-a"
+        },
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "monitor-b"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "monitor-b"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 1,
+      "lane": "stop",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "stop"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 0,
+      "lane": "save",
+      "routes": []
+    },
+    {
+      "expected_request_count": 3,
+      "lane": "pause/resume",
+      "routes": [
+        {
+          "count": 2,
+          "phase": "tool",
+          "route": "pause"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "pause"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 3,
+      "lane": "skip",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "agent-a"
+        },
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "agent-b"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "agent-b"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 5,
+      "lane": "retry",
+      "routes": [
+        {
+          "count": 2,
+          "phase": "tool",
+          "route": "agent-a"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "agent-a"
+        },
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "agent-b"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "agent-b"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 3,
+      "lane": "failure/null",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "failed",
+          "route": "failure-null"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "failure-sibling"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "failure-schema"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 2,
+      "forbidden_routes": [
+        "budget-2",
+        "budget-3"
+      ],
+      "lane": "budget-36",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "budget-0"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "budget-1"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 3,
+      "lane": "parallel barrier",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "parallel-fast"
+        },
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "parallel-held"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "parallel-held"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 4,
+      "lane": "pipeline stagger",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "pipeline-a0"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "pipeline-a1"
+        },
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "pipeline-b0"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "pipeline-b0"
+        }
+      ]
+    },
+    {
+      "expected_request_count": 0,
+      "lane": "nesting",
+      "routes": []
+    },
+    {
+      "expected_request_count": 2,
+      "lane": "worktree",
+      "routes": [
+        {
+          "count": 1,
+          "phase": "tool",
+          "route": "worktree"
+        },
+        {
+          "count": 1,
+          "phase": "final",
+          "route": "worktree"
+        }
+      ]
+    }
+  ],
+  "schema_version": 1,
+  "unmatched_request_policy": {
+    "http_status": 422,
+    "mode": "fail_closed",
+    "transcript": {
+      "phase": "rejected",
+      "scenario": "unmatched"
+    }
+  }
+}

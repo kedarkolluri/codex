@@ -30,6 +30,7 @@ impl Handler {
             payload,
             ..
         } = invocation;
+        ensure_collaboration_sender_allowed(session.as_ref()).await?;
         let arguments = function_arguments(payload)?;
         let args: ListAgentsArgs = parse_arguments(&arguments)?;
         session

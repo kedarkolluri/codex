@@ -1,14 +1,20 @@
 use super::*;
 use crate::agent::control::spawn_await_opts::SpawnAgentConfigOverrides;
+use crate::agent::control::workflow_child_progress;
+use crate::agent::control::workflow_child_progress::WorkflowChildObserver;
+use crate::agent::control::workflow_child_progress::WorkflowChildProgress;
+use crate::agent::registry::ParentCompletionDelivery;
 use crate::agent::registry::next_thread_spawn_depth;
+use crate::session::StartTurnIfIdleOutcome;
 use crate::session::turn_context::TurnContext;
-use crate::tools::handlers::multi_agents::build_agent_spawn_config;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::TokenUsage;
 use std::path::PathBuf;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::error::TryRecvError;
+use tokio_util::sync::CancellationToken;
 
 /// The outcome of a workflow `agent()` spawn enriched with the run→agent linkage facts the journal
 /// (§7) records: the child's final assistant message plus its `child_thread_id`, absolute
@@ -29,6 +35,13 @@ pub(crate) struct SpawnAwaitOutcome {
     pub(crate) rollout_path: Option<PathBuf>,
     /// The child's metered output-token spend for this call (from its `token_usage_info`).
     pub(crate) tokens_spent: Option<u64>,
+    /// Full final counters used by workflow progress. Defaults to zero only when no child was
+    /// spawned and therefore no usage exists.
+    pub(crate) token_usage: TokenUsage,
+    /// Completed tool requests reconstructed from the child's durable turn history.
+    pub(crate) tool_call_count: u64,
+    /// Whether caller cancellation won and the registered child was explicitly reaped.
+    pub(crate) cancelled: bool,
 }
 
 impl SpawnAwaitOutcome {
@@ -38,12 +51,18 @@ impl SpawnAwaitOutcome {
     }
 }
 
+enum SpawnAwaitCancellation {
+    Never,
+    Token(CancellationToken),
+}
+
 impl AgentControl {
     /// Spawn a subagent through the **registering** spawn path and block until the child's first
     /// turn completes, returning the child's final assistant message.
     ///
     /// The child is spawned via [`AgentControl::spawn_agent_deferred_input`] →
-    /// `spawn_agent_internal` → `spawn_new_thread_with_source(ThreadSource::Subagent)`, the only
+    /// `spawn_agent_internal` → `spawn_new_thread_with_source(ThreadSource::Feature("workflow"))`,
+    /// the only
     /// path that registers the child in `thread_manager.threads`, fires `notify_thread_created`,
     /// and persists the `agent-graph-store` spawn edge. Those three side effects are exactly what
     /// the workflow monitor, live-attach, and per-agent session-saving features depend on, so this
@@ -115,6 +134,26 @@ impl AgentControl {
         .final_text
     }
 
+    /// Resolve the exact inherited/model/effort/role child config without spawning. Workflow
+    /// progress uses this to publish `AgentBegin` before the child starts with the same effective
+    /// identity the spawn path consumes.
+    pub(crate) async fn prepare_workflow_spawn_config(
+        &self,
+        base_instructions: &BaseInstructions,
+        parent_turn: &TurnContext,
+        parent_thread_id: ThreadId,
+        overrides: &SpawnAgentConfigOverrides,
+    ) -> Option<crate::config::Config> {
+        workflow_child_progress::prepare_spawn_config(
+            self,
+            base_instructions,
+            parent_turn,
+            parent_thread_id,
+            overrides,
+        )
+        .await
+    }
+
     /// Enriched twin of [`Self::spawn_and_await_final_message`] that additionally surfaces the child's
     /// `child_thread_id`, absolute `rollout_path`, and metered `tokens_spent` so the workflow host can
     /// write a §7 `agent_call` journal line — the authoritative run→agent link. Behaviorally identical
@@ -129,60 +168,107 @@ impl AgentControl {
         input: Vec<UserInput>,
         final_output_json_schema: Option<serde_json::Value>,
         overrides: SpawnAgentConfigOverrides,
-        mut options: SpawnAgentOptions,
+        options: SpawnAgentOptions,
     ) -> SpawnAwaitOutcome {
-        let mut config = match build_agent_spawn_config(base_instructions, parent_turn) {
-            Ok(config) => config,
-            Err(err) => {
-                warn!("failed to build subagent spawn config: {err}");
-                return SpawnAwaitOutcome::failed();
-            }
+        let Some(config) = self
+            .prepare_workflow_spawn_config(
+                base_instructions,
+                parent_turn,
+                parent_thread_id,
+                &overrides,
+            )
+            .await
+        else {
+            return SpawnAwaitOutcome::failed();
         };
+        self.spawn_and_await_journaled_with_config(
+            config,
+            parent_turn,
+            parent_thread_id,
+            input,
+            final_output_json_schema,
+            options,
+            None,
+        )
+        .await
+    }
 
-        // Apply the requested `agent()` `opts.model` / `opts.effort` / `opts.agentType` on top of the
-        // inherited config, in the same config-build step (and ordering) the V2 `spawn_agent` tool
-        // uses. Resolving a requested model needs the session `ModelsManager`, so look up the
-        // (registered) parent thread's session; effort-only requests validate against the parent
-        // turn's current model. Any unresolved model / unsupported effort / unknown role resolves the
-        // call to `None` (death-is-null) rather than spawning a child with the wrong model, an
-        // out-of-contract effort, or a silently-defaulted role.
-        if !overrides.is_empty() {
-            let state = match self.upgrade() {
-                Ok(state) => state,
-                Err(err) => {
-                    warn!("thread manager dropped before resolving subagent overrides: {err}");
-                    return SpawnAwaitOutcome::failed();
-                }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_and_await_journaled_with_config(
+        &self,
+        config: crate::config::Config,
+        parent_turn: &TurnContext,
+        parent_thread_id: ThreadId,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+        options: SpawnAgentOptions,
+        observer: Option<WorkflowChildObserver>,
+    ) -> SpawnAwaitOutcome {
+        self.spawn_and_await_journaled_with_config_inner(
+            config,
+            parent_turn,
+            parent_thread_id,
+            input,
+            final_output_json_schema,
+            options,
+            observer,
+            SpawnAwaitCancellation::Never,
+        )
+        .await
+    }
+
+    /// Cancellation-aware twin used when an external resource must remain owned until the child
+    /// has stopped. It explicitly reaps a registered child before returning `cancelled: true`, so
+    /// the caller can safely close a worktree guard without racing a still-running process.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_and_await_journaled_with_config_cancellable(
+        &self,
+        config: crate::config::Config,
+        parent_turn: &TurnContext,
+        parent_thread_id: ThreadId,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+        options: SpawnAgentOptions,
+        observer: Option<WorkflowChildObserver>,
+        cancellation_token: CancellationToken,
+    ) -> SpawnAwaitOutcome {
+        self.spawn_and_await_journaled_with_config_inner(
+            config,
+            parent_turn,
+            parent_thread_id,
+            input,
+            final_output_json_schema,
+            options,
+            observer,
+            SpawnAwaitCancellation::Token(cancellation_token),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_and_await_journaled_with_config_inner(
+        &self,
+        config: crate::config::Config,
+        parent_turn: &TurnContext,
+        parent_thread_id: ThreadId,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+        mut options: SpawnAgentOptions,
+        observer: Option<WorkflowChildObserver>,
+        cancellation: SpawnAwaitCancellation,
+    ) -> SpawnAwaitOutcome {
+        if matches!(
+            &cancellation,
+            SpawnAwaitCancellation::Token(token) if token.is_cancelled()
+        ) {
+            return SpawnAwaitOutcome {
+                cancelled: true,
+                ..SpawnAwaitOutcome::failed()
             };
-            let parent_thread = match state.get_thread(parent_thread_id).await {
-                Ok(parent_thread) => parent_thread,
-                Err(err) => {
-                    warn!(
-                        "parent thread {parent_thread_id} not registered while resolving subagent \
-                         overrides: {err}"
-                    );
-                    return SpawnAwaitOutcome::failed();
-                }
-            };
-            if let Err(err) = overrides
-                .apply(&parent_thread.codex.session, parent_turn, &mut config)
-                .await
-            {
-                warn!("failed to apply subagent model/effort overrides: {err}");
-                return SpawnAwaitOutcome::failed();
-            }
-        } else {
-            // Even with no requested model/effort/agentType, the role layer must still run so a
-            // user-defined role literally named `default` (`DEFAULT_ROLE_NAME`) is applied to a bare
-            // `agent("prompt")` — matching the V2 `spawn_agent` path, which always calls
-            // `apply_role_to_config(.., None)`. This needs no session/`ModelsManager`, so it runs
-            // without upgrading the manager or looking up the parent thread.
-            if let Err(err) = overrides.apply_role_layer(&mut config).await {
-                warn!("failed to apply default subagent role: {err}");
-                return SpawnAwaitOutcome::failed();
-            }
         }
-
+        if observer.is_some() {
+            options.parent_completion_delivery = ParentCompletionDelivery::WorkflowSupervisor;
+        }
         // Make the Subagent source intrinsic: constructing it here (rather than accepting an
         // `Option<SessionSource>`) forces the registering, spawn-edge-writing path for every
         // caller. `spawn_agent_internal` re-derives the agent nickname/path via
@@ -196,9 +282,13 @@ impl AgentControl {
             depth: next_thread_spawn_depth(&parent_turn.session_source),
             agent_path: None,
             agent_nickname: None,
-            agent_role: None,
+            agent_role: options.agent_role.clone(),
         });
         options.parent_thread_id = Some(parent_thread_id);
+        // A typed workspace override currently denotes an externally-owned isolated checkout.
+        // The caller cannot safely close that checkout while the child session (including any
+        // background processes it owns) remains live, even after the first turn has completed.
+        let reap_after_first_turn = options.spawn_workspace.is_some();
 
         let spawned = match self
             .spawn_agent_deferred_input(config, Some(session_source), options)
@@ -211,71 +301,106 @@ impl AgentControl {
             }
         };
 
+        // Arm the reaper before awaiting any post-registration work. In particular, rollout
+        // materialization, durable binding, and the host acknowledgment below may all yield; if
+        // this future is cancelled during any of them, the deferred child must not leak.
+        let mut reaper = SpawnedChildReaper::new(self.clone(), spawned.thread_id);
+        if let Some(observer) = &observer
+            && let Err(err) = observer.child_bound(self, spawned.thread_id).await
+        {
+            warn!(
+                "workflow child {} failed to bind before its first turn: {err}",
+                spawned.thread_id
+            );
+            self.reap_spawned_child(spawned.thread_id).await;
+            reaper.disarm();
+            return SpawnAwaitOutcome::failed();
+        }
+
         // From here the child is registered (registry slot + nickname + a scheduler permit held by
         // the caller). If this future is cancelled/dropped before `await_first_turn_final_message`
         // returns, the child would leak; the reaper terminates + deregisters it on drop. It is
-        // disarmed on any normal return — a child that ran its turn keeps its natural lifecycle (the
-        // workflow monitor / live-attach depend on it), and a submit-failure reaps explicitly inside
-        // `await_first_turn_final_message`.
-        let mut reaper = SpawnedChildReaper::new(self.clone(), spawned.thread_id);
-        let final_text = self
-            .await_first_turn_final_message(spawned.thread_id, input, final_output_json_schema)
-            .await;
-        reaper.disarm();
-
+        // disarmed on any normal return after journal facts are gathered. A normal child keeps its
+        // natural lifecycle (the workflow monitor / live-attach depend on it); a child backed by an
+        // externally-owned workspace is shut down after its first turn so that workspace can then
+        // be closed safely. Submit failures reap explicitly inside `await_first_turn_final_message`.
+        let first_turn = self.await_first_turn_final_message(
+            spawned.thread_id,
+            input,
+            final_output_json_schema,
+            observer,
+        );
+        tokio::pin!(first_turn);
+        let (final_text, cancelled, reaped_facts) = match cancellation {
+            SpawnAwaitCancellation::Never => (first_turn.await, false, None),
+            SpawnAwaitCancellation::Token(cancellation_token) => {
+                tokio::select! {
+                    final_text = &mut first_turn => (final_text, false, None),
+                    _ = cancellation_token.cancelled() => {
+                        let facts = self.reap_spawned_child(spawned.thread_id).await;
+                        (None, true, Some(facts))
+                    }
+                }
+            }
+        };
         // Gather the §7 run→agent linkage facts from the (still-registered) child: its absolute
         // rollout path and its metered output-token spend for this call. A child that ran its turn
-        // keeps its natural lifecycle, so it is normally still registered here; if it has already been
-        // torn down (abort/teardown) these degrade to `None`, which is fine — the journal exempts
-        // non-`completed` lines from carrying linkage.
-        let (rollout_path, tokens_spent) = self.child_journal_facts(spawned.thread_id).await;
+        // is normally still registered here; if it has already been torn down (abort/teardown)
+        // these degrade to `None`, which is fine — the journal exempts non-`completed` lines from
+        // carrying linkage. Isolated children are shut down only after these facts are captured.
+        let facts = if let Some(facts) = reaped_facts {
+            facts
+        } else if reap_after_first_turn {
+            self.reap_spawned_child(spawned.thread_id).await
+        } else {
+            workflow_child_progress::child_journal_facts(self, spawned.thread_id).await
+        };
+        reaper.disarm();
         SpawnAwaitOutcome {
             final_text,
             child_thread_id: Some(spawned.thread_id),
-            rollout_path,
-            tokens_spent,
+            rollout_path: facts.rollout_path,
+            tokens_spent: Some(facts.token_usage.output_tokens.max(0) as u64),
+            token_usage: facts.token_usage,
+            tool_call_count: facts.tool_call_count,
+            cancelled,
         }
-    }
-
-    /// Read a spawned child's journal linkage facts — its absolute rollout path and metered
-    /// output-token spend — after its turn finalized. Materializes the child's rollout file first so
-    /// the recorded `rollout_path` points at a file that exists on disk (§7 acceptance). Both fields
-    /// degrade to `None` if the child is no longer registered.
-    async fn child_journal_facts(
-        &self,
-        child_thread_id: ThreadId,
-    ) -> (Option<PathBuf>, Option<u64>) {
-        let Ok(state) = self.upgrade() else {
-            return (None, None);
-        };
-        let Ok(child_thread) = state.get_thread(child_thread_id).await else {
-            return (None, None);
-        };
-        // Ensure the child's own rollout file is materialized before we record its path, so the
-        // journaled `rollout_path` resolves to an existing subagent session file.
-        child_thread.ensure_rollout_materialized().await;
-        let rollout_path = child_thread.rollout_path();
-        let tokens_spent = child_thread
-            .token_usage_info()
-            .await
-            .map(|info| info.total_token_usage.output_tokens.max(0) as u64);
-        (rollout_path, tokens_spent)
     }
 
     /// Best-effort terminate + deregister a subagent this helper spawned but will not (or no longer)
     /// drive to a turn outcome — the deferred prompt submit failed, or the spawn-and-await future was
-    /// cancelled/dropped. Interrupts any in-flight turn, removes the thread from the manager, and
-    /// releases the registry slot + nickname (mirroring `handle_thread_request_result`'s
+    /// cancelled/dropped. Shuts down the session and waits for process cleanup, removes the thread
+    /// from the manager, and releases the registry slot + nickname (mirroring
+    /// `handle_thread_request_result`'s
     /// `InternalAgentDied` cleanup). Releasing the registry slot is idempotent: a second call after
     /// the thread is gone finds nothing to release and does not double-decrement.
-    pub(crate) async fn reap_spawned_child(&self, child_thread_id: ThreadId) {
+    pub(crate) async fn reap_spawned_child(
+        &self,
+        child_thread_id: ThreadId,
+    ) -> workflow_child_progress::ChildJournalFacts {
+        let mut facts = workflow_child_progress::ChildJournalFacts::default();
         if let Ok(state) = self.upgrade() {
-            // Interrupt any turn racing on the child before removing it; ignored when idle.
-            let _ = state.send_op(child_thread_id, Op::Interrupt).await;
+            // Wait for session shutdown before removing the child. Merely enqueueing an interrupt
+            // is not sufficient for worktree isolation: process cleanup can still be running when
+            // the interrupt submission returns, allowing the caller to remove a checkout that a
+            // child process still has open (and making cleanup particularly racy on Windows).
+            if let Ok(thread) = state.get_thread(child_thread_id).await
+                && let Err(err) = thread.shutdown_and_wait().await
+            {
+                warn!("failed to shut down spawned subagent {child_thread_id}: {err}");
+                // Fail closed: an isolated workspace owner must never resume cleanup while the
+                // child session might still own processes in that checkout.
+                thread.wait_until_terminated().await;
+            }
+            // Shutdown flushes the final token/history/rollout state. Capture those durable facts
+            // while the child is still registered; after removal the terminal workflow journal
+            // could no longer satisfy its completed-linkage invariant.
+            facts = workflow_child_progress::child_journal_facts(self, child_thread_id).await;
             let _ = state.remove_thread(&child_thread_id).await;
         }
         self.forget_v2_residency(child_thread_id);
         self.state.release_spawned_thread(child_thread_id);
+        facts
     }
 
     /// Subscribe to the spawned child's non-competing event tap, submit the prompt as a fresh
@@ -299,13 +424,13 @@ impl AgentControl {
     /// foreign id, our id-filter drops it, and we would hang — or, after a tap lag, recover the
     /// foreign turn's final message from the child's aggregate status.
     ///
-    /// A deferred-spawned child runs no turn of its own, so the only way a turn is active here is a
-    /// foreign racer. We therefore *refuse to steer*: before submitting we check the child has no
-    /// active turn, and after submitting we re-check that the turn our prompt runs under is ours
-    /// (defends the narrow enqueue race where a foreign turn goes active between the two steps). If
-    /// a foreign turn is active in either check we return `None` — our prompt would be steered and
-    /// never run as our own turn, so there is no id to wait on. With steering ruled out, our
-    /// submission id is exactly the fresh turn's id, and filtering terminal events on it is sound.
+    /// A deferred-spawned child runs no turn of its own, so its first prompt is submitted with an
+    /// explicit start-only-if-idle admission. The admission is decided by the serialized child
+    /// session loop in the same iteration that dispatches the prompt. This is load-bearing: checking
+    /// `active_turn` around an asynchronous queue send leaves a queued-but-not-active race where a
+    /// foreign prompt can be processed first and ours can be steered into it. A busy admission
+    /// returns `None`; a started admission's submission id is the fresh turn id, so filtering
+    /// terminal events on it is sound.
     ///
     /// ## Never waiting forever
     ///
@@ -322,6 +447,7 @@ impl AgentControl {
         child_thread_id: ThreadId,
         input: Vec<UserInput>,
         final_output_json_schema: Option<serde_json::Value>,
+        observer: Option<WorkflowChildObserver>,
     ) -> Option<String> {
         let state = match self.upgrade() {
             Ok(state) => state,
@@ -343,28 +469,21 @@ impl AgentControl {
         let mut events = child_thread.subscribe_events();
         let mut status = child_thread.subscribe_status();
 
-        // Refuse to steer into a foreign turn (see "Turn identity" above): a deferred-spawned child
-        // runs no turn of its own, so any turn active here is a client that raced into the
-        // announce->submit window. Submitting now would let dispatch steer our prompt into that
-        // turn, whose terminal event carries the foreign id — never ours — so we could not recover
-        // our result and would hang. Bail to `None` instead.
-        if let Some(foreign_turn_id) = active_turn_sub_id(&child_thread).await {
-            warn!(
-                "subagent {child_thread_id} already has active turn {foreign_turn_id} before its \
-                 deferred prompt was submitted; refusing to steer the prompt into a foreign turn"
-            );
-            return None;
-        }
-
-        // Deliver the prompt as a fresh `Op::UserInput` turn via the same public `send_input` path
-        // a client would use: it re-runs the *current* execution-capacity check at submit time (the
-        // deferred spawn's earlier check could be stale — another agent may have taken the last slot
-        // in between) and hands back the submission id that stamps our (fresh) turn's events.
+        // Re-run the *current* execution-capacity check at submit time (the deferred spawn's earlier
+        // check could be stale), then let the serialized session loop atomically admit this prompt
+        // only if no foreign turn was active or queued before it.
         let submission_id = match self
-            .send_input_with_schema(child_thread_id, input, final_output_json_schema)
+            .send_input_with_schema_if_idle(child_thread_id, input, final_output_json_schema)
             .await
         {
-            Ok(submission_id) => submission_id,
+            Ok(StartTurnIfIdleOutcome::Started { submission_id }) => submission_id,
+            Ok(StartTurnIfIdleOutcome::Busy) => {
+                warn!(
+                    "subagent {child_thread_id} was busy before its deferred prompt was admitted; \
+                     refusing to steer the prompt into a foreign turn"
+                );
+                return None;
+            }
             Err(err) => {
                 warn!("failed to submit subagent prompt: {err}");
                 // The child is registered but never ran our turn: terminate + deregister it so it
@@ -374,24 +493,10 @@ impl AgentControl {
             }
         };
 
-        // Enqueue-race safety net: if a foreign turn went active between the pre-submit check and
-        // our submission being processed, our prompt was steered into it and the active turn id is
-        // not ours. Our submission id would then stamp no terminal event, so bail rather than wait
-        // for one that never arrives. `None` here means the loop has not yet started our fresh turn
-        // (its id matches once it does), so it is not a false positive.
-        if let Some(active_turn_id) = active_turn_sub_id(&child_thread).await
-            && active_turn_id != submission_id
-        {
-            warn!(
-                "subagent {child_thread_id} prompt was steered into foreign turn {active_turn_id} \
-                 (expected fresh turn {submission_id}); reporting None"
-            );
-            return None;
-        }
-
         // Set once the tap lags past its ring buffer: our terminal event may have been evicted, so
         // from then on a final status transition is treated as the authoritative turn outcome.
         let mut tap_lagged = false;
+        let mut workflow_progress = WorkflowChildProgress::default();
         loop {
             tokio::select! {
                 // `biased`: poll the event tap first so a terminal event for our turn that is
@@ -407,6 +512,13 @@ impl AgentControl {
                         // carry a different id and are ignored.
                         if event.id != submission_id {
                             continue;
+                        }
+                        if workflow_child_progress::observe_event(
+                            &mut workflow_progress,
+                            &event.msg,
+                        ) && let Some(observer) = &observer
+                        {
+                            observer.progress(workflow_progress.clone());
                         }
                         match event.msg {
                             EventMsg::TurnComplete(turn_complete) => {
@@ -463,10 +575,11 @@ impl AgentControl {
 /// RAII guard that reaps a freshly-spawned-but-not-yet-finalized subagent if the spawn-and-await
 /// future is dropped/cancelled before it completes (finding: child leak on cancellation).
 ///
-/// Armed the instant the child is registered; disarmed on any normal return from
-/// `await_first_turn_final_message` (a child that ran a turn keeps its natural lifecycle). If the
-/// future is instead dropped mid-await, `disarm` never runs and `Drop` spawns a detached best-effort
-/// reap so the registry slot / nickname (and the held scheduler permit) are not stranded.
+/// Armed the instant the child is registered and kept armed until journal facts are captured and
+/// any isolated-workspace shutdown is complete. A non-isolated child that ran a turn keeps its
+/// natural lifecycle. If the future is instead dropped before that boundary, `disarm` never runs
+/// and `Drop` spawns a detached best-effort reap so the registry slot / nickname (and the held
+/// scheduler permit) are not stranded.
 struct SpawnedChildReaper {
     control: AgentControl,
     child_thread_id: ThreadId,
@@ -502,24 +615,6 @@ impl Drop for SpawnedChildReaper {
             });
         }
     }
-}
-
-/// Read the sub_id of the child's currently-active turn, if any.
-///
-/// A deferred-spawned child runs no turn of its own until the caller drives the first turn, so a
-/// non-`None` result before/just-after the caller submits its prompt is a client that raced a turn
-/// onto the child in the announce->submit window (see [`AgentControl::await_first_turn_final_message`]
-/// "Turn identity").
-async fn active_turn_sub_id(child_thread: &Arc<crate::CodexThread>) -> Option<String> {
-    child_thread
-        .codex
-        .session
-        .active_turn
-        .lock()
-        .await
-        .as_ref()
-        .and_then(|turn| turn.task.as_ref())
-        .map(|task| task.turn_context.sub_id.clone())
 }
 
 /// Non-blocking drain of already-buffered tap events, returning our turn's terminal outcome if its

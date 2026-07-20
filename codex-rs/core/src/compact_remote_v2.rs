@@ -47,6 +47,8 @@ use futures::StreamExt;
 mod attempt;
 use attempt::RemoteCompactV2Attempt;
 use attempt::run_remote_compact_v2_attempt;
+#[cfg(test)]
+use attempt::workflow_remote_compaction_input;
 
 // Mirror the current /responses/compact retained-message default while the
 // server-side path remains the reference implementation.
@@ -280,14 +282,21 @@ async fn run_remote_compact_task_inner_impl(
     let (compacted_history, retained_images) =
         build_v2_compacted_history(&prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
-    let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
+    let planned_window = sess.plan_auto_compact_window_advance().await;
     let (new_history, world_state_baseline) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
         compacted_history,
         &initial_context_injection,
+        planned_window.ids,
     )
     .await;
+    let new_history = sess
+        .prepare_compacted_history_for_install(compaction_turn_context.as_ref(), new_history)
+        .await?;
+    let (new_window_number, new_window_ids) = sess
+        .commit_auto_compact_window_advance(planned_window)
+        .await?;
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -314,7 +323,7 @@ async fn run_remote_compact_task_inner_impl(
         world_state_baseline,
         compacted_item,
     )
-    .await;
+    .await?;
     sess.recompute_token_usage(compaction_turn_context).await;
 
     sess.emit_turn_item_completed(compaction_turn_context, compaction_item)
@@ -593,6 +602,27 @@ mod tests {
             rx_event,
             consumer_dropped: CancellationToken::new(),
         }
+    }
+
+    #[test]
+    fn workflow_remote_v2_compaction_validates_the_appended_trigger() {
+        let prompt_input = vec![
+            message("user", "x", /*phase*/ None);
+            crate::context::MAX_WORKFLOW_CHILD_CONTEXT_BATCH_ITEMS
+        ];
+        crate::context::validate_workflow_child_model_history(&prompt_input)
+            .expect("the pre-trigger input is exactly within the item limit");
+
+        let error = workflow_remote_compaction_input(&prompt_input)
+            .expect_err("the appended trigger must be included in final input validation");
+        let CodexErr::InvalidRequest(message) = error else {
+            panic!("unexpected remote compaction error");
+        };
+
+        assert_eq!(
+            message,
+            "workflow child history exceeds model-context limits"
+        );
     }
 
     #[test]

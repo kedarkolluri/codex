@@ -6,6 +6,7 @@ mod memories;
 mod thread_goal;
 mod thread_metadata;
 mod workflow_run;
+mod workflow_run_agent;
 
 pub use agent_job::AgentJob;
 pub use agent_job::AgentJobCreateParams;
@@ -37,8 +38,15 @@ pub use thread_metadata::ThreadMetadataBuilder;
 pub use thread_metadata::ThreadRelationFilter;
 pub use thread_metadata::ThreadsPage;
 pub use workflow_run::WorkflowRun;
+pub use workflow_run::WorkflowRunFilesystemCycleResult;
+pub use workflow_run::WorkflowRunFilesystemIndexState;
+pub use workflow_run::WorkflowRunPendingCleanupBatch;
+pub use workflow_run::WorkflowRunPublicationAdmission;
+pub use workflow_run::WorkflowRunRecoveryBatch;
 pub use workflow_run::WorkflowRunStatus;
 pub use workflow_run::WorkflowRunUpsertParams;
+pub use workflow_run_agent::WorkflowRunAgent;
+pub use workflow_run_agent::WorkflowRunAgentUpsertParams;
 
 pub(crate) use agent_job::AgentJobItemRow;
 pub(crate) use agent_job::AgentJobRow;
@@ -49,3 +57,4 @@ pub(crate) use thread_metadata::datetime_to_epoch_millis;
 pub(crate) use thread_metadata::datetime_to_epoch_seconds;
 pub(crate) use thread_metadata::epoch_millis_to_datetime;
 pub(crate) use workflow_run::WorkflowRunRow;
+pub(crate) use workflow_run_agent::WorkflowRunAgentRow;

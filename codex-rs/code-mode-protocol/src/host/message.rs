@@ -20,6 +20,8 @@ use super::WireRuntimeResponse;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
 use crate::AgentCallOpts;
+use crate::WorkflowBudgetSnapshot;
+use crate::WorkflowHostProgress;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -231,6 +233,9 @@ pub enum DelegateRequest {
     #[serde(rename = "agent/spawn")]
     SpawnAgent {
         cell_id: WireCellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
         prompt: String,
         ordinal: u64,
         // Boxed to keep the (otherwise small) `DelegateRequest` — and every enum that embeds it —
@@ -248,6 +253,35 @@ pub enum DelegateRequest {
         name: String,
         args: Option<JsonValue>,
     },
+    /// Persist a workflow phase marker in the client-owned run journal.
+    #[serde(rename = "workflow/phase")]
+    JournalPhase { cell_id: WireCellId, title: String },
+    /// Persist a workflow log marker in the client-owned run journal.
+    #[serde(rename = "workflow/log")]
+    JournalLog {
+        cell_id: WireCellId,
+        message: String,
+    },
+    /// Re-append a prefix-replayed agent entry and restore its metered spend in
+    /// the client-owned workflow state.
+    #[serde(rename = "workflow/replayAgent")]
+    ReplayAgent {
+        cell_id: WireCellId,
+        node_id: u64,
+        parent_node_id: Option<u64>,
+        phase: Option<String>,
+        entry: JsonValue,
+    },
+    /// Source-ordered workflow progress and terminal runtime state. Core remains the only layer
+    /// that publishes these as durable protocol events.
+    #[serde(rename = "workflow/progress")]
+    WorkflowProgress {
+        cell_id: WireCellId,
+        progress: Box<WorkflowHostProgress>,
+    },
+    /// Read the current run-local budget after a budget-affecting callback.
+    #[serde(rename = "workflow/budget")]
+    WorkflowBudget { cell_id: WireCellId },
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -266,6 +300,11 @@ pub enum DelegateResponse {
     /// [`WireAgentSpawnOutcome`] because the three-way settlement is identical to `agent()`.
     #[serde(rename = "workflow/spawned")]
     WorkflowSpawned { outcome: WireAgentSpawnOutcome },
+    /// Current run-local budget view for the requesting cell.
+    #[serde(rename = "workflow/budget")]
+    WorkflowBudget {
+        snapshot: Option<WorkflowBudgetSnapshot>,
+    },
 }
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]

@@ -43,6 +43,14 @@ pub(crate) struct ToolRouterParams<'a> {
     pub(crate) tool_suggest_candidates: Option<ToolSuggestCandidates>,
     pub(crate) extension_tool_executors: Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>>,
     pub(crate) dynamic_tools: &'a [DynamicToolSpec],
+    pub(crate) collaboration_tool_access: CollaborationToolAccess,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum CollaborationToolAccess {
+    #[default]
+    Enabled,
+    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -832,7 +832,11 @@ ON CONFLICT(id) DO UPDATE SET
     recency_at_ms = threads.recency_at_ms,
     source = excluded.source,
     history_mode = excluded.history_mode,
-    thread_source = excluded.thread_source,
+    thread_source = CASE
+        WHEN threads.thread_source = 'workflow' OR excluded.thread_source = 'workflow'
+            THEN 'workflow'
+        ELSE excluded.thread_source
+    END,
     agent_nickname = excluded.agent_nickname,
     agent_role = excluded.agent_role,
     agent_path = excluded.agent_path,
@@ -1427,6 +1431,7 @@ mod tests {
     use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::ThreadSource;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::path::PathBuf;
@@ -1467,6 +1472,44 @@ mod tests {
                 .await
                 .expect("memory mode should remain readable");
         assert_eq!(memory_mode, "disabled");
+    }
+
+    #[tokio::test]
+    async fn upsert_thread_keeps_workflow_source_if_either_side_is_exact() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let workflow_source = ThreadSource::Feature("workflow".to_string());
+        let other_source = ThreadSource::Feature("other".to_string());
+
+        for (existing_source, incoming_source) in [
+            (Some(workflow_source.clone()), Some(other_source.clone())),
+            (Some(workflow_source.clone()), None),
+            (Some(other_source), Some(workflow_source.clone())),
+            (None, Some(workflow_source.clone())),
+        ] {
+            let thread_id = ThreadId::new();
+            let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            metadata.thread_source = existing_source;
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("initial upsert should succeed");
+
+            metadata.thread_source = incoming_source;
+            runtime
+                .upsert_thread(&metadata)
+                .await
+                .expect("conflicting upsert should succeed");
+
+            let persisted = runtime
+                .get_thread(thread_id)
+                .await
+                .expect("thread should load")
+                .expect("thread should exist");
+            assert_eq!(persisted.thread_source, Some(workflow_source.clone()));
+        }
     }
 
     #[tokio::test]

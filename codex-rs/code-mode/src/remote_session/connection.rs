@@ -14,6 +14,7 @@ use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientHello;
 use codex_code_mode_protocol::host::ClientToHost;
@@ -24,6 +25,7 @@ use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WORKFLOW_V1_CAPABILITY;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
@@ -88,6 +90,7 @@ pub(super) struct Connection {
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
+    supports_workflow_v1: bool,
 }
 
 struct CallerCancellation {
@@ -174,11 +177,13 @@ impl Connection {
         let mut reader = FramedReader::new(stdout);
         let mut writer = FramedWriter::new(stdin);
         let handshake = async {
+            let workflow_v1 =
+                Capability::new(WORKFLOW_V1_CAPABILITY).map_err(|err| err.to_string())?;
             let hello = ClientHello::new(
                 SupportedProtocolVersions::try_new([ProtocolVersion::V1])
                     .map_err(|err| err.to_string())?,
                 CapabilitySet::empty(),
-                CapabilitySet::empty(),
+                CapabilitySet::try_new([workflow_v1.clone()]).map_err(|err| err.to_string())?,
             )
             .map_err(|err| err.to_string())?;
             writer
@@ -193,7 +198,7 @@ impl Connection {
                 Some(HostToClient::HostHello(hello))
                     if hello.selected_version() == ProtocolVersion::V1 =>
                 {
-                    Ok(())
+                    Ok(hello.capabilities().contains(&workflow_v1))
                 }
                 Some(HostToClient::HandshakeRejected { reason }) => {
                     Err(format!("code-mode host rejected the handshake: {reason:?}"))
@@ -213,10 +218,13 @@ impl Connection {
                 ));
             }
         };
-        if let Err(err) = handshake_result {
-            kill_and_reap(&mut child).await;
-            return Err(ConnectionError::Other(err));
-        }
+        let supports_workflow_v1 = match handshake_result {
+            Ok(supports_workflow_v1) => supports_workflow_v1,
+            Err(err) => {
+                kill_and_reap(&mut child).await;
+                return Err(ConnectionError::Other(err));
+            }
+        };
 
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
@@ -281,6 +289,7 @@ impl Connection {
             alive,
             failure,
             cancellation,
+            supports_workflow_v1,
         })
     }
 
@@ -322,6 +331,11 @@ impl Connection {
         session: RemoteSession,
         request: ExecuteRequest,
     ) -> Result<StartedCell, String> {
+        if request.workflow && !self.supports_workflow_v1 {
+            return Err(format!(
+                "code-mode host does not support required `{WORKFLOW_V1_CAPABILITY}` capability"
+            ));
+        }
         let cancellation = CallerCancellation::new();
         let (response_tx, response_rx) = oneshot::channel();
         self.send(DriverCommand::Execute {

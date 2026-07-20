@@ -969,6 +969,7 @@ impl ThreadRequestProcessor {
             thread_source,
             environments,
         } = params;
+        ensure_client_thread_source_allowed(thread_source.as_ref())?;
         if matches!(
             history_mode,
             Some(codex_app_server_protocol::ThreadHistoryMode::Paginated)
@@ -1430,8 +1431,9 @@ impl ThreadRequestProcessor {
     ) -> Result<(ThreadArchiveResponse, Vec<String>), JSONRPCErrorError> {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
-
         let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+        self.ensure_thread_subtree_mutation_allowed(&thread_ids)
+            .await?;
 
         let mut archive_thread_ids = Vec::new();
         match self
@@ -1530,11 +1532,48 @@ impl ThreadRequestProcessor {
             })
     }
 
+    pub(super) async fn ensure_requested_thread_mutation_allowed(
+        &self,
+        thread_id: ThreadId,
+    ) -> Result<(), JSONRPCErrorError> {
+        if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
+            ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
+        }
+        match self
+            .thread_store
+            .read_thread(StoreReadThreadParams {
+                thread_id,
+                include_archived: true,
+                include_history: false,
+            })
+            .await
+        {
+            Ok(stored_thread) => ensure_workflow_managed_thread_source_mutation_allowed(
+                stored_thread.thread_source.as_ref(),
+            )?,
+            Err(ThreadStoreError::ThreadNotFound { .. }) => {}
+            Err(err) => return Err(thread_store_resume_read_error(err)),
+        }
+        Ok(())
+    }
+
+    pub(super) async fn ensure_thread_subtree_mutation_allowed(
+        &self,
+        thread_ids: &[ThreadId],
+    ) -> Result<(), JSONRPCErrorError> {
+        for thread_id in thread_ids {
+            self.ensure_requested_thread_mutation_allowed(*thread_id)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn thread_increment_elicitation_inner(
         &self,
         params: ThreadIncrementElicitationParams,
     ) -> Result<ThreadIncrementElicitationResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         let count = thread
             .increment_out_of_band_elicitation_count()
             .await
@@ -1554,6 +1593,7 @@ impl ThreadRequestProcessor {
         params: ThreadDecrementElicitationParams,
     ) -> Result<ThreadDecrementElicitationResponse, JSONRPCErrorError> {
         let (_, thread) = self.load_thread(&params.thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         let count = thread
             .decrement_out_of_band_elicitation_count()
             .await
@@ -1577,6 +1617,8 @@ impl ThreadRequestProcessor {
         let ThreadSetNameParams { thread_id, name } = params;
         let thread_id = ThreadId::from_string(&thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        self.ensure_requested_thread_mutation_allowed(thread_id)
+            .await?;
         let Some(name) = codex_core::util::normalize_thread_name(&name) else {
             return Err(invalid_request("thread name must not be empty"));
         };
@@ -1610,6 +1652,8 @@ impl ThreadRequestProcessor {
         let ThreadMemoryModeSetParams { thread_id, mode } = params;
         let thread_id = ThreadId::from_string(&thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        self.ensure_requested_thread_mutation_allowed(thread_id)
+            .await?;
 
         self.thread_manager
             .update_thread_metadata(
@@ -1663,6 +1707,8 @@ impl ThreadRequestProcessor {
 
         let thread_uuid = ThreadId::from_string(&thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+        self.ensure_requested_thread_mutation_allowed(thread_uuid)
+            .await?;
 
         let Some(ThreadMetadataGitInfoUpdateParams {
             sha,
@@ -1749,6 +1795,8 @@ impl ThreadRequestProcessor {
     ) -> Result<(ThreadUnarchiveResponse, String), JSONRPCErrorError> {
         let thread_id = ThreadId::from_string(&params.thread_id)
             .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
+        self.ensure_requested_thread_mutation_allowed(thread_id)
+            .await?;
 
         let fallback_provider = self.config.model_provider_id.clone();
         let stored_thread = self
@@ -1793,6 +1841,7 @@ impl ThreadRequestProcessor {
         }
 
         let (thread_id, thread) = self.load_thread(&thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
 
         let request = request_id.clone();
 
@@ -1838,6 +1887,7 @@ impl ThreadRequestProcessor {
         let ThreadCompactStartParams { thread_id } = params;
 
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         self.submit_core_op(request_id, thread.as_ref(), Op::Compact)
             .await
             .map_err(|err| internal_error(format!("failed to start compaction: {err}")))?;
@@ -1852,6 +1902,7 @@ impl ThreadRequestProcessor {
         let ThreadBackgroundTerminalsCleanParams { thread_id } = params;
 
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         self.submit_core_op(request_id, thread.as_ref(), Op::CleanBackgroundTerminals)
             .await
             .map_err(|err| {
@@ -1910,6 +1961,7 @@ impl ThreadRequestProcessor {
         })?;
 
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         let terminated = thread.terminate_background_terminal(process_id).await;
         Ok(ThreadBackgroundTerminalsTerminateResponse { terminated })
     }
@@ -1936,6 +1988,7 @@ impl ThreadRequestProcessor {
         }
 
         let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         self.submit_core_op(
             request_id,
             thread.as_ref(),
@@ -1952,9 +2005,10 @@ impl ThreadRequestProcessor {
         params: ThreadApproveGuardianDeniedActionParams,
     ) -> Result<ThreadApproveGuardianDeniedActionResponse, JSONRPCErrorError> {
         let ThreadApproveGuardianDeniedActionParams { thread_id, event } = params;
+        let (_, thread) = self.load_thread(&thread_id).await?;
+        ensure_workflow_managed_thread_mutation_allowed(thread.as_ref())?;
         let event = serde_json::from_value(event)
             .map_err(|err| invalid_request(format!("invalid Guardian denial event: {err}")))?;
-        let (_, thread) = self.load_thread(&thread_id).await?;
 
         self.submit_core_op(
             request_id,
@@ -2700,15 +2754,6 @@ impl ThreadRequestProcessor {
             return Ok(());
         }
 
-        if params.sandbox.is_some() && params.permissions.is_some() {
-            self.outgoing
-                .send_error(
-                    request_id,
-                    invalid_request("`permissions` cannot be combined with `sandbox`"),
-                )
-                .await;
-            return Ok(());
-        }
         let redact_resume_payloads =
             should_redact_thread_resume_payloads(app_server_client_name.as_deref());
 
@@ -2736,10 +2781,52 @@ impl ThreadRequestProcessor {
             }
         };
 
+        let resume_result = if let Some(history) = params.history.as_ref() {
+            self.resume_thread_from_history(history.as_slice())
+                .await
+                .map(|thread_history| (thread_history, None))
+        } else if let Some(mut stored_thread) = stored_thread_from_running_probe {
+            self.stored_thread_to_initial_history(&mut stored_thread)
+                .await
+                .map(|thread_history| (thread_history, Some(*stored_thread)))
+        } else {
+            self.resume_thread_from_rollout(&params.thread_id, params.path.as_ref())
+                .await
+                .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
+        };
+        let (thread_history, resume_source_thread) = match resume_result {
+            Ok(value) => value,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return Ok(());
+            }
+        };
+        let workflow_managed_resume = is_workflow_managed_initial_history(&thread_history)
+            || resume_source_thread.as_ref().is_some_and(|stored_thread| {
+                is_workflow_managed_thread_source(stored_thread.thread_source.as_ref())
+            });
+        if workflow_managed_resume {
+            self.outgoing
+                .send_error(
+                    request_id,
+                    invalid_request(DIRECT_MUTATION_TO_WORKFLOW_MANAGED_THREAD_ERROR),
+                )
+                .await;
+            return Ok(());
+        } else if params.sandbox.is_some() && params.permissions.is_some() {
+            self.outgoing
+                .send_error(
+                    request_id,
+                    invalid_request("`permissions` cannot be combined with `sandbox`"),
+                )
+                .await;
+            return Ok(());
+        }
+
         let ThreadResumeParams {
-            thread_id,
-            history,
-            path,
+            thread_id: _,
+            history: _,
+            path: _,
             model,
             model_provider,
             service_tier,
@@ -2757,27 +2844,6 @@ impl ThreadRequestProcessor {
             initial_turns_page,
         } = params;
         let include_turns = !exclude_turns;
-
-        let resume_result = if let Some(history) = history {
-            self.resume_thread_from_history(history.as_slice())
-                .await
-                .map(|thread_history| (thread_history, None))
-        } else if let Some(mut stored_thread) = stored_thread_from_running_probe {
-            self.stored_thread_to_initial_history(&mut stored_thread)
-                .await
-                .map(|thread_history| (thread_history, Some(*stored_thread)))
-        } else {
-            self.resume_thread_from_rollout(&thread_id, path.as_ref())
-                .await
-                .map(|(thread_history, stored_thread)| (thread_history, Some(stored_thread)))
-        };
-        let (thread_history, resume_source_thread) = match resume_result {
-            Ok(value) => value,
-            Err(error) => {
-                self.outgoing.send_error(request_id, error).await;
-                return Ok(());
-            }
-        };
 
         let history_cwd = thread_history.session_cwd();
         let runtime_workspace_roots = runtime_workspace_roots.map(resolve_runtime_workspace_roots);
@@ -2815,6 +2881,8 @@ impl ThreadRequestProcessor {
                 return Ok(());
             }
         };
+        let workflow_replay_enabled =
+            self.workflows_watcher.is_some() && config.features.enabled(Feature::Workflow);
 
         let response_history = thread_history.clone();
 
@@ -2980,6 +3048,19 @@ impl ThreadRequestProcessor {
                     )
                     .await;
                 }
+                if workflow_replay_enabled {
+                    // Workflow progress is durable but is not part of `thread.turns`. Re-project a
+                    // bounded, connection-scoped stream after the resume response so a reconnecting
+                    // monitor restores its run topology without duplicating rollout records or
+                    // notifying already-attached clients.
+                    super::workflow_event_replay::send_workflow_replay_to_connection(
+                        &self.outgoing,
+                        connection_id,
+                        thread_id,
+                        response_history.get_rollout_items(),
+                    )
+                    .await;
+                }
                 self.thread_goal_processor
                     .emit_resume_goal_snapshot_and_continue(thread_id, codex_thread.as_ref())
                     .await;
@@ -3082,7 +3163,24 @@ impl ThreadRequestProcessor {
                 )));
             }
             let config_snapshot = existing_thread.config_snapshot().await;
-            let mismatch_details = collect_resume_override_mismatches(params, &config_snapshot);
+            let workflow_managed_thread = existing_thread.is_workflow_managed_agent()
+                || is_workflow_managed_thread_source(source_thread.thread_source.as_ref());
+            let mismatch_details = if workflow_managed_thread {
+                if thread_resume_has_configuration_overrides(params) {
+                    tracing::warn!(
+                        thread_id = %existing_thread_id,
+                        "ignored configuration overrides while rejoining workflow-managed thread"
+                    );
+                }
+                Vec::new()
+            } else {
+                if params.sandbox.is_some() && params.permissions.is_some() {
+                    return Err(invalid_request(
+                        "`permissions` cannot be combined with `sandbox`",
+                    ));
+                }
+                collect_resume_override_mismatches(params, &config_snapshot)
+            };
             if !mismatch_details.is_empty() {
                 let has_subscribers = !self
                     .thread_state_manager
@@ -3147,12 +3245,14 @@ impl ThreadRequestProcessor {
                 thread_state.clone(),
             )
             .await?;
-            Self::set_app_server_client_info(
-                existing_thread.as_ref(),
-                app_server_client_name,
-                app_server_client_version,
-            )
-            .await?;
+            if !workflow_managed_thread {
+                Self::set_app_server_client_info(
+                    existing_thread.as_ref(),
+                    app_server_client_name,
+                    app_server_client_version,
+                )
+                .await?;
+            }
 
             let mut thread_summary = self.stored_thread_to_api_thread(
                 source_thread,
@@ -3186,6 +3286,7 @@ impl ThreadRequestProcessor {
                     thread_summary,
                     emit_thread_goal_update,
                     thread_goal_state_db,
+                    workflow_managed_thread,
                     include_turns: !params.exclude_turns,
                     initial_turns_page: params.initial_turns_page.clone(),
                     redact_resume_payloads,
@@ -3472,6 +3573,7 @@ impl ThreadRequestProcessor {
             thread_source,
             exclude_turns,
         } = params;
+        ensure_client_thread_source_allowed(thread_source.as_ref())?;
         let include_turns = !exclude_turns;
         if sandbox.is_some() && permissions.is_some() {
             return Err(invalid_request(
@@ -3481,6 +3583,12 @@ impl ThreadRequestProcessor {
         let mut source_thread = self
             .read_stored_thread_for_resume(&thread_id, path.as_ref(), /*include_history*/ true)
             .await?;
+        ensure_workflow_managed_thread_source_mutation_allowed(
+            source_thread.thread_source.as_ref(),
+        )?;
+        if let Some(history) = source_thread.history.as_ref() {
+            ensure_workflow_managed_rollout_items_mutation_allowed(&history.items)?;
+        }
         let source_thread_id = source_thread.thread_id;
         let source_thread_name = source_thread
             .name

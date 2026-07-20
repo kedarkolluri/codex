@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&chat.workflow_monitor, 80)"
+---
+◆ Workflow inspectable  run-navi  running · elapsed ≥ 6s
+  320 tokens · 1 tool
+  ● work · 1/2 agents · elapsed ≥ 5s
+  › ├─ ✓ completed-agent  gpt-5.5 · medium  completed · attempt 1 · 320 tok · 1
+       tool · 0ms
+    └─ ● running-agent  gpt-5.5 · high  running · attempt 1 · ≥0ms
+
+  ↑↓ choose · Enter inspect agent · Esc exit

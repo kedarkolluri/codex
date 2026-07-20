@@ -1,0 +1,12 @@
+---
+source: tui/src/chatwidget/tests/workflows.rs
+expression: "render_bottom_popup(&chat, 100)"
+---
+  Saved workflows
+  Choose a saved workflow to start in this thread.
+
+  Search workflows
+› release-audit     Audit the release candidate with parallel reviewers. · project · 3 phases
+  dependency-sweep  Find risky dependency updates and validate the safe set. · personal · 2 phases
+
+  Press enter to confirm or esc to go back

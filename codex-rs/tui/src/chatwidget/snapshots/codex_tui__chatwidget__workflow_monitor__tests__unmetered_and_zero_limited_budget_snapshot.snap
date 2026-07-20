@@ -1,0 +1,13 @@
+---
+source: tui/src/chatwidget/workflow_monitor_tests.rs
+expression: "rendered(&monitor, 80)"
+---
+◆ Workflow unmetered work  run-unme  completed · duration 8s
+  ✓ root · duration 8s
+  budget  718 weighted tokens · unmetered
+
+◆ Workflow zero limit  run-zero  completed · duration 8s
+  ✓ root · duration 8s
+  budget  0 / 0 weighted tokens
+
+  Enter inspect agents

@@ -6,14 +6,18 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 
+use codex_code_mode_protocol::WorkflowHostCompletion;
+use codex_code_mode_protocol::WorkflowHostProgress;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use self::callbacks::CallbackCompletion;
 use self::callbacks::finish_callbacks;
+use self::callbacks::refresh_workflow_budget;
 use self::callbacks::report_task_result;
 use self::callbacks::spawn_agent;
 use self::callbacks::spawn_notification;
@@ -43,6 +47,9 @@ use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::ObserveMode;
 use crate::session_runtime::OutputItem;
 use crate::session_runtime::ToolName as CellToolName;
+use crate::workflow_budget::WorkflowBudgetMirror;
+
+const WORKFLOW_JOURNAL_UNAVAILABLE_ERROR: &str = "workflow journal is unavailable";
 
 pub(crate) struct CellActor;
 
@@ -62,22 +69,27 @@ impl CellActor {
         ),
         String,
     > {
+        let workflow = request.workflow;
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (initial_response_tx, initial_response_rx) = oneshot::channel();
-        // Thread the host's live budget handle (SEAM #1) into the isolate so a real
-        // workflow cell forwards `budget.spent()` / `budget.remaining()` to the shared
-        // `RolloutBudget` instead of the static `budget: None` defaults. Non-workflow
-        // hosts (and the process-owned host, which cannot forward an `Arc` over IPC)
-        // return `None` and are unaffected.
-        let budget = host.budget_handle();
+        // Both in-process and process-owned cells use the same runtime-local
+        // mirror. Its initial value is serializable on the execute request and
+        // callback acknowledgements refresh it before the JS promise settles.
+        let budget = request
+            .workflow_budget
+            .map(WorkflowBudgetMirror::new)
+            .map(Arc::new);
+        let runtime_budget = budget.as_ref().map(|budget| {
+            Arc::clone(budget) as Arc<dyn codex_code_mode_protocol::WorkflowBudgetHandle>
+        });
         // Prefix-replay seed (SEAM, `P3-resume-entry`, spec §7 steps 1-3). The resume
         // entrypoint stashes the prior run's loaded journal `agent_call` lines on the
         // host; the host hands them to the FIRST cell it spawns (the top-level resumed
         // run) and returns empty for every later nested `workflow()` cell. An empty vec
         // maps to `None` so a fresh run installs `ReplayState::fresh` and dispatches
         // every `agent()` live, exactly as before.
-        let replay_entries = host.replay_entries();
+        let replay_entries = request.replay_entries.clone();
         let replay_entries = if replay_entries.is_empty() {
             None
         } else {
@@ -89,7 +101,7 @@ impl CellActor {
             event_tx,
             PendingRuntimeMode::PauseUntilResumed,
             task_failure_handler.clone(),
-            budget,
+            runtime_budget,
             replay_entries,
         )?;
         let handle = CellHandle::new(command_tx, Arc::clone(&cell_state));
@@ -100,6 +112,8 @@ impl CellActor {
                 runtime_control_tx,
                 runtime_terminate_handle,
                 cell_state,
+                workflow,
+                budget,
             },
             event_rx,
             command_rx,
@@ -120,6 +134,8 @@ struct CellContext {
     runtime_control_tx: std::sync::mpsc::Sender<RuntimeControlCommand>,
     runtime_terminate_handle: v8::IsolateHandle,
     cell_state: Arc<CellState>,
+    workflow: bool,
+    budget: Option<Arc<WorkflowBudgetMirror>>,
 }
 
 struct Observer {
@@ -140,6 +156,8 @@ async fn run_cell<H: CellHost>(
         runtime_control_tx,
         runtime_terminate_handle,
         cell_state,
+        workflow,
+        budget,
     } = context;
     let cancellation_token = cell_state.cancellation_token();
     let callback_cancellation_token = cancellation_token.child_token();
@@ -151,6 +169,7 @@ async fn run_cell<H: CellHost>(
     let mut runtime_closed = false;
     let mut runtime_paused = false;
     let mut runtime_failure_reported = false;
+    let mut journal_failed = false;
     let mut yield_timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
     let mut notification_tasks = JoinSet::new();
     let mut tool_tasks = JoinSet::new();
@@ -179,6 +198,12 @@ async fn run_cell<H: CellHost>(
                         CallbackCompletion::Cancel,
                         task_failure_handler.as_ref(),
                     ).await;
+                    report_workflow_completion(
+                        host.as_ref(),
+                        workflow,
+                        WorkflowHostCompletion::Interrupted,
+                    )
+                    .await;
                     finish_termination(
                         &cell_state,
                         observer.take().map(|observer| observer.response_tx),
@@ -290,6 +315,12 @@ async fn run_cell<H: CellHost>(
                             CallbackCompletion::Cancel,
                             task_failure_handler.as_ref(),
                         ).await;
+                        report_workflow_completion(
+                            host.as_ref(),
+                            workflow,
+                            WorkflowHostCompletion::Interrupted,
+                        )
+                        .await;
                         finish_termination(
                             &cell_state,
                             observer.take().map(|observer| observer.response_tx),
@@ -299,7 +330,8 @@ async fn run_cell<H: CellHost>(
                         );
                         break;
                     }
-                    if !runtime_failure_reported
+                    if !journal_failed
+                        && !runtime_failure_reported
                         && let Some(task_failure_handler) = &task_failure_handler
                     {
                         runtime_failure_reported = true;
@@ -307,17 +339,39 @@ async fn run_cell<H: CellHost>(
                             "code-mode V8 runtime thread ended unexpectedly".to_string(),
                         );
                     }
+                    let callback_completion = if journal_failed {
+                        CallbackCompletion::Cancel
+                    } else {
+                        CallbackCompletion::DrainNotifications
+                    };
                     finish_callbacks(
                         &callback_cancellation_token,
                         &mut notification_tasks,
                         &mut tool_tasks,
-                        CallbackCompletion::DrainNotifications,
+                        callback_completion,
                         task_failure_handler.as_ref(),
+                    )
+                    .await;
+                    let (workflow_error, runtime_error) = if journal_failed {
+                        (
+                            WORKFLOW_JOURNAL_UNAVAILABLE_ERROR,
+                            WORKFLOW_JOURNAL_UNAVAILABLE_ERROR,
+                        )
+                    } else {
+                        (
+                            "workflow runtime ended unexpectedly",
+                            "exec runtime ended unexpectedly",
+                        )
+                    };
+                    report_workflow_completion(
+                        host.as_ref(),
+                        workflow,
+                        WorkflowHostCompletion::Errored(workflow_error.to_string()),
                     )
                     .await;
                     let event = CellEvent::Completed {
                         content_items: std::mem::take(&mut content_items),
-                        error_text: Some("exec runtime ended unexpectedly".to_string()),
+                        error_text: Some(runtime_error.to_string()),
                     };
                     let rejected_event = match host
                         .commit_completion(
@@ -349,6 +403,9 @@ async fn run_cell<H: CellHost>(
                     }
                     continue;
                 };
+                if journal_failed {
+                    continue;
+                }
                 match event {
                     RuntimeEvent::Started => {
                         yield_timer = observer.as_ref().and_then(observer_timer);
@@ -415,11 +472,29 @@ async fn run_cell<H: CellHost>(
                     // host routes these to the run's recorder (a no-op for a
                     // non-journaled cell). Awaited inline so the line is durable
                     // and ordered relative to the surrounding agent-call lines.
+                    // A failed acknowledgement stops the workflow because
+                    // continuing would make its replay history incomplete.
                     RuntimeEvent::Phase { title } => {
-                        host.journal_phase(title).await;
+                        if let Err(error) = host.journal_phase(title).await {
+                            warn!(error = %error, "failed to persist workflow phase journal record");
+                            journal_failed = true;
+                            stop_runtime(
+                                &runtime_tx,
+                                &runtime_control_tx,
+                                &runtime_terminate_handle,
+                            );
+                        }
                     }
                     RuntimeEvent::WorkflowLog { message } => {
-                        host.journal_log(message).await;
+                        if let Err(error) = host.journal_log(message).await {
+                            warn!(error = %error, "failed to persist workflow log journal record");
+                            journal_failed = true;
+                            stop_runtime(
+                                &runtime_tx,
+                                &runtime_control_tx,
+                                &runtime_terminate_handle,
+                            );
+                        }
                     }
                     // Workflow `agent()` spawn requests. Mirrors the `ToolCall`
                     // path: spawn one independent task into the shared tool
@@ -434,6 +509,9 @@ async fn run_cell<H: CellHost>(
                     // and out-of-order.
                     RuntimeEvent::AgentCall {
                         id,
+                        node_id,
+                        parent_node_id,
+                        phase,
                         ordinal,
                         prompt,
                         opts,
@@ -442,9 +520,13 @@ async fn run_cell<H: CellHost>(
                             &mut tool_tasks,
                             Arc::clone(&host),
                             id,
+                            node_id,
+                            parent_node_id,
+                            phase,
                             prompt,
                             ordinal,
                             opts,
+                            budget.clone(),
                             runtime_tx.clone(),
                             callback_cancellation_token.child_token(),
                             task_failure_handler.clone(),
@@ -454,17 +536,47 @@ async fn run_cell<H: CellHost>(
                     // matched this ordinal's recomputed key against the journaled
                     // entry, so NO subagent is spawned. Route the entry to the host
                     // inline (awaited before the next event is drained) so its
-                    // `tokens_spent` is re-added to the shared budget and it is
+                    // `tokens_spent` is charged to this run's workflow meter and it is
                     // re-appended to the NEW run's journal BEFORE any later
                     // divergent live `agent()` runs its pre-admission budget check —
                     // that is what makes the ceiling throw land at the identical
-                    // ordinal as the original run. Then settle the isolate promise
-                    // by id via the SAME `ToolResponse` resolve path a live agent
-                    // uses, reusing `module_loader::resolve_tool_response`.
-                    RuntimeEvent::AgentReplay { id, entry } => {
+                    // ordinal as the original run. Only a successful acknowledgement
+                    // settles the isolate promise with the cached response. A failed
+                    // acknowledgement is fatal: letting workflow code catch it would permit
+                    // execution to continue from an incomplete durable prefix.
+                    RuntimeEvent::AgentReplay {
+                        id,
+                        node_id,
+                        parent_node_id,
+                        phase,
+                        entry,
+                    } => {
                         let result = entry.ret.clone();
-                        host.replay_agent(*entry).await;
-                        let _ = runtime_tx.send(RuntimeCommand::ToolResponse { id, result });
+                        match host
+                            .replay_agent(node_id, parent_node_id, phase, *entry)
+                            .await
+                        {
+                            Ok(()) => {
+                                refresh_workflow_budget(host.as_ref(), budget.as_ref()).await;
+                                let _ = runtime_tx.send(RuntimeCommand::ToolResponse { id, result });
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "failed to persist workflow replay journal record"
+                                );
+                                journal_failed = true;
+                                stop_runtime(
+                                    &runtime_tx,
+                                    &runtime_control_tx,
+                                    &runtime_terminate_handle,
+                                );
+                            }
+                        }
+                    }
+                    RuntimeEvent::WorkflowProgress(event) => {
+                        host.workflow_progress(WorkflowHostProgress::Event { event })
+                            .await;
                     }
                     // Workflow `workflow(nameOrRef, args)` nested-run requests.
                     // Mirrors the `AgentCall` path: spawn one independent task that
@@ -482,6 +594,7 @@ async fn run_cell<H: CellHost>(
                             id,
                             name,
                             args,
+                            budget.clone(),
                             runtime_tx.clone(),
                             callback_cancellation_token.child_token(),
                             task_failure_handler.clone(),
@@ -527,6 +640,12 @@ async fn run_cell<H: CellHost>(
                                 CallbackCompletion::Cancel,
                                 task_failure_handler.as_ref(),
                             ).await;
+                            report_workflow_completion(
+                                host.as_ref(),
+                                workflow,
+                                WorkflowHostCompletion::Interrupted,
+                            )
+                            .await;
                             finish_termination(
                                 &cell_state,
                                 observer.take().map(|observer| observer.response_tx),
@@ -544,6 +663,13 @@ async fn run_cell<H: CellHost>(
                             task_failure_handler.as_ref(),
                         )
                         .await;
+                        let completion = match error_text.as_deref() {
+                            Some(error) => WorkflowHostCompletion::Errored(
+                                bound_workflow_progress_error(error),
+                            ),
+                            None => WorkflowHostCompletion::Completed,
+                        };
+                        report_workflow_completion(host.as_ref(), workflow, completion).await;
                         let event = CellEvent::Completed {
                             content_items: std::mem::take(&mut content_items),
                             error_text,
@@ -612,6 +738,30 @@ async fn run_cell<H: CellHost>(
     )
     .await;
     host.closed().await;
+}
+
+async fn report_workflow_completion<H: CellHost>(
+    host: &H,
+    workflow: bool,
+    status: WorkflowHostCompletion,
+) {
+    if workflow {
+        host.workflow_progress(WorkflowHostProgress::Complete { status })
+            .await;
+    }
+}
+
+fn bound_workflow_progress_error(error: &str) -> String {
+    const MAX_BYTES: usize = 2048;
+    const MARKER: &str = "… [error truncated]";
+    if error.len() <= MAX_BYTES {
+        return error.to_string();
+    }
+    let mut end = MAX_BYTES.saturating_sub(MARKER.len());
+    while end > 0 && !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{MARKER}", &error[..end])
 }
 
 fn send_observer_event(observer: Option<Observer>, event: CellEvent) -> Result<(), CellEvent> {
@@ -697,6 +847,14 @@ fn begin_termination(
     cancellation_token: &CancellationToken,
 ) {
     cancellation_token.cancel();
+    stop_runtime(runtime_tx, runtime_control_tx, runtime_terminate_handle);
+}
+
+fn stop_runtime(
+    runtime_tx: &std::sync::mpsc::Sender<RuntimeCommand>,
+    runtime_control_tx: &std::sync::mpsc::Sender<RuntimeControlCommand>,
+    runtime_terminate_handle: &v8::IsolateHandle,
+) {
     let _ = runtime_tx.send(RuntimeCommand::Terminate);
     let _ = runtime_control_tx.send(RuntimeControlCommand::Terminate);
     let _ = runtime_terminate_handle.terminate_execution();

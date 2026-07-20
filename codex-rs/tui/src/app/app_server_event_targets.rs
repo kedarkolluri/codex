@@ -155,6 +155,32 @@ pub(super) fn server_notification_thread_target(
         }
         ServerNotification::Warning(notification) => notification.thread_id.as_deref(),
         ServerNotification::GuardianWarning(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::WorkflowStarted(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::WorkflowPhaseChanged(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowGroupStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowGroupCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowAgentStarted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowAgentBound(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowAgentUpdated(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowAgentCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
+        ServerNotification::WorkflowLog(notification) => Some(notification.thread_id.as_str()),
+        ServerNotification::WorkflowCompleted(notification) => {
+            Some(notification.thread_id.as_str())
+        }
         ServerNotification::McpServerStatusUpdated(notification) => {
             match notification.thread_id.as_deref() {
                 Some(thread_id) => Some(thread_id),

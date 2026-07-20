@@ -3,8 +3,9 @@
 //! spec §14.2 UAT-3 / UAT-4, §14.3 Phase-1 exit gates).
 //!
 //! These drive a *real* Codex session end-to-end with `Feature::Workflow` enabled: the fixture
-//! model emits a `workflow` custom-tool call whose body fans out real subagents via `parallel()` /
-//! `agent()`. Every subagent is a real registered thread that issues its own model request to the
+//! model emits a structured `workflow_run` call for a saved workflow whose body fans out real
+//! subagents via `parallel()` / `agent()`. Every subagent is a real registered thread that issues
+//! its own model request to the
 //! same ordered SSE fixture server, so the tests assert on ENGINE ARTIFACTS (the workflow's own
 //! position-preserving return, per-child model/effort request bodies, per-subagent rollout files,
 //! parent linkage in each subagent's `SessionMeta`) rather than model free text.
@@ -22,14 +23,23 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::Result;
 use codex_core::config::AgentRoleConfig;
 use codex_core::config::RolloutBudgetConfig;
 use codex_features::Feature;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadGoalStatus;
+use codex_protocol::protocol::WorkflowEvent;
+use codex_workflow_journal::ReplayJournal;
+use codex_workflow_journal::WorkflowRunLease;
+use codex_workflow_journal::WorkflowRunLeaseAcquire;
+use codex_workflow_journal::WorkflowRunStatus;
+use codex_workflow_journal::storage::WorkflowRunPaths;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -39,6 +49,7 @@ use core_test_support::responses::ev_reasoning_item;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::sse;
 use core_test_support::responses::sse_response;
+use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::test_codex;
 use serde_json::Value;
@@ -54,8 +65,12 @@ use wiremock::matchers::path_regex;
 /// turn (the prompt arrives as the subagent's own `user` message) and recover its ordinal.
 const SUBAGENT_MARKER: &str = "WFUAT_SUB_";
 
-/// Call id the fixture model uses for its `workflow` custom-tool call.
+/// Call id the fixture model uses for its structured `workflow_run` call.
 const WORKFLOW_CALL_ID: &str = "call-workflow";
+
+/// Saved workflows expose their test result through the durable progress channel because
+/// `workflow_run` returns at admission rather than carrying the eventual top-level `text()` value.
+const WORKFLOW_RESULT_LOG_PREFIX: &str = "WFUAT_RESULT:";
 
 /// Distinctive model slug a registered `reviewer` role locks onto the child config, so a test can
 /// prove `opts.agentType` resolved and applied the role by observing the child's model request.
@@ -119,10 +134,8 @@ fn subagent_ordinal(body: &Value) -> Option<u64> {
 /// parent turn.
 fn contains_workflow_tool_output(body: &Value) -> bool {
     body["input"].as_array().into_iter().flatten().any(|item| {
-        matches!(
-            item.get("type").and_then(Value::as_str),
-            Some("custom_tool_call_output") | Some("function_call_output")
-        ) && item.get("call_id").and_then(Value::as_str) == Some(WORKFLOW_CALL_ID)
+        item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && item.get("call_id").and_then(Value::as_str) == Some(WORKFLOW_CALL_ID)
     })
 }
 
@@ -144,11 +157,13 @@ type SubagentScript = Box<dyn Fn(u64, bool) -> String + Send + Sync>;
 /// inspecting the request body, so the test is immune to the nondeterministic order in which
 /// concurrent subagents hit the server:
 /// - a subagent turn (its `user` message carries `WFUAT_SUB_<k>`) -> the per-ordinal script;
-/// - the parent's post-workflow turn (input carries the workflow tool output) -> a final message;
-/// - otherwise the parent's opening turn -> the `workflow` custom-tool call carrying the body.
+/// - the parent's post-admission turn (input carries the `workflow_run` output) -> a final message;
+/// - otherwise the parent's opening turn -> a structured call naming the saved fixture.
 struct WorkflowRouter {
-    workflow_source: String,
+    workflow_name: String,
+    workflow_args: Value,
     subagent: SubagentScript,
+    subagent_delay: Duration,
     /// Every decoded request body, in arrival order, for post-hoc assertions.
     seen: Arc<Mutex<Vec<Value>>>,
 }
@@ -161,7 +176,8 @@ impl Respond for WorkflowRouter {
         // Subagent turn: its own `user` message is the prompt carrying the marker.
         if let Some(ordinal) = subagent_ordinal(&body) {
             let is_followup = contains_any_function_call_output(&body);
-            return sse_response((self.subagent)(ordinal, is_followup));
+            return sse_response((self.subagent)(ordinal, is_followup))
+                .set_delay(self.subagent_delay);
         }
 
         // Parent's closing turn: the workflow already ran and its output is in history.
@@ -173,10 +189,15 @@ impl Respond for WorkflowRouter {
             ]));
         }
 
-        // Parent's opening turn: emit the workflow custom-tool call.
+        // Parent's opening turn: launch the saved workflow by exact metadata name.
+        let arguments = json!({
+            "name": self.workflow_name,
+            "args": self.workflow_args,
+        })
+        .to_string();
         sse_response(sse(vec![
             ev_response_created("resp-parent-open"),
-            responses::ev_custom_tool_call(WORKFLOW_CALL_ID, "workflow", &self.workflow_source),
+            ev_function_call(WORKFLOW_CALL_ID, "workflow_run", &arguments),
             ev_completed("resp-parent-open"),
         ]))
     }
@@ -188,10 +209,38 @@ async fn mount_workflow_router(
     workflow_source: &str,
     subagent: SubagentScript,
 ) -> Arc<Mutex<Vec<Value>>> {
+    mount_workflow_router_with_args(server, workflow_source, json!({}), subagent).await
+}
+
+async fn mount_workflow_router_with_args(
+    server: &MockServer,
+    workflow_source: &str,
+    workflow_args: Value,
+    subagent: SubagentScript,
+) -> Arc<Mutex<Vec<Value>>> {
+    mount_workflow_router_with_args_and_subagent_delay(
+        server,
+        workflow_source,
+        workflow_args,
+        subagent,
+        Duration::ZERO,
+    )
+    .await
+}
+
+async fn mount_workflow_router_with_args_and_subagent_delay(
+    server: &MockServer,
+    workflow_source: &str,
+    workflow_args: Value,
+    subagent: SubagentScript,
+    subagent_delay: Duration,
+) -> Arc<Mutex<Vec<Value>>> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let router = WorkflowRouter {
-        workflow_source: workflow_source.to_string(),
+        workflow_name: workflow_name(workflow_source),
+        workflow_args,
         subagent,
+        subagent_delay,
         seen: Arc::clone(&seen),
     };
     Mock::given(method("POST"))
@@ -217,25 +266,51 @@ fn write_mock_provider_config(codex_home: &std::path::Path, server_uri: &str) {
     .expect("write mock provider config.toml");
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WorkflowHostMode {
+    InProcess,
+    ProcessOwned,
+}
+
 /// Build a `TestCodexBuilder` with `Feature::Workflow` enabled and the process-host disabled so the
 /// in-process code-mode isolate + spawn bridge is exercised. Also registers a `reviewer` role whose
 /// locked model (`REVIEWER_ROLE_MODEL`) is observable when `opts.agentType = "reviewer"` is applied,
 /// and persists the mock provider to disk so the role-layer reload stays on the fixture server.
-fn workflow_builder(server_uri: &str) -> TestCodexBuilder {
+fn workflow_builder(server_uri: &str, workflow_source: &str) -> TestCodexBuilder {
+    workflow_builder_for_host(server_uri, workflow_source, WorkflowHostMode::InProcess)
+}
+
+fn workflow_builder_for_host(
+    server_uri: &str,
+    workflow_source: &str,
+    host_mode: WorkflowHostMode,
+) -> TestCodexBuilder {
     let server_uri = server_uri.to_string();
-    test_codex()
+    let workflow_source = workflow_source.to_string();
+    let builder = test_codex()
         .with_model(PARENT_MODEL)
-        .with_pre_build_hook(move |home| write_mock_provider_config(home, &server_uri))
-        .with_config(|config| {
+        .with_pre_build_hook(move |home| {
+            write_mock_provider_config(home, &server_uri);
+            let workflows_dir = home.join("workflows");
+            std::fs::create_dir_all(&workflows_dir).expect("create workflows dir");
+            std::fs::write(workflows_dir.join("root.workflow.js"), workflow_source)
+                .expect("write saved root workflow");
+        })
+        .with_config(move |config| {
             config
                 .features
                 .enable(Feature::Workflow)
                 .expect("enable workflow feature");
-            // Run the code-mode isolate in-process (no external host binary) for the hermetic lane.
-            config
-                .features
-                .disable(Feature::CodeModeHost)
-                .expect("disable code-mode host feature");
+            match host_mode {
+                WorkflowHostMode::InProcess => config
+                    .features
+                    .disable(Feature::CodeModeHost)
+                    .expect("disable code-mode host feature"),
+                WorkflowHostMode::ProcessOwned => config
+                    .features
+                    .enable(Feature::CodeModeHost)
+                    .expect("enable code-mode host feature"),
+            }
 
             // Register a user-defined `reviewer` role that locks a distinctive model, mirroring the
             // role wiring in `agent/role_tests.rs`: a `reviewer.toml` on disk referenced from
@@ -253,49 +328,333 @@ fn workflow_builder(server_uri: &str) -> TestCodexBuilder {
                     nickname_candidates: None,
                 },
             );
-        })
+        });
+    match host_mode {
+        WorkflowHostMode::InProcess => builder,
+        WorkflowHostMode::ProcessOwned => builder.with_code_mode_host_program(
+            codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")
+                .expect("resolve real process-owned code-mode host"),
+        ),
+    }
 }
 
-/// Recover the workflow body's own return value (`text(JSON.stringify(results))`) from the parent's
-/// closing turn: the workflow tool output is echoed into that request's `input`.
-fn workflow_return_array(seen: &Arc<Mutex<Vec<Value>>>) -> Vec<Value> {
-    let bodies = seen.lock().unwrap();
-    for body in bodies.iter() {
-        let Some(items) = body["input"].as_array() else {
+fn workflow_name(workflow_source: &str) -> String {
+    codex_code_mode::parse_workflow_meta(workflow_source)
+        .expect("workflow fixture has valid static meta")
+        .name
+}
+
+async fn submit_workflow_and_wait(test: &TestCodex, prompt: &str) -> Result<Vec<WorkflowEvent>> {
+    let mut receiver = test.codex.subscribe_events();
+    test.submit_turn(prompt).await?;
+    let mut run_id = None;
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(30), receiver.recv())
+            .await
+            .context("timed out waiting for detached workflow completion")??;
+        let EventMsg::Workflow(workflow_event) = event.msg else {
             continue;
         };
-        for item in items {
-            if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
-                continue;
-            }
-            if item.get("call_id").and_then(Value::as_str) != Some(WORKFLOW_CALL_ID) {
-                continue;
-            }
-            let text = workflow_output_text(item);
-            // The workflow tool output carries an adapter status header line plus the script's
-            // `text(...)` payloads; the JSON array is the last parseable line.
-            if let Some(array) = text
-                .lines()
-                .rev()
-                .find_map(|line| serde_json::from_str::<Vec<Value>>(line.trim()).ok())
-            {
-                return array;
-            }
+        let event_run_id = workflow_event_run_id(&workflow_event);
+        match &run_id {
+            Some(expected) if expected != event_run_id => continue,
+            None => run_id = Some(event_run_id.to_string()),
+            Some(_) => {}
+        }
+        let terminal = matches!(workflow_event, WorkflowEvent::RunEnd(_));
+        events.push(workflow_event);
+        if terminal {
+            return Ok(events);
         }
     }
-    panic!("workflow tool output with a JSON array return was never sent to the model");
 }
 
-/// Pull the plain-text body out of a `custom_tool_call_output` item (string or content-item forms).
-fn workflow_output_text(item: &Value) -> String {
-    match item.get("output") {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(spans)) => spans
+async fn workflow_result(test: &TestCodex, prompt: &str) -> Result<Value> {
+    let events = submit_workflow_and_wait(test, prompt).await?;
+    events
+        .iter()
+        .filter_map(|event| match event {
+            WorkflowEvent::Log(event) => event.message.strip_prefix(WORKFLOW_RESULT_LOG_PREFIX),
+            _ => None,
+        })
+        .next_back()
+        .context("workflow fixture did not emit its bounded result log")
+        .and_then(|result| serde_json::from_str(result).map_err(Into::into))
+}
+
+async fn workflow_return_array(test: &TestCodex, prompt: &str) -> Result<Vec<Value>> {
+    workflow_result(test, prompt)
+        .await?
+        .as_array()
+        .cloned()
+        .context("workflow result log did not contain an array")
+}
+
+/// Workflow progress is an out-of-band observability channel, never model-visible history.
+/// Exercise both runtime hosts, then force a subsequent parent model request so a delayed context
+/// injection cannot hide behind the detached workflow's already-completed admission turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_narration_stays_out_of_parent_context_across_hosts() -> Result<()> {
+    const CONTEXT_LEAK_MARKER: &str = "WFUAT_NARRATION_CONTEXT_LEAK";
+    const CHILD_COMPLETION_LEAK_MARKER: &str = "WFUAT_CHILD_COMPLETION_CONTEXT_LEAK";
+    let workflow_source = r#"export const meta = { name: 'contextsafe', description: 'out-of-band narration' };
+const marker = ['WFUAT', 'NARRATION', 'CONTEXT', 'LEAK'].join('_');
+log(marker);
+const notifyType = typeof notify;
+if (notifyType !== 'undefined') notify(marker);
+const children = await parallel([
+  () => agent('WFUAT_SUB_0 return a large WFUAT_CHILD_COMPLETION_CONTEXT_LEAK payload'),
+  () => agent('WFUAT_SUB_1 return a large WFUAT_CHILD_COMPLETION_CONTEXT_LEAK payload'),
+]);
+log('WFUAT_RESULT:' + JSON.stringify({
+  notifyType,
+  logged: true,
+  childCount: children.length,
+  childMarkers: children.map(value => value.startsWith('WFUAT_CHILD_COMPLETION_CONTEXT_LEAK')),
+}));
+text('ok');
+"#;
+
+    for host_mode in [WorkflowHostMode::InProcess, WorkflowHostMode::ProcessOwned] {
+        let server = responses::start_mock_server().await;
+        let subagent: SubagentScript = Box::new(|ordinal, is_followup| {
+            assert!(ordinal < 2);
+            assert!(!is_followup);
+            let child_output = format!(
+                "WFUAT_CHILD_COMPLETION_CONTEXT_LEAK_{ordinal}:{}",
+                "x".repeat(12_000)
+            );
+            sse(vec![
+                ev_response_created(&format!("resp-context-child-{ordinal}")),
+                ev_assistant_message(&format!("msg-context-child-{ordinal}"), &child_output),
+                ev_completed(&format!("resp-context-child-{ordinal}")),
+            ])
+        });
+        let seen = mount_workflow_router(&server, workflow_source, subagent).await;
+        let test = workflow_builder_for_host(&server.uri(), workflow_source, host_mode)
+            .build_with_auto_env(&server)
+            .await?;
+
+        assert_eq!(
+            workflow_result(&test, "run the context-safety workflow").await?,
+            json!({
+                "notifyType": "undefined",
+                "logged": true,
+                "childCount": 2,
+                "childMarkers": [true, true],
+            }),
+            "{host_mode:?} workflow isolate must omit the model-context notify channel"
+        );
+
+        // The workflow is detached from its admission turn. Make one more parent request after its
+        // terminal event so even a late custom-output injection would become observable on wire.
+        let mut events = test.codex.subscribe_events();
+        let requests_before_follow_up = seen.lock().unwrap().len();
+        test.submit_turn("follow up after workflow narration")
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(events.recv().await?.msg, EventMsg::TurnComplete(_)) {
+                    return anyhow::Ok(());
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("{host_mode:?} parent follow-up completed"))??;
+
+        {
+            let bodies = seen.lock().unwrap();
+            assert!(
+                bodies.len() > requests_before_follow_up,
+                "{host_mode:?} follow-up must issue a fresh parent model request"
+            );
+            assert!(
+                bodies
+                    .iter()
+                    .all(|body| !body.to_string().contains(CONTEXT_LEAK_MARKER)),
+                "{host_mode:?} workflow log/notify narration leaked into model-visible request history"
+            );
+            assert!(
+                bodies
+                    .iter()
+                    .filter(|body| subagent_ordinal(body).is_none())
+                    .flat_map(user_message_texts)
+                    .all(|text| !text.contains(CHILD_COMPLETION_LEAK_MARKER)),
+                "{host_mode:?} workflow child completion leaked through the parent mailbox"
+            );
+            assert!(
+                bodies
+                    .iter()
+                    .filter(|body| subagent_ordinal(body).is_none())
+                    .flat_map(user_message_texts)
+                    .all(|text| !text.contains("<subagents>")),
+                "{host_mode:?} workflow-managed children leaked through environment context"
+            );
+        }
+        test.codex.shutdown_and_wait().await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_nested_tools_omit_collaboration_when_code_mode_allows_it() -> Result<()> {
+    let workflow_source = r#"export const meta = { name: 'nocollabescape', description: 'workflow nested-tool isolation' };
+const collaborationType = typeof tools.collaboration;
+let spawnResult = null;
+if (collaborationType !== 'undefined') {
+  spawnResult = await tools.collaboration.spawn_agent({
+    message: 'WFUAT_SUB_0 ordinary collaboration escape',
+    task_name: 'escape',
+  });
+}
+log('WFUAT_RESULT:' + JSON.stringify({ collaborationType, spawnResult }));
+text('ok');
+"#;
+    let server = responses::start_mock_server().await;
+    let subagent: SubagentScript = Box::new(|ordinal, is_followup| {
+        assert_eq!(ordinal, 0);
+        assert!(!is_followup);
+        sse(vec![
+            ev_response_created("resp-collaboration-escape-child"),
+            ev_assistant_message("msg-collaboration-escape-child", "escaped"),
+            ev_completed("resp-collaboration-escape-child"),
+        ])
+    });
+    let seen = mount_workflow_router(&server, workflow_source, subagent).await;
+    let test = workflow_builder(&server.uri(), workflow_source)
+        .with_config(|config| {
+            // Ordinary code-mode exec may expose collaboration when explicitly configured, but a
+            // saved workflow must use its bounded `agent()` primitive instead.
+            config.multi_agent_v2.non_code_mode_only = false;
+        })
+        .build_with_auto_env(&server)
+        .await?;
+    let mut child_created = test.thread_manager.subscribe_thread_created();
+
+    assert_eq!(
+        workflow_result(&test, "run the collaboration-isolation workflow").await?,
+        json!({
+            "collaborationType": "undefined",
+            "spawnResult": null,
+        })
+    );
+    assert!(
+        child_created.try_recv().is_err(),
+        "workflow nested tools must not spawn an ordinary collaboration child"
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
             .iter()
-            .filter_map(|span| span.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
+            .all(|body| subagent_ordinal(body).is_none()),
+        "workflow nested tools must not issue an ordinary collaboration child request"
+    );
+
+    test.codex.shutdown_and_wait().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workflow_child_cannot_inject_parent_mailbox_across_hosts() -> Result<()> {
+    const MAILBOX_LEAK_MARKER: &str = "WFUAT_WORKFLOW_CHILD_MAILBOX_LEAK";
+    let workflow_source = r#"export const meta = { name: 'mailboxsafe', description: 'workflow child isolation' };
+const child = await agent('WFUAT_SUB_0 attempt a generic collaboration call');
+log('WFUAT_RESULT:' + JSON.stringify({ child }));
+text('ok');
+"#;
+
+    for host_mode in [WorkflowHostMode::InProcess, WorkflowHostMode::ProcessOwned] {
+        let server = responses::start_mock_server().await;
+        let subagent: SubagentScript = Box::new(|ordinal, is_followup| {
+            assert_eq!(ordinal, 0);
+            if is_followup {
+                return sse(vec![
+                    ev_response_created("resp-mailbox-child-final"),
+                    ev_assistant_message("msg-mailbox-child-final", "child call rejected"),
+                    ev_completed("resp-mailbox-child-final"),
+                ]);
+            }
+            let arguments = json!({
+                "target": "/root",
+                "message": MAILBOX_LEAK_MARKER,
+            })
+            .to_string();
+            sse(vec![
+                ev_response_created("resp-mailbox-child-call"),
+                ev_function_call("call-child-send-message", "send_message", &arguments),
+                ev_completed("resp-mailbox-child-call"),
+            ])
+        });
+        let seen = mount_workflow_router(&server, workflow_source, subagent).await;
+        let test = workflow_builder_for_host(&server.uri(), workflow_source, host_mode)
+            .build_with_auto_env(&server)
+            .await?;
+
+        let events = submit_workflow_and_wait(&test, "run the mailbox-isolation workflow").await?;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WorkflowEvent::RunEnd(_))),
+            "{host_mode:?} workflow should reach a terminal event"
+        );
+
+        let mut parent_events = test.codex.subscribe_events();
+        test.submit_turn("follow up after the workflow child call")
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(parent_events.recv().await?.msg, EventMsg::TurnComplete(_)) {
+                    return anyhow::Ok(());
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("{host_mode:?} parent follow-up completed"))??;
+
+        {
+            let bodies = seen.lock().unwrap();
+            let initial_child_request = bodies
+                .iter()
+                .find(|body| {
+                    subagent_ordinal(body) == Some(0) && !contains_any_function_call_output(body)
+                })
+                .with_context(|| format!("{host_mode:?} initial child request was captured"))?;
+            assert!(
+                !initial_child_request["tools"]
+                    .to_string()
+                    .contains("send_message"),
+                "{host_mode:?} workflow child request advertised generic collaboration tools"
+            );
+            assert!(
+                bodies
+                    .iter()
+                    .filter(|body| subagent_ordinal(body).is_none())
+                    .flat_map(user_message_texts)
+                    .all(|text| !text.contains(MAILBOX_LEAK_MARKER)),
+                "{host_mode:?} workflow child injected its generic message into parent context"
+            );
+        }
+        test.codex.shutdown_and_wait().await?;
+    }
+
+    Ok(())
+}
+
+fn workflow_event_run_id(event: &WorkflowEvent) -> &str {
+    match event {
+        WorkflowEvent::RunBegin(event) => &event.run_id,
+        WorkflowEvent::RunEnd(event) => &event.run_id,
+        WorkflowEvent::PhaseBegin(event) => &event.run_id,
+        WorkflowEvent::PhaseEnd(event) => &event.run_id,
+        WorkflowEvent::GroupBegin(event) => &event.run_id,
+        WorkflowEvent::GroupEnd(event) => &event.run_id,
+        WorkflowEvent::AgentBegin(event) => &event.run_id,
+        WorkflowEvent::AgentBound(event) => &event.run_id,
+        WorkflowEvent::AgentUpdated(event) => &event.run_id,
+        WorkflowEvent::AgentEnd(event) => &event.run_id,
+        WorkflowEvent::Log(event) => &event.run_id,
     }
 }
 
@@ -366,6 +725,7 @@ const results = await parallel([
   () => agent("{marker}1 return structured output", {{ schema }}),
   () => agent("{marker}2 return structured output", {{ schema, agentType: "reviewer" }}),
 ]);
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#,
         schema = answer_schema(),
@@ -391,11 +751,12 @@ text(JSON.stringify(results));
 
     let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri()).build(&server).await?;
-    test.submit_turn("run the uat4 fan-out workflow").await?;
+    let test = workflow_builder(&server.uri(), &workflow_source)
+        .build_with_auto_env(&server)
+        .await?;
 
     // Position-preserving results with the dead agent -> null, and conformant results as objects.
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat4 fan-out workflow").await?;
     assert_eq!(
         results.len(),
         3,
@@ -479,6 +840,7 @@ async fn uat3_per_subagent_sessions_saved_and_recoverable() -> Result<()> {
         r#"export const meta = {{ name: 'uat3', description: 'per-agent session save' }};
 const results = await parallel([
 {thunks}]);
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#
     );
@@ -512,13 +874,15 @@ text(JSON.stringify(results));
 
     let _seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri()).build(&server).await?;
+    let test = workflow_builder(&server.uri(), &workflow_source)
+        .build_with_auto_env(&server)
+        .await?;
     let parent_thread_id = test.session_configured.thread_id;
 
     // Collect every child thread announced during the run so we can resolve each one's rollout.
     let mut child_created = test.thread_manager.subscribe_thread_created();
 
-    test.submit_turn("run the uat3 fan-out workflow").await?;
+    submit_workflow_and_wait(&test, "run the uat3 fan-out workflow").await?;
 
     // Drain the announced child thread ids (the parent turn has completed, so all subagents ran).
     let mut child_ids: HashSet<ThreadId> = HashSet::new();
@@ -608,25 +972,12 @@ text(JSON.stringify(results));
     Ok(())
 }
 
-/// Recover the plain text a workflow's `text(...)` output carried into the parent's closing model
-/// turn (the workflow tool output echoed into that request's `input`), joined across payload lines.
-fn workflow_output_full_text(seen: &Arc<Mutex<Vec<Value>>>) -> String {
-    let bodies = seen.lock().unwrap();
-    for body in bodies.iter() {
-        let Some(items) = body["input"].as_array() else {
-            continue;
-        };
-        for item in items {
-            if item.get("type").and_then(Value::as_str) != Some("custom_tool_call_output") {
-                continue;
-            }
-            if item.get("call_id").and_then(Value::as_str) != Some(WORKFLOW_CALL_ID) {
-                continue;
-            }
-            return workflow_output_text(item);
-        }
-    }
-    panic!("workflow tool output was never sent to the model");
+async fn workflow_output_full_text(test: &TestCodex, prompt: &str) -> Result<String> {
+    workflow_result(test, prompt)
+        .await?
+        .as_str()
+        .map(str::to_string)
+        .context("workflow result log did not contain a string")
 }
 
 /// P2-workflow-registry-reenter — a depth-1 nested `workflow('child', args)` runs the named saved
@@ -637,14 +988,16 @@ fn workflow_output_full_text(seen: &Arc<Mutex<Vec<Value>>>) -> String {
 /// the core-workflows registry the host handler consults. It calls `text('child-ran-with:' +
 /// args.input)` — proving both that the nested run executed and that it received the parent's args —
 /// and the parent workflow returns that value verbatim via `text(await workflow('child', ...))`.
-/// The engine artifact is the parent workflow tool output echoed into the model's closing turn.
+/// The engine artifact is the bounded result log emitted through workflow progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nested_workflow_reenters_and_returns_child_result() -> Result<()> {
     let server = responses::start_mock_server().await;
 
     // Parent workflow: re-enter the saved `child` workflow one level deep and return its result.
     let parent_source = r#"export const meta = { name: 'uat10parent', description: 'nested re-enter' };
-text(await workflow('child', { input: 'hi-from-parent' }));
+const result = await workflow('child', { input: 'hi-from-parent' });
+log('WFUAT_RESULT:' + JSON.stringify(result));
+text(result);
 "#;
 
     // No subagent turns are expected (neither the parent nor the child spawns an agent); a stub keeps
@@ -655,9 +1008,9 @@ text(await workflow('child', { input: 'hi-from-parent' }));
             ev_completed(&format!("resp-sub-{ordinal}")),
         ])
     });
-    let seen = mount_workflow_router(&server, parent_source, subagent).await;
+    let _seen = mount_workflow_router(&server, parent_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), parent_source)
         .with_config(|config| {
             // Save the `child` workflow into `$CODEX_HOME/workflows` so the host handler's registry
             // resolves `workflow('child', ...)` to it.
@@ -670,16 +1023,232 @@ text(await workflow('child', { input: 'hi-from-parent' }));
             )
             .expect("write child workflow");
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
-    test.submit_turn("run the nested workflow").await?;
-
-    let output = workflow_output_full_text(&seen);
+    let output = workflow_output_full_text(&test, "run the nested workflow").await?;
     assert!(
         output.contains("child-ran-with:hi-from-parent"),
         "the parent's awaited workflow() promise must carry the nested child run's result \
          (with the caller-supplied args injected); got: {output}"
     );
+
+    Ok(())
+}
+
+/// A nested saved workflow must retain its lifecycle across an intermediate runtime yield while
+/// it awaits an `agent()` result. The 1 ms child yield and delayed fixture response make the yield
+/// deterministic; an implementation that only consumes the child's first response rejects the
+/// otherwise valid nested run before its agent can finish.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_workflow_waits_through_yield_for_child_agent() -> Result<()> {
+    let server = responses::start_mock_server().await;
+
+    let parent_source = r#"export const meta = { name: 'yieldparent', description: 'nested yield' };
+const result = await workflow('yieldchild', { input: 'from-parent' });
+log('WFUAT_RESULT:' + JSON.stringify(result));
+text(result);
+"#;
+    let subagent: SubagentScript = Box::new(|ordinal, _is_followup| {
+        sse(vec![
+            ev_response_created(&format!("resp-sub-{ordinal}")),
+            ev_assistant_message(
+                &format!("msg-sub-{ordinal}"),
+                &format!("delayed-sub-done-{ordinal}"),
+            ),
+            ev_completed(&format!("resp-sub-{ordinal}")),
+        ])
+    });
+    let _seen = mount_workflow_router_with_args_and_subagent_delay(
+        &server,
+        parent_source,
+        json!({}),
+        subagent,
+        Duration::from_millis(100),
+    )
+    .await;
+
+    for host_mode in [WorkflowHostMode::InProcess, WorkflowHostMode::ProcessOwned] {
+        let test = workflow_builder_for_host(&server.uri(), parent_source, host_mode)
+            .with_config(|config| {
+                let workflows_dir = config.codex_home.as_path().join("workflows");
+                std::fs::create_dir_all(&workflows_dir).expect("create workflows dir");
+                std::fs::write(
+                    workflows_dir.join("yieldchild.workflow.js"),
+                    "// @exec: {\"yield_time_ms\": 1}\n\
+                     export const meta = { name: 'yieldchild', description: 'yielding child' };\n\
+                     const r = await agent('WFUAT_SUB_0 delayed nested child work');\n\
+                     text('yield-child:' + args.input + ':' + r);\n",
+                )
+                .expect("write yielding child workflow");
+            })
+            .build_with_auto_env(&server)
+            .await?;
+
+        let output = workflow_output_full_text(&test, "run the yielding nested workflow").await?;
+        assert!(
+            output.contains("yield-child:from-parent:delayed-sub-done-0"),
+            "the {host_mode:?} nested workflow must survive its intermediate yield and return its agent output; got: {output}"
+        );
+        test.codex.shutdown_and_wait().await?;
+    }
+
+    Ok(())
+}
+
+/// Cancelling a parent session while a nested workflow is yielded must join the nested terminal
+/// cleanup on both runtime hosts. Durable terminal state, a valid flushed journal, and immediate
+/// lease reacquisition are the externally observable proof that shutdown did not leave a detached
+/// nested driver or stale run owner behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_workflow_cancel_while_yielded_joins_cleanup_across_hosts() -> Result<()> {
+    let server = responses::start_mock_server().await;
+    let parent_source = r#"export const meta = { name: 'cancelparent', description: 'cancel nested yield' };
+const result = await workflow('cancelchild');
+log('WFUAT_RESULT:' + JSON.stringify(result));
+text(result);
+"#;
+    let subagent: SubagentScript = Box::new(|ordinal, _is_followup| {
+        sse(vec![
+            ev_response_created(&format!("resp-cancel-sub-{ordinal}")),
+            ev_assistant_message(
+                &format!("msg-cancel-sub-{ordinal}"),
+                "must-not-complete-before-cancel",
+            ),
+            ev_completed(&format!("resp-cancel-sub-{ordinal}")),
+        ])
+    });
+    let _seen = mount_workflow_router_with_args_and_subagent_delay(
+        &server,
+        parent_source,
+        json!({}),
+        subagent,
+        Duration::from_secs(30),
+    )
+    .await;
+
+    for host_mode in [WorkflowHostMode::InProcess, WorkflowHostMode::ProcessOwned] {
+        let test = workflow_builder_for_host(&server.uri(), parent_source, host_mode)
+            .with_config(|config| {
+                let workflows_dir = config.codex_home.as_path().join("workflows");
+                std::fs::create_dir_all(&workflows_dir).expect("create workflows dir");
+                std::fs::write(
+                    workflows_dir.join("cancelchild.workflow.js"),
+                    "// @exec: {\"yield_time_ms\": 1}\n\
+                     export const meta = { name: 'cancelchild', description: 'yield until cancel' };\n\
+                     const r = await agent('WFUAT_SUB_0 nested work held for cancellation');\n\
+                     text('unexpected:' + r);\n",
+                )
+                .expect("write cancellation child workflow");
+            })
+            .build_with_auto_env(&server)
+            .await?;
+        let mut events = test.codex.subscribe_events();
+        test.submit_turn("start the cancellation workflow").await?;
+
+        let nested_run_id = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut root_run_id = None;
+            let mut nested_run_id = None;
+            loop {
+                let event = events.recv().await.expect("workflow event channel");
+                let EventMsg::Workflow(event) = event.msg else {
+                    continue;
+                };
+                match event {
+                    WorkflowEvent::RunBegin(event) => {
+                        if root_run_id.is_none() {
+                            root_run_id = Some(event.run_id);
+                        } else if root_run_id.as_deref() != Some(event.run_id.as_str()) {
+                            nested_run_id = Some(event.run_id);
+                        }
+                    }
+                    WorkflowEvent::AgentBound(event)
+                        if nested_run_id.as_deref() == Some(event.run_id.as_str()) =>
+                    {
+                        break nested_run_id.expect("nested run began before its agent");
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("{host_mode:?} nested workflow reached agent wait"))?;
+
+        // The fixture response is held for 30 seconds while the runtime yield deadline is 1 ms.
+        // Give the actor a scheduling turn past that deadline, then cancel while it is observably
+        // still awaiting the held subagent rather than racing a normal completion.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::timeout(Duration::from_secs(10), test.codex.shutdown_and_wait())
+            .await
+            .with_context(|| format!("{host_mode:?} shutdown joined nested cleanup"))??;
+
+        let paths = WorkflowRunPaths::new(test.codex_home_path(), &nested_run_id);
+        assert_eq!(
+            paths
+                .read_meta_bounded()
+                .with_context(|| format!("read {host_mode:?} nested metadata"))?
+                .status,
+            WorkflowRunStatus::Failed,
+            "cancelled nested run must be durable as failed"
+        );
+        let progress: Value = serde_json::from_slice(
+            &std::fs::read(paths.progress())
+                .with_context(|| format!("read {host_mode:?} nested progress"))?,
+        )?;
+        assert_eq!(progress["state"], json!("terminal"));
+        assert_eq!(
+            progress["status"],
+            serde_json::to_value(AgentStatus::Interrupted)?,
+            "cancelled nested run must project an interrupted terminal status"
+        );
+        let journal = ReplayJournal::load(&paths.journal())
+            .with_context(|| format!("{host_mode:?} nested journal flushed and replayable"))?;
+        assert_eq!(
+            journal.entries().len(),
+            1,
+            "the bound child must have one terminal journal record before shutdown returns"
+        );
+        let agent_call = &journal.entries()[0];
+        assert_eq!(
+            (agent_call.status, agent_call.ret.clone()),
+            (None, Value::Null),
+            "cancelled workflow agent must durably record death-is-null"
+        );
+        let child_thread_id = ThreadId::from_string(
+            agent_call
+                .child_thread_id
+                .as_deref()
+                .context("bound cancelled agent retained its child thread id")?,
+        )?;
+        assert!(
+            test.thread_manager
+                .get_thread(child_thread_id)
+                .await
+                .is_err(),
+            "cancelled workflow agent must be reaped from the thread manager before shutdown returns"
+        );
+        let lease = match WorkflowRunLease::try_acquire(&paths)? {
+            WorkflowRunLeaseAcquire::Acquired(lease) => lease,
+            WorkflowRunLeaseAcquire::Held => {
+                anyhow::bail!("{host_mode:?} nested lease remained held after shutdown")
+            }
+        };
+        let recovery = codex_core::workflow_recovery::reconcile_stale_workflow_run(
+            test.codex_home_path(),
+            &nested_run_id,
+            /*state_db*/ None,
+        )
+        .await;
+        assert_eq!(
+            (
+                recovery.active,
+                recovery.reconciled,
+                recovery.already_terminal,
+            ),
+            (0, 0, 1),
+            "joined cleanup must leave an already-terminal run, not a stale active owner"
+        );
+        drop(lease);
+    }
 
     Ok(())
 }
@@ -693,8 +1262,8 @@ text(await workflow('child', { input: 'hi-from-parent' }));
 // (`next_spawn_depth` + `exceeds_thread_spawn_depth_limit` mapped onto
 // `agent_max_depth = 1`, host-side `admit_nested_workflow_depth`) and surfaces as
 // a JS throw on the inner `workflow()` promise — never a silent hang. Both tests
-// assert on ENGINE ARTIFACTS: the workflow tool output echoed into the model's
-// closing turn (depth-1 ran; the depth-2 attempt was rejected with the guard's
+// assert on ENGINE ARTIFACTS: the bounded result log emitted by the detached run
+// (depth-1 ran; the depth-2 attempt was rejected with the guard's
 // message) and, for depth-1, the nested run's own spawned subagent rollout
 // (`SessionMeta.parent_thread_id` linking the child run's agent back into the run
 // tree). The depth-guard decision itself is unit-tested at the registry primitive
@@ -711,7 +1280,7 @@ text(await workflow('child', { input: 'hi-from-parent' }));
 /// `linkchild` workflow (depth 1, admitted by the one-level guard) both threads the parent's
 /// `args.input` into its result AND spawns an `agent()` — so the nested run provably re-entered
 /// the runtime one level deep and its subagent accounting flows through the registering path. The
-/// engine artifacts are (1) the parent's workflow tool output carrying the child's result with the
+/// engine artifacts are (1) the parent run's durable result log carrying the child's result with the
 /// injected args, and (2) the nested subagent's rollout `SessionMeta.parent_thread_id`, which links
 /// the child run's agent back to the workflow thread (the externally-observable manifestation of the
 /// nested run's parent linkage; the `parent_run_id` ledger edge itself is unit-tested).
@@ -722,7 +1291,9 @@ async fn uat10_nested_workflow_depth_one_runs_and_links_child_agent() -> Result<
     // Top-level workflow: re-enter the saved `linkchild` workflow one level deep and return its
     // result verbatim.
     let parent_source = r#"export const meta = { name: 'uat10linkparent', description: 'depth-1 nested run' };
-text(await workflow('linkchild', { input: 'from-parent' }));
+const result = await workflow('linkchild', { input: 'from-parent' });
+log('WFUAT_RESULT:' + JSON.stringify(result));
+text(result);
 "#;
 
     // The nested run's single subagent turn returns a self-identifying completed message.
@@ -736,9 +1307,9 @@ text(await workflow('linkchild', { input: 'from-parent' }));
             ev_completed(&format!("resp-sub-{ordinal}")),
         ])
     });
-    let seen = mount_workflow_router(&server, parent_source, subagent).await;
+    let _seen = mount_workflow_router(&server, parent_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), parent_source)
         .with_config(|config| {
             // Save the depth-1 `linkchild` workflow: it spawns one subagent (proving the nested run
             // re-enters and its agent accounting flows) and returns a marker carrying the caller args.
@@ -752,23 +1323,46 @@ text(await workflow('linkchild', { input: 'from-parent' }));
             )
             .expect("write linkchild workflow");
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
+    let codex_home = test.config.codex_home.clone();
     let parent_thread_id = test.session_configured.thread_id;
 
     // Announce every child thread the run creates so we can resolve the nested subagent's rollout.
     let mut child_created = test.thread_manager.subscribe_thread_created();
 
-    test.submit_turn("run the depth-1 nested workflow").await?;
-
     // Engine artifact 1: depth-1 nested run executed and returned its result (with args injected)
     // to the parent's awaited promise — proof the run did not silently hang.
-    let output = workflow_output_full_text(&seen);
+    let output = workflow_output_full_text(&test, "run the depth-1 nested workflow").await?;
     assert!(
         output.contains("child-linked:from-parent:sub-done-0"),
         "the depth-1 nested workflow() must run, receive the caller args, and return its result \
          (including its own subagent's output); got: {output}"
     );
+
+    let mut run_metas = std::fs::read_dir(codex_workflow_journal::storage::runs_root(
+        codex_home.as_path(),
+    ))?
+    .map(|entry| {
+        let run_id = entry?.file_name().to_string_lossy().into_owned();
+        WorkflowRunPaths::new(codex_home.as_path(), &run_id)
+            .read_meta_bounded()
+            .map_err(anyhow::Error::from)
+    })
+    .collect::<Result<Vec<_>>>()?;
+    run_metas.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+    assert_eq!(run_metas.len(), 2, "parent and nested run metadata exist");
+    let root_run = run_metas
+        .iter()
+        .find(|meta| meta.parent_run_id.is_none())
+        .context("root workflow metadata")?;
+    let nested_run = run_metas
+        .iter()
+        .find(|meta| meta.parent_run_id.as_deref() == Some(root_run.run_id.as_str()))
+        .context("nested workflow metadata")?;
+    let expected_owner = Some(parent_thread_id.to_string());
+    assert_eq!(root_run.owner_thread_id, expected_owner);
+    assert_eq!(nested_run.owner_thread_id, expected_owner);
 
     // Engine artifact 2: the nested run's subagent is a real registered thread whose rollout links
     // back to the workflow thread — the observable parent linkage for the depth-1 nested run.
@@ -818,7 +1412,7 @@ text(await workflow('linkchild', { input: 'from-parent' }));
 /// 1, admitted) then calls `workflow('leaf', args)` — which would create a *second* nesting level
 /// (depth 2) and is refused by the one-level guard. `mid` wraps the deeper call in `try/catch` and
 /// returns the caught error text, and `leaf` (which must never run) writes a sentinel. The engine
-/// artifact is the parent's workflow tool output: it shows `mid` (depth 1) ran to completion, the
+/// artifact is the parent run's result log: it shows `mid` (depth 1) ran to completion, the
 /// depth-2 `workflow('leaf')` attempt was REJECTED with the guard's one-level-nesting message
 /// (surfaced as a JS throw, caught by the script), and the `leaf` body never executed. The whole
 /// turn completing at all is itself the "not a silent hang" assertion.
@@ -827,7 +1421,9 @@ async fn uat10_second_nesting_level_rejected_as_error() -> Result<()> {
     let server = responses::start_mock_server().await;
 
     let parent_source = r#"export const meta = { name: 'uat10rejparent', description: 'depth-2 rejection' };
-text(await workflow('mid', { input: 'hi' }));
+const result = await workflow('mid', { input: 'hi' });
+log('WFUAT_RESULT:' + JSON.stringify(result));
+text(result);
 "#;
 
     // No subagent turns are expected in this scenario; a stub keeps the router shape.
@@ -837,9 +1433,9 @@ text(await workflow('mid', { input: 'hi' }));
             ev_completed(&format!("resp-sub-{ordinal}")),
         ])
     });
-    let seen = mount_workflow_router(&server, parent_source, subagent).await;
+    let _seen = mount_workflow_router(&server, parent_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), parent_source)
         .with_config(|config| {
             let workflows_dir = config.codex_home.as_path().join("workflows");
             std::fs::create_dir_all(&workflows_dir).expect("create workflows dir");
@@ -866,11 +1462,9 @@ text(await workflow('mid', { input: 'hi' }));
             )
             .expect("write leaf workflow");
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
-    test.submit_turn("run the depth-2 nested workflow").await?;
-
-    let output = workflow_output_full_text(&seen);
+    let output = workflow_output_full_text(&test, "run the depth-2 nested workflow").await?;
     // The depth-1 middle workflow ran to completion (the turn did not hang before returning).
     assert!(
         output.contains("mid-depth1-ran"),
@@ -949,7 +1543,7 @@ fn subagent_arrival_index(seen: &Arc<Mutex<Vec<Value>>>, code: u64) -> Option<us
 const PIPELINE_LATCH_MAX_ROUNDS: usize = 64;
 
 /// A routing responder for the pipeline UAT: identical dispatch shape to [`WorkflowRouter`]
-/// (subagent marker -> per-code SSE; parent open -> `workflow` custom-tool call; parent
+/// (subagent marker -> per-code SSE; parent open -> structured `workflow_run` call; parent
 /// close -> final message), but it holds `latched_code`'s subagent in an early stage using a
 /// DETERMINISTIC latch rather than a wall-clock delay.
 ///
@@ -960,7 +1554,7 @@ const PIPELINE_LATCH_MAX_ROUNDS: usize = 64;
 /// request (not elapsed time), the staggered ordering the test asserts is deterministic on slow CI.
 /// Every OTHER subagent turn is a single round-trip returning a completed assistant message.
 struct PipelineRouter {
-    workflow_source: String,
+    workflow_name: String,
     /// The subagent code held in an early stage until `release_code` is observed.
     latched_code: u64,
     /// Observing a request for this code in `seen` releases the latched subagent.
@@ -1035,9 +1629,10 @@ impl Respond for PipelineRouter {
             ]));
         }
 
+        let arguments = json!({ "name": self.workflow_name }).to_string();
         sse_response(sse(vec![
             ev_response_created("resp-parent-open"),
-            responses::ev_custom_tool_call(WORKFLOW_CALL_ID, "workflow", &self.workflow_source),
+            ev_function_call(WORKFLOW_CALL_ID, "workflow_run", &arguments),
             ev_completed("resp-parent-open"),
         ]))
     }
@@ -1053,7 +1648,7 @@ async fn mount_pipeline_router(
 ) -> Arc<Mutex<Vec<Value>>> {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let router = PipelineRouter {
-        workflow_source: workflow_source.to_string(),
+        workflow_name: workflow_name(workflow_source),
         latched_code,
         release_code,
         seen: Arc::clone(&seen),
@@ -1090,6 +1685,7 @@ const stage = (n) => async (x) => {{
   return x;
 }};
 const results = await pipeline([0, 1], stage(0), stage(1), stage(2));
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#,
     );
@@ -1105,18 +1701,16 @@ text(JSON.stringify(results));
     )
     .await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), &workflow_source)
         // Raise the per-session registry ceiling so the run's six lifetime subagents (2
         // items x 3 stages), which stay registered for the run, never hit the hard backstop.
         .with_config(|config| {
             config.multi_agent_v2.max_concurrent_threads_per_session = 32;
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
-    test.submit_turn("run the uat7 pipeline workflow").await?;
-
     // Position-preserving return: each item threads its index through every stage.
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat7 pipeline workflow").await?;
     assert_eq!(results, vec![json!(0), json!(1)], "pipeline return [0, 1]");
 
     // Every stage of both items dispatched a subagent request (all six agents ran).
@@ -1166,6 +1760,7 @@ const stage = (n) => async (x) => {{
   return x;
 }};
 const results = await pipeline([0, 1], stage(0), stage(1), stage(2));
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#,
     );
@@ -1180,17 +1775,14 @@ text(JSON.stringify(results));
 
     let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), &workflow_source)
         .with_config(|config| {
             config.multi_agent_v2.max_concurrent_threads_per_session = 32;
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
-    test.submit_turn("run the uat7 stage-throw workflow")
-        .await?;
-
     // The throwing item's slot is `null`; the sibling holds its value — position-preserving.
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat7 stage-throw workflow").await?;
     assert_eq!(
         results,
         vec![json!(0), Value::Null],
@@ -1228,8 +1820,9 @@ text(JSON.stringify(results));
 // Budget pre-admission hard ceiling (spec §5 admission-order step 1, §8;
 // `P2-budget-pre-admission-throw`).
 //
-// A metered workflow run drives `agent()` calls sequentially; the shared,
-// tree-wide `RolloutBudget` accrues each subagent turn's fixture token usage. The
+// A metered workflow run drives `agent()` calls sequentially; the run-local
+// `WorkflowBudget` and session-tree `RolloutBudget` both accrue each subagent
+// turn's fixture token usage. The
 // pre-admission gate in `CoreTurnHost::spawn_agent` refuses the FIRST `agent()`
 // call whose admission-time `remaining()` is `<= 0` by returning
 // `AgentSpawnOutcome::Rejected("BudgetExceeded")`, which the isolate surfaces as a
@@ -1242,10 +1835,11 @@ text(JSON.stringify(results));
 /// UAT-5 — budget hard ceiling: `agent()` throws `BudgetExceeded` at the exact ordinal where
 /// `remaining()` first hits `<= 0`, and no further subagents spawn.
 ///
-/// The run is metered by a `RolloutBudget` with `limit_tokens = 250` counting input tokens 1:1
-/// (`prefill_token_weight = 1.0`), and each subagent turn reports 100 input tokens via
-/// `ev_completed_with_tokens`. The workflow issues `agent()` calls sequentially in a `try/catch`
-/// loop, so budget accrues between calls and the throw is deterministic:
+/// The structured invocation supplies `args.budget.total = 250` for the run-local meter, while the
+/// session `RolloutBudget` uses the same ceiling and counts output tokens 1:1
+/// (`sampling_token_weight = 1.0`). Each subagent turn reports 100 output tokens. The workflow
+/// issues `agent()` calls sequentially in a `try/catch`
+/// loop, so both budgets accrue together and the throw is deterministic:
 /// - ordinal 0 (pre-check remaining 250) spawns; after it, spent 100, remaining 150.
 /// - ordinal 1 (remaining 150) spawns; after it, spent 200, remaining 50.
 /// - ordinal 2 (remaining 50) spawns; its turn pushes spent to 300 (the in-flight backstop aborts
@@ -1259,8 +1853,8 @@ text(JSON.stringify(results));
 /// `ThreadGoalStatus::BudgetLimited` surfaces at the ceiling (observed via a non-competing event
 /// tap). The high `max_concurrent_threads_per_session` guarantees the lifetime cap is not the
 /// limiting factor, so the only possible throw is the budget ceiling (step 1 precedes the lifetime
-/// CAS of step 2). Fixed `ev_completed_with_tokens` counts make the ceiling-throw ordinal (3)
-/// byte-identical on every run.
+/// CAS of step 2). Fixed output-token counts make the ceiling-throw ordinal (3) byte-identical on
+/// every run.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uat5_budget_pre_admission_throw_at_ceiling() -> Result<()> {
     let server = responses::start_mock_server().await;
@@ -1278,37 +1872,44 @@ for (let i = 0; i < 5; i++) {{
     break;
   }}
 }}
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#,
     );
 
-    // Every subagent turn is a single round-trip that reports 100 input tokens against the budget.
+    // Every subagent turn is a single round-trip that reports 100 output tokens against both
+    // budgets.
     let subagent: SubagentScript = Box::new(|ordinal, _is_followup| {
         sse(vec![
             ev_response_created(&format!("resp-sub-{ordinal}")),
             ev_assistant_message(&format!("msg-sub-{ordinal}"), &format!("done-{ordinal}")),
-            ev_completed_with_tokens(&format!("resp-sub-{ordinal}"), 100),
+            ev_completed_with_output_tokens(&format!("resp-sub-{ordinal}"), 100),
         ])
     });
 
-    let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
+    let seen = mount_workflow_router_with_args(
+        &server,
+        &workflow_source,
+        json!({ "budget": { "total": 250 } }),
+        subagent,
+    )
+    .await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), &workflow_source)
         .with_config(|config| {
-            // Meter the run: a 250-token ceiling counting input tokens 1:1 (output tokens are 0 in
-            // the fixture usage, so `prefill_token_weight = 1.0` is what makes the fixture counts
-            // accrue). Shared tree-wide via the session's `AgentControl.rollout_budget`.
+            // Align the session-tree ceiling with the run-local `args.budget.total = 250` ceiling.
+            // Output tokens count 1:1, so both meters cross at the same deterministic ordinal.
             config.rollout_budget = Some(RolloutBudgetConfig {
                 limit_tokens: 250,
                 reminder_at_remaining_tokens: Vec::new(),
                 sampling_token_weight: 1.0,
-                prefill_token_weight: 1.0,
+                prefill_token_weight: 0.0,
             });
             // Raise the registry ceiling so the lifetime cap never fires first: the ONLY throw in
             // this run must be the budget ceiling, proving step 1 precedes the lifetime CAS.
             config.multi_agent_v2.max_concurrent_threads_per_session = 32;
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
 
     // Tap the workflow session's event stream BEFORE the turn: at the ceiling the §8 reporting half
@@ -1318,11 +1919,8 @@ text(JSON.stringify(results));
     // turn since a `broadcast::Receiver` only observes events published after `subscribe`.
     let mut events = test.codex.subscribe_events();
 
-    test.submit_turn("run the uat5 budget-ceiling workflow")
-        .await?;
-
     // The workflow's own return: ordinals 0-2 ran (pushed as their index), then ordinal 3 threw.
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat5 budget-ceiling workflow").await?;
     assert_eq!(
         results.len(),
         4,
@@ -1403,25 +2001,23 @@ text(JSON.stringify(results));
 ///
 /// This gate covers the in-process-lane readout gap: the isolate's `budget.spent()` /
 /// `budget.remaining()` native functions (and the `budget.total` property) must forward to the
-/// session's shared, tree-wide `RolloutBudget` so a workflow can loop until its budget is nearly
-/// exhausted. Before the in-process delegate returned a live handle, the broker inherited the
-/// default `budget_handle() -> None`, so on THIS lane (`Feature::CodeModeHost` disabled) the globals
-/// reported static values (`total`/`spent`/`remaining` all `0`, since a top-level run carries no
-/// `args.budget.total`) even while enforcement metered real spend — which breaks the
-/// loop-until-budget authoring pattern.
+/// ledger's live run-local `WorkflowBudget` so a workflow can loop until its budget is nearly
+/// exhausted. The saved structured invocation supplies `args.budget.total = 1000`; without the
+/// live delegate callback the globals would remain at their initial snapshot while agents accrue
+/// spend, which breaks the loop-until-budget authoring pattern.
 ///
-/// The run is metered by a session `RolloutBudget` (`limit_tokens = 1000`, `prefill_token_weight =
-/// 1.0`), and each subagent turn reports 100 input tokens via `ev_completed_with_tokens`. The
-/// workflow reads the globals before any spawn and again after each of two sequential `agent()`
-/// calls, returning the readings as its result. The readings must reflect live accrual:
+/// The independent session `RolloutBudget` is aligned at 1000 and counts output tokens 1:1, while
+/// each subagent turn reports 100 output tokens. The workflow reads the globals before any spawn
+/// and again after each of two sequential `agent()` calls, returning the readings as its result.
+/// The readings must reflect live run-local accrual:
 /// - start: `total 1000`, `spent 0`, `remaining 1000`.
 /// - after ordinal 0: `spent 100`, `remaining 900`.
 /// - after ordinal 1: `spent 200`, `remaining 800`.
 ///
-/// With the pre-fix static `None` handle every reading would instead be `total 0` / `spent 0` /
-/// `remaining 0`, so the `spent == 100/200` and `total == 1000` assertions are what prove the handle
-/// is live on the in-process lane. Engine artifacts (a dispatched subagent request per admitted
-/// ordinal) are asserted too, so the readings are anchored to real spawns rather than free text.
+/// With a static snapshot, later readings would stay `spent = 0` / `remaining = 1000`, so the
+/// `spent == 100/200` assertions prove the handle is live on the in-process lane. Engine artifacts
+/// (a dispatched subagent request per admitted ordinal) are asserted too, so the readings are
+/// anchored to real spawns rather than free text.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn uat5_in_process_budget_global_reports_live_accrual() -> Result<()> {
     let server = responses::start_mock_server().await;
@@ -1441,56 +2037,60 @@ await agent("{marker}0 budgeted work");
 read('after0');
 await agent("{marker}1 budgeted work");
 read('after1');
+log('WFUAT_RESULT:' + JSON.stringify(readings));
 text(JSON.stringify(readings));
 "#,
     );
 
-    // Every subagent turn is a single round-trip reporting 100 input tokens against the budget.
+    // Every subagent turn is a single round-trip reporting 100 output tokens against both budgets.
     let subagent: SubagentScript = Box::new(|ordinal, _is_followup| {
         sse(vec![
             ev_response_created(&format!("resp-sub-{ordinal}")),
             ev_assistant_message(&format!("msg-sub-{ordinal}"), &format!("done-{ordinal}")),
-            ev_completed_with_tokens(&format!("resp-sub-{ordinal}"), 100),
+            ev_completed_with_output_tokens(&format!("resp-sub-{ordinal}"), 100),
         ])
     });
 
-    let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
+    let seen = mount_workflow_router_with_args(
+        &server,
+        &workflow_source,
+        json!({ "budget": { "total": 1000 } }),
+        subagent,
+    )
+    .await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), &workflow_source)
         .with_config(|config| {
-            // Meter the run with a generous 1000-token ceiling counting input tokens 1:1 so the two
-            // sequential agents (100 tokens each) accrue without ever hitting the ceiling. Shared
-            // tree-wide via the session's `AgentControl.rollout_budget`.
+            // Align the independent session-tree ceiling with the run-local
+            // `args.budget.total = 1000` ceiling. The two sequential agents accrue 100 tokens each
+            // without approaching either ceiling.
             config.rollout_budget = Some(RolloutBudgetConfig {
                 limit_tokens: 1000,
                 reminder_at_remaining_tokens: Vec::new(),
                 sampling_token_weight: 1.0,
-                prefill_token_weight: 1.0,
+                prefill_token_weight: 0.0,
             });
             // Keep the lifetime cap out of the way: both agents stay registered for the run.
             config.multi_agent_v2.max_concurrent_threads_per_session = 32;
         })
-        .build(&server)
-        .await?;
-
-    test.submit_turn("run the uat5 live-budget workflow")
+        .build_with_auto_env(&server)
         .await?;
 
     // The workflow's own return carries the three readings the isolate took.
-    let readings = workflow_return_array(&seen);
+    let readings = workflow_return_array(&test, "run the uat5 live-budget workflow").await?;
     assert_eq!(
         readings.len(),
         3,
         "the workflow reads the budget at start + after each of two agents: {readings:?}"
     );
 
-    // The `budget.total` property is sourced from the LIVE handle's configured ceiling (1000), not
-    // the top-level run's absent `args.budget.total` (which would read 0 without the handle).
+    // The `budget.total` property is sourced from the structured invocation's run-local ceiling.
     for reading in &readings {
         assert_eq!(
             reading["total"],
             json!(1000),
-            "budget.total must report the live session ceiling on the in-process lane: {reading:?}"
+            "budget.total must report the saved run's explicit ceiling on the in-process lane: \
+             {reading:?}"
         );
     }
 
@@ -1589,6 +2189,7 @@ for (let i = 0; i < 6; i++) {{
     break;
   }}
 }}
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#,
     );
@@ -1603,7 +2204,7 @@ text(JSON.stringify(results));
 
     let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), &workflow_source)
         .with_config(|config| {
             config.rollout_budget = Some(RolloutBudgetConfig {
                 limit_tokens: 250,
@@ -1616,13 +2217,10 @@ text(JSON.stringify(results));
             // budget gate not checked first.
             config.multi_agent_v2.max_concurrent_threads_per_session = 4;
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
 
-    test.submit_turn("run the uat5 admission-order workflow")
-        .await?;
-
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat5 admission-order workflow").await?;
     assert_eq!(
         results.len(),
         4,
@@ -1700,6 +2298,7 @@ for (let i = 0; i < {FANOUT}; i++) {{
   }})(i));
 }}
 const results = await parallel(thunks);
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#,
     );
@@ -1714,7 +2313,7 @@ text(JSON.stringify(results));
 
     let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), &workflow_source)
         .with_config(|config| {
             config.rollout_budget = Some(RolloutBudgetConfig {
                 limit_tokens: 250,
@@ -1726,13 +2325,10 @@ text(JSON.stringify(results));
             // bound this fan-out is the budget reservation gate.
             config.multi_agent_v2.max_concurrent_threads_per_session = 64;
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
 
-    test.submit_turn("run the uat5 parallel fan-out workflow")
-        .await?;
-
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat5 parallel fan-out workflow").await?;
     assert_eq!(
         results.len(),
         FANOUT,
@@ -1795,11 +2391,11 @@ text(JSON.stringify(results));
 /// UAT-5 (real `args.budget.total`) — a budget sourced from a live `args.budget.total` threaded
 /// through the tool call drives the ceiling end-to-end.
 ///
-/// The top-level (freeform) `workflow` tool carries no structured args, so a real `args.budget.total`
-/// reaches the engine through the NESTED `workflow(name, args)` path: the depth-0 run calls
+/// This specifically covers argument propagation through the NESTED `workflow(name, args)` path:
+/// the depth-0 run calls
 /// `workflow('metered', { budget: { total: 250 } })`, and the saved `metered` workflow's subagents
 /// meter their OUTPUT tokens against that caller-supplied ceiling. The engine artifact is the nested
-/// run's own return (surfaced verbatim in the parent's workflow tool output): ordinals 0/1/2 ran and
+/// run's own return (surfaced in the parent run's bounded result log): ordinals 0/1/2 ran and
 /// ordinal 3 threw `BudgetExceeded` at `remaining() == 0` — proving the `args.budget.total` value
 /// (not a session-configured baseline) installed and enforced the ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1807,7 +2403,9 @@ async fn uat5_nested_args_budget_total_drives_ceiling() -> Result<()> {
     let server = responses::start_mock_server().await;
 
     let parent_source = r#"export const meta = { name: 'uat5argsparent', description: 'args.budget.total via nested run' };
-text(await workflow('metered', { budget: { total: 250 } }));
+const result = await workflow('metered', { budget: { total: 250 } });
+log('WFUAT_RESULT:' + JSON.stringify(result));
+text(result);
 "#;
 
     // Each subagent turn reports 100 OUTPUT tokens (the nested budget uses the pure output-weight
@@ -1821,7 +2419,7 @@ text(await workflow('metered', { budget: { total: 250 } }));
     });
     let seen = mount_workflow_router(&server, parent_source, subagent).await;
 
-    let test = workflow_builder(&server.uri())
+    let test = workflow_builder(&server.uri(), parent_source)
         .with_config(|config| {
             // No session baseline: the ONLY ceiling is the one carried by args.budget.total.
             config.rollout_budget = None;
@@ -1841,18 +2439,20 @@ text(await workflow('metered', { budget: { total: 250 } }));
                  \x20   break;\n\
                  \x20 }\n\
                  }\n\
+                 log('WFUAT_RESULT:' + JSON.stringify(results));\n\
                  text(JSON.stringify(results));\n",
             )
             .expect("write metered workflow");
         })
-        .build(&server)
+        .build_with_auto_env(&server)
         .await?;
 
-    test.submit_turn("run the nested args.budget workflow")
-        .await?;
-
-    // The nested run's own return, surfaced verbatim in the parent's workflow tool output.
-    let results = workflow_return_array(&seen);
+    // The nested run's own return, surfaced in the parent run's bounded result log.
+    let results = workflow_result(&test, "run the nested args.budget workflow")
+        .await?
+        .as_str()
+        .and_then(|result| serde_json::from_str::<Vec<Value>>(result).ok())
+        .context("nested budget workflow did not return its JSON result array")?;
     assert_eq!(
         results.len(),
         4,
@@ -1945,6 +2545,7 @@ phase('fanout');
 log('starting fan-out');
 const results = await parallel([
 {thunks}]);
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#
     );
@@ -1964,7 +2565,9 @@ text(JSON.stringify(results));
 
     let _seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri()).build(&server).await?;
+    let test = workflow_builder(&server.uri(), &workflow_source)
+        .build_with_auto_env(&server)
+        .await?;
     let parent_thread_id = test.session_configured.thread_id;
     let codex_home = test.config.codex_home.clone();
 
@@ -1973,8 +2576,7 @@ text(JSON.stringify(results));
     // this flush only guarantees the named files are durable.
     let mut child_created = test.thread_manager.subscribe_thread_created();
 
-    test.submit_turn("run the p3 journal-write workflow")
-        .await?;
+    submit_workflow_and_wait(&test, "run the p3 journal-write workflow").await?;
 
     let mut child_ids: HashSet<ThreadId> = HashSet::new();
     while let Ok(child_id) = child_created.try_recv() {
@@ -2163,6 +2765,7 @@ async fn uat6_unchanged_script_journal_is_a_full_prefix_cache_hit() -> Result<()
         r#"export const meta = {{ name: 'uat6', description: 'resume prefix replay gate' }};
 const results = await parallel([
 {thunks}]);
+log('WFUAT_RESULT:' + JSON.stringify(results));
 text(JSON.stringify(results));
 "#
     );
@@ -2179,14 +2782,13 @@ text(JSON.stringify(results));
 
     let seen = mount_workflow_router(&server, &workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri()).build(&server).await?;
+    let test = workflow_builder(&server.uri(), &workflow_source)
+        .build_with_auto_env(&server)
+        .await?;
     let codex_home = test.config.codex_home.clone();
 
-    test.submit_turn("run the uat6 resume-gate workflow")
-        .await?;
-
     // The source run's own return is the deterministic fixture fan-out.
-    let results = workflow_return_array(&seen);
+    let results = workflow_return_array(&test, "run the uat6 resume-gate workflow").await?;
     assert_eq!(
         results,
         vec![json!("done-0"), json!("done-1"), json!("done-2")],
@@ -2312,7 +2914,7 @@ text(JSON.stringify(results));
 /// lane runs (not just the `code-mode` unit harness).
 ///
 /// A workflow body probes each shimmed determinism source and returns the probe results as its own
-/// value (the engine artifact, surfaced in the workflow tool output): `Date.now()`, argless
+/// value (the engine artifact, surfaced in the durable result log): `Date.now()`, argless
 /// `new Date()`, and `Math.random()` all THROW, while `WeakRef`, `FinalizationRegistry`, and
 /// `setTimeout` are absent (`undefined`). This is the integration bookend to the in-isolate unit
 /// assertions in `code-mode` (`workflow_determinism_prelude_*`, `workflow_isolate_*`): it proves the
@@ -2333,6 +2935,7 @@ const probes = [
   'FinalizationRegistry=' + typeof FinalizationRegistry,
   'setTimeout=' + typeof setTimeout,
 ];
+log('WFUAT_RESULT:' + JSON.stringify(probes));
 text(JSON.stringify(probes));
 "#;
 
@@ -2343,13 +2946,12 @@ text(JSON.stringify(probes));
             ev_completed(&format!("resp-sub-{ordinal}")),
         ])
     });
-    let seen = mount_workflow_router(&server, workflow_source, subagent).await;
+    let _seen = mount_workflow_router(&server, workflow_source, subagent).await;
 
-    let test = workflow_builder(&server.uri()).build(&server).await?;
-    test.submit_turn("run the uat6 determinism-shim workflow")
+    let test = workflow_builder(&server.uri(), workflow_source)
+        .build_with_auto_env(&server)
         .await?;
-
-    let probes = workflow_return_array(&seen);
+    let probes = workflow_return_array(&test, "run the uat6 determinism-shim workflow").await?;
     assert_eq!(
         probes,
         vec![

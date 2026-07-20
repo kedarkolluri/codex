@@ -141,6 +141,12 @@ impl App {
         {
             return;
         }
+        if self
+            .maybe_return_to_workflow_monitor(tui, app_server, key_event)
+            .await
+        {
+            return;
+        }
 
         let app_keymap_shortcuts_available = self.app_keymap_shortcuts_available();
 

@@ -96,6 +96,21 @@ pub use crate::permissions::NetworkSandboxPolicy;
 use crate::permissions::default_read_only_subpaths_for_writable_root;
 pub use crate::request_permissions::RequestPermissionsArgs;
 pub use crate::request_user_input::RequestUserInputEvent;
+pub use crate::workflow_events::WorkflowAgentAttemptReason;
+pub use crate::workflow_events::WorkflowAgentBeginEvent;
+pub use crate::workflow_events::WorkflowAgentBoundEvent;
+pub use crate::workflow_events::WorkflowAgentEndEvent;
+pub use crate::workflow_events::WorkflowAgentUpdatedEvent;
+pub use crate::workflow_events::WorkflowEvent;
+pub use crate::workflow_events::WorkflowGroupBeginEvent;
+pub use crate::workflow_events::WorkflowGroupEndEvent;
+pub use crate::workflow_events::WorkflowGroupKind;
+pub use crate::workflow_events::WorkflowLogEvent;
+pub use crate::workflow_events::WorkflowPhaseBeginEvent;
+pub use crate::workflow_events::WorkflowPhaseEndEvent;
+pub use crate::workflow_events::WorkflowRunBeginEvent;
+pub use crate::workflow_events::WorkflowRunEndEvent;
+pub use crate::workflow_events::WorkflowRunTerminalReason;
 
 /// Open/close tags for special context blocks. Used across crates to avoid duplicated hardcoded
 /// strings.
@@ -1474,6 +1489,9 @@ pub enum EventMsg {
     CollabResumeBegin(CollabResumeBeginEvent),
     /// Collab interaction: resume end.
     CollabResumeEnd(CollabResumeEndEvent),
+
+    /// Structured workflow progress. The nested tagged union is exhaustive over workflow events.
+    Workflow(WorkflowEvent),
 
     /// Path-based v2 sub-agent activity.
     SubAgentActivity(SubAgentActivityEvent),

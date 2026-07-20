@@ -39,6 +39,14 @@ pub(crate) struct AgentMetadata {
     pub(crate) agent_nickname: Option<String>,
     pub(crate) agent_role: Option<String>,
     pub(crate) last_task_message: Option<String>,
+    pub(crate) parent_completion_delivery: ParentCompletionDelivery,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ParentCompletionDelivery {
+    #[default]
+    NotifyParent,
+    WorkflowSupervisor,
 }
 
 fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
@@ -287,6 +295,34 @@ impl AgentRegistry {
         Some(agent_nickname)
     }
 
+    fn reserve_restored_agent_nickname(&self, restored: &str) -> String {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live_nicknames: HashSet<String> = active_agents
+            .agent_tree
+            .values()
+            .filter_map(|metadata| metadata.agent_nickname.clone())
+            .collect();
+        let nickname = if live_nicknames.contains(restored) {
+            let mut suffix = 2usize;
+            loop {
+                let candidate = format!("{restored}-{suffix}");
+                if !active_agents.used_agent_nicknames.contains(&candidate)
+                    && !live_nicknames.contains(candidate.as_str())
+                {
+                    break candidate;
+                }
+                suffix += 1;
+            }
+        } else {
+            restored.to_string()
+        };
+        active_agents.used_agent_nicknames.insert(nickname.clone());
+        nickname
+    }
+
     fn reserve_agent_path(&self, agent_path: &AgentPath) -> Result<()> {
         let mut active_agents = self
             .active_agents
@@ -366,6 +402,16 @@ impl SpawnReservation {
             })?;
         self.reserved_agent_nickname = Some(agent_nickname.clone());
         Ok(agent_nickname)
+    }
+
+    /// Reclaim a persisted nickname for the same thread when it resumes.
+    ///
+    /// Historical nickname usage does not force a suffix, but a nickname still held by another
+    /// live agent does. This preserves rollout identity without creating a live-name collision.
+    pub(crate) fn reserve_restored_agent_nickname(&mut self, restored: &str) -> String {
+        let agent_nickname = self.state.reserve_restored_agent_nickname(restored);
+        self.reserved_agent_nickname = Some(agent_nickname.clone());
+        agent_nickname
     }
 
     pub(crate) fn reserve_agent_path(&mut self, agent_path: &AgentPath) -> Result<()> {

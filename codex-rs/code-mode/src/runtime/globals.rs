@@ -13,6 +13,10 @@ use super::callbacks::store_callback;
 use super::callbacks::text_callback;
 use super::callbacks::tool_callback;
 use super::callbacks::workflow_callback;
+use super::callbacks::workflow_group_begin_callback;
+use super::callbacks::workflow_group_end_callback;
+use super::callbacks::workflow_group_enter_callback;
+use super::callbacks::workflow_group_exit_callback;
 use super::callbacks::yield_control_callback;
 use super::value::json_to_v8;
 use super::value::value_to_error_text;
@@ -52,7 +56,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     let generated_image = helper_function(scope, "generatedImage", generated_image_callback)?;
     let store = helper_function(scope, "store", store_callback)?;
     let load = helper_function(scope, "load", load_callback)?;
-    let notify = helper_function(scope, "notify", notify_callback)?;
     let yield_control = helper_function(scope, "yield_control", yield_control_callback)?;
     let exit = helper_function(scope, "exit", exit_callback)?;
 
@@ -63,7 +66,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     set_global(scope, global, "generatedImage", generated_image.into())?;
     set_global(scope, global, "store", store.into())?;
     set_global(scope, global, "load", load.into())?;
-    set_global(scope, global, "notify", notify.into())?;
     set_global(scope, global, "yield_control", yield_control.into())?;
     set_global(scope, global, "exit", exit.into())?;
 
@@ -78,8 +80,14 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
     // `setInterval`, `clearTimeout`, `clearInterval` all `undefined`, and no OS
     // timer thread is ever spawned). Plain code-mode exec keeps them.
     if !workflow {
+        // `notify()` injects a custom tool-call output into the active model turn. Workflow
+        // narration is deliberately out-of-band (`log`/`phase` -> journal/progress/UI), so
+        // exposing `notify` here would let a saved workflow add unbounded repeated model-history
+        // items behind the bounded `workflow_run` result contract.
+        let notify = helper_function(scope, "notify", notify_callback)?;
         let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
         let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
+        set_global(scope, global, "notify", notify.into())?;
         set_global(scope, global, "clearTimeout", clear_timeout.into())?;
         set_global(scope, global, "setTimeout", set_timeout.into())?;
     }
@@ -117,12 +125,48 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         // `args` or the host-minted `workflow.runId`.
         install_determinism_prelude(scope)?;
 
-        // Read-only native-backed `budget` global (§4/§8). `budget.total` is a
-        // read-only number sourced from `args.budget.total`; `budget.spent()` and
-        // `budget.remaining()` are native functions forwarding to the shared
-        // `RolloutBudget` handle on the `RuntimeState`, read live at call time so
-        // a workflow that awaits subagents sees updated spend.
+        // Read-only native-backed `budget` global. `budget.spent()` and
+        // `budget.remaining()` read the runtime-owned mirror, which host
+        // callbacks refresh before awaited promises settle.
         install_workflow_budget_global(scope, global)?;
+
+        // Private native topology hooks captured by the pure-JS orchestration preludes below. The
+        // raw globals are deleted immediately after both preludes install, so workflow source can
+        // use only the validated `parallel`/`pipeline` APIs and cannot forge progress nodes.
+        let group_begin = helper_function(
+            scope,
+            "__codexWorkflowGroupBegin",
+            workflow_group_begin_callback,
+        )?;
+        let group_end = helper_function(
+            scope,
+            "__codexWorkflowGroupEnd",
+            workflow_group_end_callback,
+        )?;
+        let group_enter = helper_function(
+            scope,
+            "__codexWorkflowGroupEnter",
+            workflow_group_enter_callback,
+        )?;
+        let group_exit = helper_function(
+            scope,
+            "__codexWorkflowGroupExit",
+            workflow_group_exit_callback,
+        )?;
+        set_global(
+            scope,
+            global,
+            "__codexWorkflowGroupBegin",
+            group_begin.into(),
+        )?;
+        set_global(scope, global, "__codexWorkflowGroupEnd", group_end.into())?;
+        set_global(
+            scope,
+            global,
+            "__codexWorkflowGroupEnter",
+            group_enter.into(),
+        )?;
+        set_global(scope, global, "__codexWorkflowGroupExit", group_exit.into())?;
 
         // Pure JS orchestration prelude. `parallel()` is a position-preserving
         // barrier defined entirely in the isolate (no host op) — it composes
@@ -137,6 +181,10 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
         // composes `agent()` promises exactly like `parallel()` and inherits the
         // same host-side scheduler-semaphore concurrency bound.
         install_pipeline_prelude(scope)?;
+        delete_global(scope, global, "__codexWorkflowGroupBegin")?;
+        delete_global(scope, global, "__codexWorkflowGroupEnd")?;
+        delete_global(scope, global, "__codexWorkflowGroupEnter")?;
+        delete_global(scope, global, "__codexWorkflowGroupExit")?;
     }
     Ok(())
 }
@@ -157,6 +205,7 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
 /// `count` (and `map` runs over the real `snapshot`, never the proxy), no more
 /// than `count` (<= 4096) thunks can ever be invoked. There is no host op.
 const PARALLEL_PRELUDE: &str = r#"
+(function installParallel(beginGroup, endGroup, enterGroup, exitGroup) {
 Object.defineProperty(globalThis, "parallel", {
   value: function parallel(thunks) {
     if (!Array.isArray(thunks)) {
@@ -176,12 +225,35 @@ Object.defineProperty(globalThis, "parallel", {
     for (let i = 0; i < count; i++) {
       snapshot.push(thunks[i]);
     }
-    return Promise.all(snapshot.map((t) => t().catch(() => null)));
+    const groupId = beginGroup("parallel", count);
+    let promises;
+    try {
+      promises = snapshot.map((t) => {
+        const previous = enterGroup(groupId);
+        try {
+          return t().catch(() => null);
+        } finally {
+          exitGroup(previous);
+        }
+      });
+    } catch (error) {
+      endGroup(groupId, "parallel", count);
+      throw error;
+    }
+    return Promise.all(promises).finally(() => {
+      endGroup(groupId, "parallel", count);
+    });
   },
   writable: false,
   enumerable: false,
   configurable: false,
 });
+})(
+  globalThis.__codexWorkflowGroupBegin,
+  globalThis.__codexWorkflowGroupEnd,
+  globalThis.__codexWorkflowGroupEnter,
+  globalThis.__codexWorkflowGroupExit
+);
 "#;
 
 /// Compile and run the pure-JS [`PARALLEL_PRELUDE`] as a classic script so its
@@ -227,6 +299,7 @@ fn install_parallel_prelude(scope: &mut v8::PinScope<'_, '_>) -> Result<(), Stri
 /// Pure JS with no host op; it composes `agent()` promises exactly like
 /// `parallel()`.
 const PIPELINE_PRELUDE: &str = r#"
+(function installPipeline(beginGroup, endGroup, enterGroup, exitGroup) {
 Object.defineProperty(globalThis, "pipeline", {
   value: function pipeline(items, ...stages) {
     if (!Array.isArray(items)) {
@@ -246,18 +319,43 @@ Object.defineProperty(globalThis, "pipeline", {
     for (let i = 0; i < count; i++) {
       snapshot.push(items[i]);
     }
-    return Promise.all(
-      snapshot.map((item) =>
+    const groupId = beginGroup("pipeline", count);
+    let promises;
+    try {
+      promises = snapshot.map((item) =>
         stages
-          .reduce((p, s) => p.then(s), Promise.resolve(item))
+          .reduce(
+            (p, stage) =>
+              p.then((value) => {
+                const previous = enterGroup(groupId);
+                try {
+                  return stage(value);
+                } finally {
+                  exitGroup(previous);
+                }
+              }),
+            Promise.resolve(item)
+          )
           .catch(() => null)
-      )
-    );
+      );
+    } catch (error) {
+      endGroup(groupId, "pipeline", count);
+      throw error;
+    }
+    return Promise.all(promises).finally(() => {
+      endGroup(groupId, "pipeline", count);
+    });
   },
   writable: false,
   enumerable: false,
   configurable: false,
 });
+})(
+  globalThis.__codexWorkflowGroupBegin,
+  globalThis.__codexWorkflowGroupEnd,
+  globalThis.__codexWorkflowGroupEnter,
+  globalThis.__codexWorkflowGroupExit
+);
 "#;
 
 /// Compile and run the pure-JS [`PIPELINE_PRELUDE`] as a classic script so its
@@ -505,11 +603,10 @@ fn install_workflow_object_global<'s>(
 }
 
 /// Install the native-backed read-only `budget` global (§4 `budget`; §8). The
-/// object exposes `total` (a read-only number sourced from `args.budget.total`)
-/// plus the native functions `spent()` and `remaining()`, which forward to the
-/// shared [`WorkflowBudgetHandle`] on the [`RuntimeState`] and are therefore read
-/// live at call time — a workflow that awaits subagents and re-reads
-/// `budget.spent()` observes the updated tree-wide spend. The `budget` binding
+/// object exposes `total` plus native `spent()` and `remaining()` functions that
+/// read the runtime-owned [`WorkflowBudgetHandle`] mirror on [`RuntimeState`].
+/// Host callbacks refresh that mirror before resolving their promises, so a
+/// workflow observes updated run-local spend after `await`. The `budget` binding
 /// and its `total` property are non-writable/non-deletable so the script can
 /// neither reassign nor delete them. When no budget handle is threaded (plain
 /// runs), `spent()` reports `0` and `remaining()` reports `total`.
@@ -530,10 +627,8 @@ fn install_workflow_budget_global<'s>(
     define_readonly_property(scope, global, "budget", budget.into())
 }
 
-/// The workflow `budget.total` ceiling. Prefer the live budget handle's
-/// configured limit (which equals `args.budget.total`, since the handler sets
-/// `limit_tokens = args.budget.total`), falling back to reading
-/// `args.budget.total` directly when no handle is threaded.
+/// The workflow `budget.total` ceiling. Prefer the runtime mirror's initial
+/// total, falling back to legacy `args.budget.total` callers without a mirror.
 fn workflow_budget_ceiling(scope: &mut v8::PinScope<'_, '_>) -> i64 {
     let handle = scope
         .get_slot::<RuntimeState>()
@@ -556,8 +651,8 @@ fn workflow_budget_total_from_args(scope: &mut v8::PinScope<'_, '_>) -> i64 {
         .unwrap_or(0)
 }
 
-/// Native `budget.spent()` — returns the live weighted output-token spend from
-/// the shared budget handle, or `0` when no handle is threaded.
+/// Native `budget.spent()` — returns run-local output-token spend from the
+/// runtime mirror, or `0` when no mirror is installed.
 fn budget_spent_callback(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,
@@ -570,9 +665,8 @@ fn budget_spent_callback(
     retval.set(v8::Number::new(scope, spent as f64).into());
 }
 
-/// Native `budget.remaining()` — returns the live remaining budget (clamped at
-/// `0`) from the shared budget handle, or `budget.total` when no handle is
-/// threaded.
+/// Native `budget.remaining()` — returns effective remaining headroom (clamped
+/// at `0`) from the runtime mirror, or `budget.total` when no mirror is installed.
 fn budget_remaining_callback(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments,

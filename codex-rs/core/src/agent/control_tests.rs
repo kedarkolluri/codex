@@ -9,7 +9,10 @@ use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
 use crate::context::ContextualUserFragment;
+use crate::context::MultiAgentModeInstructions;
+use crate::context::MultiAgentUsageHint;
 use crate::context::SubagentNotification;
+use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
 use crate::thread_manager::StartThreadOptions;
 use assert_matches::assert_matches;
@@ -23,6 +26,7 @@ use codex_protocol::ResponseItemId;
 use codex_protocol::capabilities::CapabilityRootLocation;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::config_types::ModeKind;
+use codex_protocol::config_types::MultiAgentMode;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
@@ -332,6 +336,293 @@ async fn get_status_returns_not_found_without_manager() {
     let control = AgentControl::default();
     let got = control.get_status(ThreadId::new()).await;
     assert_eq!(got, AgentStatus::NotFound);
+}
+
+#[tokio::test]
+async fn environment_context_excludes_workflow_managed_subagents() {
+    let harness = AgentControlHarness::new().await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let ordinary_path = AgentPath::root()
+        .join("ordinary_child")
+        .expect("ordinary child path");
+    let ordinary = harness
+        .control
+        .spawn_agent_deferred_input(
+            harness.config.clone(),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(ordinary_path),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                preferred_agent_nickname: Some("ordinary-agent".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("ordinary child should spawn");
+    harness
+        .control
+        .spawn_agent_deferred_input(
+            harness.config.clone(),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(
+                    AgentPath::root()
+                        .join("workflow_child")
+                        .expect("workflow child path"),
+                ),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                preferred_agent_nickname: Some("workflow-agent".to_string()),
+                parent_completion_delivery: ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workflow child should spawn");
+
+    let ordinary_reference = ordinary
+        .metadata
+        .agent_path
+        .as_ref()
+        .expect("ordinary child path should be retained")
+        .name();
+    let expected = format_subagent_context_line(
+        ordinary_reference,
+        ordinary.metadata.agent_nickname.as_deref(),
+    );
+    let actual = harness
+        .control
+        .format_environment_context_subagents(parent_thread_id)
+        .await;
+
+    assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn workflow_managed_ownership_survives_registry_rebuild_and_resume() {
+    let (home, mut config) = test_config().await;
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should enable MultiAgentV2");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, parent_thread) = harness.start_thread().await;
+    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id,
+        depth: 1,
+        agent_path: Some(
+            AgentPath::root()
+                .join("workflow_child")
+                .expect("workflow child path"),
+        ),
+        agent_nickname: None,
+        agent_role: None,
+    });
+    let spawned = harness
+        .control
+        .spawn_agent_deferred_input(
+            harness.config.clone(),
+            Some(child_source.clone()),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                preferred_agent_nickname: Some("workflow-agent".to_string()),
+                parent_completion_delivery: ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("workflow child should spawn");
+    let child_thread = harness
+        .manager
+        .get_thread(spawned.thread_id)
+        .await
+        .expect("workflow child should be loaded");
+
+    assert_eq!(
+        child_thread.config_snapshot().await.thread_source,
+        Some(ThreadSource::Feature("workflow".to_string()))
+    );
+    persist_thread_for_tree_resume(&child_thread, "workflow child seed").await;
+    child_thread
+        .shutdown_and_wait()
+        .await
+        .expect("workflow child should shut down");
+    assert!(
+        harness
+            .manager
+            .remove_thread(&spawned.thread_id)
+            .await
+            .is_some()
+    );
+    harness
+        .control
+        .state
+        .release_spawned_thread(spawned.thread_id);
+    assert!(
+        harness
+            .control
+            .get_agent_metadata(spawned.thread_id)
+            .is_none()
+    );
+
+    let resumed_thread_id = harness
+        .control
+        .resume_agent_from_rollout(harness.config.clone(), spawned.thread_id, child_source)
+        .await
+        .expect("workflow child should resume from its rollout");
+    let resumed_thread = harness
+        .manager
+        .get_thread(resumed_thread_id)
+        .await
+        .expect("resumed workflow child should be loaded");
+    let resumed_metadata = harness
+        .control
+        .get_agent_metadata(resumed_thread_id)
+        .expect("resumed workflow metadata should be reconstructed");
+
+    assert_eq!(
+        resumed_thread.config_snapshot().await.thread_source,
+        Some(ThreadSource::Feature("workflow".to_string()))
+    );
+    assert_eq!(
+        resumed_metadata.parent_completion_delivery,
+        ParentCompletionDelivery::WorkflowSupervisor
+    );
+    assert!(
+        harness
+            .control
+            .is_workflow_managed_agent(resumed_thread_id)
+            .await
+    );
+    assert!(
+        resumed_thread
+            .codex
+            .session
+            .is_workflow_managed_agent()
+            .await
+    );
+    assert_eq!(
+        crate::agent::agent_resolver::ensure_collaboration_sender_allowed(
+            resumed_thread.codex.session.as_ref(),
+        )
+        .await,
+        Err(FunctionCallError::RespondToModel(
+            "workflow-managed agents cannot use generic collaboration tools".to_string(),
+        ))
+    );
+
+    let parent_history_before = parent_thread.codex.session.clone_history().await;
+    let resumed_turn = resumed_thread.codex.session.new_default_turn().await;
+    resumed_thread
+        .codex
+        .session
+        .send_event(
+            resumed_turn.as_ref(),
+            EventMsg::TurnComplete(TurnCompleteEvent {
+                turn_id: resumed_turn.sub_id.clone(),
+                started_at: None,
+                last_agent_message: Some("resumed workflow result".to_string()),
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        parent_thread
+            .codex
+            .session
+            .clone_history()
+            .await
+            .raw_items(),
+        parent_history_before.raw_items()
+    );
+}
+
+#[tokio::test]
+async fn environment_context_subagents_is_deterministically_bounded() {
+    let max_threads = 40_i64;
+    let (home, config) = test_config_with_cli_overrides(vec![(
+        "agents.max_threads".to_string(),
+        TomlValue::Integer(max_threads),
+    )])
+    .await;
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let total_agents = ENVIRONMENT_CONTEXT_SUBAGENT_LIMIT + 1;
+    let mut expected_lines = Vec::with_capacity(total_agents);
+
+    for index in 0..total_agents {
+        let agent_name = format!("agent_{index:02}_{}", "a".repeat(100));
+        let agent_path = AgentPath::root()
+            .join(agent_name.as_str())
+            .expect("bounded child path");
+        let spawned = harness
+            .control
+            .spawn_agent_deferred_input(
+                harness.config.clone(),
+                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                    parent_thread_id,
+                    depth: 1,
+                    agent_path: Some(agent_path),
+                    agent_nickname: None,
+                    agent_role: None,
+                })),
+                SpawnAgentOptions {
+                    parent_thread_id: Some(parent_thread_id),
+                    preferred_agent_nickname: Some(format!("bounded-agent-{index:02}")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("bounded child should spawn");
+        expected_lines.push(format_subagent_context_line(
+            spawned
+                .metadata
+                .agent_path
+                .as_ref()
+                .expect("bounded child path should be retained")
+                .name(),
+            spawned.metadata.agent_nickname.as_deref(),
+        ));
+    }
+
+    expected_lines.truncate(ENVIRONMENT_CONTEXT_SUBAGENT_LIMIT);
+    expected_lines
+        .push("- 1 additional subagents omitted; use list_agents to inspect them".to_string());
+    let expected = truncate_text(
+        &expected_lines.join("\n"),
+        TruncationPolicy::Bytes(
+            ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES
+                .saturating_sub(ENVIRONMENT_CONTEXT_TRUNCATION_MARKER_RESERVE_BYTES),
+        ),
+    );
+    let expected =
+        take_bytes_at_char_boundary(&expected, ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES).to_string();
+    let actual = harness
+        .control
+        .format_environment_context_subagents(parent_thread_id)
+        .await;
+
+    assert_eq!(actual, expected);
+    assert!(actual.len() <= ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES);
+    assert!(
+        codex_utils_output_truncation::approx_token_count(&actual)
+            <= codex_utils_output_truncation::approx_tokens_from_byte_count(
+                ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES
+            ) as usize
+    );
 }
 
 #[tokio::test]
@@ -914,6 +1205,11 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
     let _ = parent_config.features.enable(Feature::MultiAgentV2);
+    let legacy_default_root_guidance = parent_config
+        .multi_agent_v2
+        .root_agent_usage_hint_text
+        .clone()
+        .expect("default root guidance");
     parent_config.multi_agent_v2.root_agent_usage_hint_text =
         Some("Parent root guidance.".to_string());
     parent_config.multi_agent_v2.subagent_usage_hint_text =
@@ -945,6 +1241,24 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .expect("parent seed should be recorded");
     let turn_context = parent_thread.codex.session.new_default_turn().await;
     let parent_spawn_call_id = "spawn-call-history".to_string();
+    let retained_aggregated_context = "Retain this aggregated developer context.";
+    let aggregated_parent_context = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![
+            ContentItem::InputText {
+                text: retained_aggregated_context.to_string(),
+            },
+            ContentItem::InputText {
+                text: "Parent subagent guidance.".to_string(),
+            },
+            ContentItem::InputText {
+                text: MultiAgentModeInstructions::new(MultiAgentMode::Proactive).render(),
+            },
+        ],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
     let trigger_message = InterAgentCommunication::new(
         AgentPath::root(),
         AgentPath::try_from("/root/worker").expect("agent path"),
@@ -958,15 +1272,9 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
         .record_conversation_items(
             turn_context.as_ref(),
             &[
-                ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: "Parent root guidance.".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
+                ContextualUserFragment::into(MultiAgentUsageHint::new(
+                    "Historical parent root guidance.",
+                )),
                 ResponseItem::Message {
                     id: None,
                     role: "developer".to_string(),
@@ -976,6 +1284,16 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
                     phase: None,
                     internal_chat_message_metadata_passthrough: None,
                 },
+                ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: legacy_default_root_guidance.clone(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                aggregated_parent_context.clone(),
                 assistant_message("parent commentary", Some(MessagePhase::Commentary)),
                 assistant_message("parent final answer", Some(MessagePhase::FinalAnswer)),
                 assistant_message("parent unknown phase", /*phase*/ None),
@@ -1042,23 +1360,30 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
     let mut expected_final_answer =
         assistant_message("parent final answer", Some(MessagePhase::FinalAnswer));
     expected_final_answer.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut expected_aggregated_context = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: retained_aggregated_context.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_aggregated_context.set_turn_id_if_missing(&turn_context.sub_id);
     let expected_history = [
         expected_parent_seed,
+        expected_aggregated_context,
         expected_final_answer,
-        ResponseItem::Message {
-            id: None,
-            role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Child subagent guidance.".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
+        ContextualUserFragment::into(MultiAgentUsageHint::new("Child subagent guidance.")),
     ];
     assert_eq!(
         history.raw_items(),
         &expected_history,
-        "full-history forked child history should replace parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
+        "full-history forked child history should replace both marked historical and legacy parent usage hints with the child subagent hint while filtering non-final assistant/tool chatter"
+    );
+    assert!(
+        !history_contains_text(history.raw_items(), &legacy_default_root_guidance),
+        "legacy default guidance should be recognized after the live parent config drifts"
     );
     assert_eq!(
         serde_json::to_value(child_thread.codex.session.reference_context_item().await)
@@ -1140,6 +1465,135 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
 }
 
 #[tokio::test]
+async fn spawn_agent_fork_migrates_legacy_default_hint_from_unloaded_parent() {
+    let harness = AgentControlHarness::new().await;
+    let legacy_default_root_guidance = harness
+        .config
+        .multi_agent_v2
+        .root_agent_usage_hint_text
+        .clone()
+        .expect("default root guidance");
+    let mut parent_config = harness.config.clone();
+    let _ = parent_config.features.enable(Feature::MultiAgentV2);
+    parent_config.multi_agent_v2.root_agent_usage_hint_text =
+        Some("Drifted parent guidance.".to_string());
+    let mut child_config = harness.config.clone();
+    let _ = child_config.features.enable(Feature::MultiAgentV2);
+    child_config.multi_agent_v2.root_agent_usage_hint_text =
+        Some("Different child root guidance.".to_string());
+    child_config.multi_agent_v2.subagent_usage_hint_text =
+        Some("Child subagent guidance.".to_string());
+
+    let new_thread = harness
+        .manager
+        .start_thread(parent_config)
+        .await
+        .expect("start parent thread");
+    let parent_thread_id = new_thread.thread_id;
+    let parent_thread = new_thread.thread;
+    let turn_context = parent_thread.codex.session.new_default_turn().await;
+    let parent_spawn_call_id = "spawn-call-unloaded-legacy-hint".to_string();
+    let arbitrary_developer_message = ResponseItem::Message {
+        id: None,
+        role: "developer".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "Preserve this arbitrary developer instruction.".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    parent_thread
+        .codex
+        .session
+        .record_conversation_items(
+            turn_context.as_ref(),
+            &[
+                ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: legacy_default_root_guidance.clone(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+                arbitrary_developer_message.clone(),
+                spawn_agent_call(&parent_spawn_call_id),
+            ],
+        )
+        .await;
+    parent_thread
+        .codex
+        .session
+        .ensure_rollout_materialized()
+        .await;
+    parent_thread
+        .codex
+        .session
+        .flush_rollout()
+        .await
+        .expect("parent rollout should flush");
+    parent_thread
+        .shutdown_and_wait()
+        .await
+        .expect("parent should shut down");
+    assert!(
+        harness
+            .manager
+            .remove_thread(&parent_thread_id)
+            .await
+            .is_some(),
+        "parent should be unloaded before the fork"
+    );
+    drop(parent_thread);
+
+    let child_thread_id = harness
+        .control
+        .spawn_agent_with_metadata(
+            child_config,
+            text_input("child task"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                fork_parent_spawn_call_id: Some(parent_spawn_call_id),
+                fork_mode: Some(SpawnAgentForkMode::FullHistory),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("forked spawn should load and sanitize stored parent history")
+        .thread_id;
+
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be registered");
+    let history = child_thread.codex.session.clone_history().await;
+    let mut expected_arbitrary_developer_message = arbitrary_developer_message;
+    expected_arbitrary_developer_message.set_turn_id_if_missing(&turn_context.sub_id);
+    assert_eq!(
+        history.raw_items(),
+        &[
+            expected_arbitrary_developer_message,
+            ContextualUserFragment::into(MultiAgentUsageHint::new("Child subagent guidance.")),
+        ],
+        "stored legacy default guidance should be removed without deleting arbitrary developer instructions"
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("child shutdown should submit");
+}
+
+#[tokio::test]
 async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     let harness = AgentControlHarness::new().await;
     let mut parent_config = harness.config.clone();
@@ -1176,9 +1630,17 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
         ResponseItem::Message {
             id: None,
             role: "developer".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "Parent root guidance.".to_string(),
-            }],
+            content: vec![
+                ContentItem::InputText {
+                    text: "retained compacted developer context".to_string(),
+                },
+                ContentItem::InputText {
+                    text: "Parent root guidance.".to_string(),
+                },
+                ContentItem::InputText {
+                    text: MultiAgentModeInstructions::new(MultiAgentMode::Proactive).render(),
+                },
+            ],
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         },
@@ -1242,6 +1704,10 @@ async fn spawn_agent_fork_strips_parent_usage_hints_from_compacted_history() {
     assert!(
         history_contains_text(history.raw_items(), "compacted parent summary"),
         "forked child history should retain compacted non-hint content"
+    );
+    assert!(
+        history_contains_text(history.raw_items(), "retained compacted developer context"),
+        "forked child history should retain unrelated content from an aggregated developer item"
     );
     assert!(
         !history_contains_text(history.raw_items(), "Parent root guidance."),

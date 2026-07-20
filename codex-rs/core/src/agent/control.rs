@@ -1,6 +1,7 @@
 use crate::agent::AgentStatus;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
+pub(crate) use crate::agent::registry::ParentCompletionDelivery;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
@@ -11,6 +12,7 @@ use crate::config::Config;
 use crate::config::RolloutBudgetConfig;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::rollout_budget::RolloutBudget;
+use crate::session::StartTurnIfIdleOutcome;
 use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
@@ -38,6 +40,9 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::user_input::UserInput;
 use codex_thread_store::ReadThreadParams;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::truncate_text;
+use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -51,18 +56,52 @@ use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;
 
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
+const WORKFLOW_MANAGED_THREAD_SOURCE: &str = "workflow";
+pub(crate) const WORKFLOW_MANAGED_COLLABORATION_TARGET_ERROR: &str =
+    "workflow-managed agents are available only through workflow controls";
+const ENVIRONMENT_CONTEXT_SUBAGENT_LIMIT: usize = 32;
+const ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES: usize = 2_000;
+const ENVIRONMENT_CONTEXT_TRUNCATION_MARKER_RESERVE_BYTES: usize = 64;
 
 mod execution;
+mod generic_collaboration;
 mod legacy;
 mod residency;
 mod spawn;
 pub(crate) mod spawn_await;
 pub(crate) mod spawn_await_opts;
+pub(crate) mod spawn_workspace;
+pub(crate) mod workflow_child_progress;
+pub(crate) mod worktree_isolation;
+
+pub(crate) fn is_workflow_managed_thread_source(thread_source: Option<&ThreadSource>) -> bool {
+    matches!(
+        thread_source,
+        Some(ThreadSource::Feature(feature)) if feature == WORKFLOW_MANAGED_THREAD_SOURCE
+    )
+}
+
+fn thread_source_for_parent_completion_delivery(
+    parent_completion_delivery: ParentCompletionDelivery,
+) -> ThreadSource {
+    match parent_completion_delivery {
+        ParentCompletionDelivery::NotifyParent => ThreadSource::Subagent,
+        ParentCompletionDelivery::WorkflowSupervisor => {
+            ThreadSource::Feature(WORKFLOW_MANAGED_THREAD_SOURCE.to_string())
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SpawnAgentForkMode {
     FullHistory,
     LastNTurns(usize),
+}
+
+enum AgentNicknameReservation {
+    RandomPool,
+    Preferred(String),
+    Restored(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -71,6 +110,10 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    /// A typed child-workspace override applied immediately before the child thread is created.
+    /// Worktree-isolated workflow agents use this to keep the child cwd, runtime workspace roots,
+    /// and materialized permission profile in sync as one atomic spawn concern.
+    pub(crate) spawn_workspace: Option<spawn_workspace::SpawnAgentWorkspace>,
     /// A caller-chosen nickname the freshly-spawned child should reserve verbatim, bypassing the
     /// registry's `rand::rng()` pool pick (`registry.rs:232`). Deterministic-replay workflows derive
     /// this purely from the agent's invocation ordinal
@@ -78,6 +121,18 @@ pub(crate) struct SpawnAgentOptions {
     /// nickname is a pure function of the ordinal — no `Date`/`Math`/`rand` inputs. `None` (the
     /// non-workflow default) keeps the existing random pool pick.
     pub(crate) preferred_agent_nickname: Option<String>,
+    /// Explicit role identity stored on a workflow child's [`SubAgentSource::ThreadSpawn`].
+    ///
+    /// Role configuration is applied before this spawn option is consumed. Retaining the name on
+    /// the source keeps thread metadata, navigation, and persisted rollouts aligned with that
+    /// effective configuration. Callers that construct their own `SessionSource` leave this unset.
+    pub(crate) agent_role: Option<String>,
+    /// Selects the component that owns delivery of the child's terminal result.
+    ///
+    /// Workflow children report through the workflow isolate and durable event stream, so sending
+    /// the same raw completion through the ordinary parent mailbox would duplicate output in model
+    /// history. Ordinary multi-agent children retain the default parent notification behavior.
+    pub(crate) parent_completion_delivery: ParentCompletionDelivery,
 }
 
 #[derive(Clone, Debug)]
@@ -146,10 +201,10 @@ impl AgentControl {
         self.rollout_budget.as_ref()
     }
 
-    /// Clone of the shared, tree-wide budget `Arc`, so a live budget handle can be
-    /// constructed over the same accounting state the root thread and every cloned
-    /// sub-agent control handle share (backs the in-process code-mode `budget`
-    /// global via [`crate::rollout_budget::RolloutBudgetHandle`]).
+    /// Clone of the shared, tree-wide session budget `Arc`.
+    ///
+    /// Workflow agent admission reserves this ceiling independently from the
+    /// workflow run's local meter, so one run cannot reconfigure session policy.
     pub(crate) fn rollout_budget_arc(&self) -> Arc<RolloutBudget> {
         Arc::clone(&self.rollout_budget)
     }
@@ -179,6 +234,42 @@ impl AgentControl {
             .await?;
         self.send_input_after_capacity_check(agent_id, &state, input, final_output_json_schema)
             .await
+    }
+
+    /// Submit a workflow child's first prompt only if the serialized child session is still idle.
+    pub(crate) async fn send_input_with_schema_if_idle(
+        &self,
+        agent_id: ThreadId,
+        input: Vec<UserInput>,
+        final_output_json_schema: Option<serde_json::Value>,
+    ) -> CodexResult<StartTurnIfIdleOutcome> {
+        let state = self.upgrade()?;
+        self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
+            .await?;
+        let last_task_message = non_empty_task_message(render_input_preview(&input));
+        let op = Op::UserInput {
+            items: input,
+            final_output_json_schema,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides::default(),
+        };
+        let result = self
+            .handle_thread_request_result(
+                agent_id,
+                &state,
+                state.send_user_input_if_idle(agent_id, op).await,
+            )
+            .await;
+        if matches!(result, Ok(StartTurnIfIdleOutcome::Started { .. })) {
+            match last_task_message {
+                Some(last_task_message) => self
+                    .state
+                    .update_last_task_message(agent_id, last_task_message),
+                None => self.state.clear_last_task_message(agent_id),
+            }
+        }
+        result
     }
 
     async fn send_input_after_capacity_check(
@@ -290,12 +381,12 @@ impl AgentControl {
         .await
     }
 
-    async fn handle_thread_request_result(
+    async fn handle_thread_request_result<T>(
         &self,
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
-        result: CodexResult<String>,
-    ) -> CodexResult<String> {
+        result: CodexResult<T>,
+    ) -> CodexResult<T> {
         if matches!(result, Err(CodexErr::InternalAgentDied)) {
             let _ = state.remove_thread(&agent_id).await;
             self.forget_v2_residency(agent_id);
@@ -397,8 +488,21 @@ impl AgentControl {
             return String::new();
         };
 
-        agents
+        let mut visible_agents = Vec::with_capacity(agents.len());
+        for (thread_id, metadata) in agents {
+            if metadata.parent_completion_delivery == ParentCompletionDelivery::NotifyParent
+                && !self.is_workflow_managed_agent(thread_id).await
+            {
+                visible_agents.push((thread_id, metadata));
+            }
+        }
+        let agents = visible_agents;
+        let omitted_count = agents
+            .len()
+            .saturating_sub(ENVIRONMENT_CONTEXT_SUBAGENT_LIMIT);
+        let mut lines = agents
             .into_iter()
+            .take(ENVIRONMENT_CONTEXT_SUBAGENT_LIMIT)
             .map(|(thread_id, metadata)| {
                 let reference = metadata
                     .agent_path
@@ -407,8 +511,22 @@ impl AgentControl {
                     .unwrap_or_else(|| thread_id.to_string());
                 format_subagent_context_line(reference.as_str(), metadata.agent_nickname.as_deref())
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect::<Vec<_>>();
+        if omitted_count > 0 {
+            lines.push(format!(
+                "- {omitted_count} additional subagents omitted; use list_agents to inspect them"
+            ));
+        }
+
+        let rendered = lines.join("\n");
+        let truncated = truncate_text(
+            &rendered,
+            TruncationPolicy::Bytes(
+                ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES
+                    .saturating_sub(ENVIRONMENT_CONTEXT_TRUNCATION_MARKER_RESERVE_BYTES),
+            ),
+        );
+        take_bytes_at_char_boundary(&truncated, ENVIRONMENT_CONTEXT_SUBAGENT_MAX_BYTES).to_string()
     }
 
     pub(crate) async fn list_agents(
@@ -428,6 +546,9 @@ impl AgentControl {
             .transpose()?;
 
         let mut live_agents = self.state.live_agents();
+        live_agents.retain(|metadata| {
+            metadata.parent_completion_delivery == ParentCompletionDelivery::NotifyParent
+        });
         live_agents.sort_by(|left, right| {
             left.agent_path
                 .as_deref()
@@ -460,6 +581,9 @@ impl AgentControl {
             let Some(thread_id) = metadata.agent_id else {
                 continue;
             };
+            if self.is_workflow_managed_agent(thread_id).await {
+                continue;
+            }
             if resolved_prefix
                 .as_ref()
                 .is_some_and(|prefix| !agent_matches_prefix(metadata.agent_path.as_ref(), prefix))
@@ -505,6 +629,9 @@ impl AgentControl {
         };
         let control = self.clone();
         tokio::spawn(async move {
+            if control.is_workflow_managed_agent(child_thread_id).await {
+                return;
+            }
             let status = match control.subscribe_status(child_thread_id).await {
                 Ok(mut status_rx) => {
                     let mut status = status_rx.borrow().clone();
@@ -584,7 +711,8 @@ impl AgentControl {
         depth: i32,
         agent_path: Option<AgentPath>,
         agent_role: Option<String>,
-        preferred_agent_nickname: Option<String>,
+        nickname_reservation: AgentNicknameReservation,
+        parent_completion_delivery: ParentCompletionDelivery,
     ) -> CodexResult<(SessionSource, AgentMetadata)> {
         if depth == 1 {
             self.state.register_root_thread(parent_thread_id);
@@ -594,10 +722,18 @@ impl AgentControl {
         }
         let candidate_names = spawn::agent_nickname_candidates(config, agent_role.as_deref());
         let candidate_name_refs: Vec<&str> = candidate_names.iter().map(String::as_str).collect();
-        let agent_nickname = Some(reservation.reserve_agent_nickname_with_preference(
-            &candidate_name_refs,
-            preferred_agent_nickname.as_deref(),
-        )?);
+        let agent_nickname = Some(match nickname_reservation {
+            AgentNicknameReservation::RandomPool => reservation
+                .reserve_agent_nickname_with_preference(
+                    &candidate_name_refs,
+                    /*preferred*/ None,
+                )?,
+            AgentNicknameReservation::Preferred(preferred) => reservation
+                .reserve_agent_nickname_with_preference(&candidate_name_refs, Some(&preferred))?,
+            AgentNicknameReservation::Restored(restored) => {
+                reservation.reserve_restored_agent_nickname(&restored)
+            }
+        });
         let session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             parent_thread_id,
             depth,
@@ -611,8 +747,26 @@ impl AgentControl {
             agent_nickname,
             agent_role,
             last_task_message: None,
+            parent_completion_delivery,
         };
         Ok((session_source, agent_metadata))
+    }
+
+    pub(crate) async fn is_workflow_managed_agent(&self, thread_id: ThreadId) -> bool {
+        if self
+            .state
+            .agent_metadata_for_thread(thread_id)
+            .is_some_and(|metadata| {
+                metadata.parent_completion_delivery == ParentCompletionDelivery::WorkflowSupervisor
+            })
+        {
+            return true;
+        }
+
+        let Ok(state) = self.upgrade() else {
+            return false;
+        };
+        state.is_workflow_managed_thread(thread_id).await
     }
 
     fn upgrade(&self) -> CodexResult<Arc<ThreadManagerState>> {

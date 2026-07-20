@@ -4,6 +4,7 @@ use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadSource;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_name_by_id;
@@ -59,6 +60,19 @@ pub(super) async fn read_thread(
             rollout_thread.recency_at = thread.recency_at;
             if thread.name.is_some() {
                 rollout_thread.name = thread.name;
+            }
+            rollout_thread.thread_source = merge_thread_source_authority(
+                rollout_thread.thread_source.take(),
+                thread.thread_source,
+            );
+            if rollout_thread.agent_nickname.is_none() {
+                rollout_thread.agent_nickname = thread.agent_nickname;
+            }
+            if rollout_thread.agent_role.is_none() {
+                rollout_thread.agent_role = thread.agent_role;
+            }
+            if rollout_thread.agent_path.is_none() {
+                rollout_thread.agent_path = thread.agent_path;
             }
             rollout_thread.git_info = thread.git_info;
             rollout_thread.permission_profile = permission_profile_from_metadata_value(
@@ -120,6 +134,19 @@ pub(super) async fn read_thread_by_rollout_path(
     }
     if let Some(metadata) = read_sqlite_metadata(store, thread.thread_id).await {
         thread.recency_at = metadata.recency_at;
+        thread.thread_source = merge_thread_source_authority(
+            thread.thread_source.take(),
+            metadata.thread_source.clone(),
+        );
+        if thread.agent_nickname.is_none() {
+            thread.agent_nickname = metadata.agent_nickname.clone();
+        }
+        if thread.agent_role.is_none() {
+            thread.agent_role = metadata.agent_role.clone();
+        }
+        if thread.agent_path.is_none() {
+            thread.agent_path = metadata.agent_path.clone();
+        }
         let existing_git_info = thread.git_info.take();
         let (fallback_sha, fallback_branch, fallback_origin_url) = match existing_git_info {
             Some(info) => (
@@ -275,7 +302,14 @@ async fn read_thread_from_rollout_path(
     let meta_line = read_required_session_meta_line(path.as_path()).await?;
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
+    thread.cwd = meta_line.meta.cwd;
+    thread.cli_version = meta_line.meta.cli_version;
+    thread.source = meta_line.meta.source;
     thread.history_mode = meta_line.meta.history_mode;
+    thread.thread_source = meta_line.meta.thread_source;
+    thread.agent_nickname = meta_line.meta.agent_nickname;
+    thread.agent_role = meta_line.meta.agent_role;
+    thread.agent_path = meta_line.meta.agent_path;
     if let Some(model_provider) = meta_line
         .meta
         .model_provider
@@ -348,6 +382,12 @@ async fn stored_thread_from_sqlite_metadata(
         .as_ref()
         .map(|meta| meta.history_mode)
         .unwrap_or(metadata.history_mode);
+    let thread_source = merge_thread_source_authority(
+        metadata.thread_source.clone(),
+        session_meta
+            .as_ref()
+            .and_then(|meta| meta.thread_source.clone()),
+    );
     let preview = metadata
         .preview
         .clone()
@@ -378,7 +418,7 @@ async fn stored_thread_from_sqlite_metadata(
         cli_version: metadata.cli_version,
         source: parse_session_source(&metadata.source),
         history_mode,
-        thread_source: metadata.thread_source,
+        thread_source,
         agent_nickname: metadata.agent_nickname,
         agent_role: metadata.agent_role,
         agent_path: metadata.agent_path,
@@ -471,6 +511,28 @@ fn parse_session_source(source: &str) -> SessionSource {
         .unwrap_or(SessionSource::Unknown)
 }
 
+/// Merge duplicate source projections while keeping the workflow ownership
+/// marker sticky. For ordinary analytics classifications, the caller's primary
+/// projection wins and the secondary fills only a missing value.
+fn merge_thread_source_authority(
+    primary: Option<ThreadSource>,
+    secondary: Option<ThreadSource>,
+) -> Option<ThreadSource> {
+    if matches!(
+        &primary,
+        Some(ThreadSource::Feature(feature)) if feature == "workflow"
+    ) {
+        return primary;
+    }
+    if matches!(
+        &secondary,
+        Some(ThreadSource::Feature(feature)) if feature == "workflow"
+    ) {
+        return secondary;
+    }
+    primary.or(secondary)
+}
+
 fn parse_or_default<T>(value: &str, default: T) -> T
 where
     T: serde::de::DeserializeOwned,
@@ -496,6 +558,7 @@ mod tests {
     use codex_protocol::protocol::SandboxPolicy;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::ThreadHistoryMode;
+    use codex_protocol::protocol::ThreadSource;
     use codex_state::ThreadMetadataBuilder;
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
@@ -508,6 +571,24 @@ mod tests {
     use crate::local::test_support::write_archived_session_file;
     use crate::local::test_support::write_session_file;
     use crate::local::test_support::write_session_file_with_fork;
+
+    fn set_rollout_thread_source(path: &std::path::Path, thread_source: ThreadSource) {
+        let contents = std::fs::read_to_string(path).expect("read rollout fixture");
+        let mut lines = contents.lines();
+        let mut session_meta: serde_json::Value = serde_json::from_str(
+            lines
+                .next()
+                .expect("rollout fixture must contain session metadata"),
+        )
+        .expect("parse session metadata");
+        session_meta["payload"]["thread_source"] =
+            serde_json::to_value(thread_source).expect("serialize thread source");
+        let mut file = std::fs::File::create(path).expect("rewrite rollout fixture");
+        writeln!(file, "{session_meta}").expect("write session metadata");
+        for line in lines {
+            writeln!(file, "{line}").expect("write rollout item");
+        }
+    }
 
     #[tokio::test]
     async fn read_thread_returns_active_rollout_summary() {
@@ -535,6 +616,104 @@ mod tests {
             thread.history.expect("history should load").thread_id,
             thread_id
         );
+    }
+
+    #[tokio::test]
+    async fn read_thread_preserves_rollout_thread_source_without_sqlite() {
+        let home = TempDir::new().expect("temp dir");
+        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+        let uuid = Uuid::from_u128(227);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout_path =
+            write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+        let workflow_source = ThreadSource::Feature("workflow".to_string());
+        set_rollout_thread_source(&rollout_path, workflow_source.clone());
+
+        let thread = store
+            .read_thread(ReadThreadParams {
+                thread_id,
+                include_archived: false,
+                include_history: false,
+            })
+            .await
+            .expect("read thread");
+
+        assert_eq!(thread.thread_source, Some(workflow_source));
+    }
+
+    #[tokio::test]
+    async fn read_thread_feature_source_dominates_sqlite_rollout_disagreement() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let workflow_source = ThreadSource::Feature("workflow".to_string());
+
+        for (uuid, rollout_source, sqlite_source) in [
+            (
+                Uuid::from_u128(228),
+                workflow_source.clone(),
+                ThreadSource::User,
+            ),
+            (
+                Uuid::from_u128(229),
+                ThreadSource::User,
+                workflow_source.clone(),
+            ),
+            (
+                Uuid::from_u128(230),
+                workflow_source.clone(),
+                ThreadSource::Feature("other".to_string()),
+            ),
+            (
+                Uuid::from_u128(231),
+                ThreadSource::Feature("other".to_string()),
+                workflow_source.clone(),
+            ),
+        ] {
+            let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+            let rollout_path =
+                write_session_file(home.path(), "2025-01-03T12-00-00", uuid).expect("session file");
+            set_rollout_thread_source(&rollout_path, rollout_source);
+            let mut builder = ThreadMetadataBuilder::new(
+                thread_id,
+                rollout_path.clone(),
+                Utc::now(),
+                SessionSource::Cli,
+            );
+            builder.thread_source = Some(sqlite_source);
+            runtime
+                .upsert_thread(&builder.build(config.default_model_provider_id.as_str()))
+                .await
+                .expect("state db upsert should succeed");
+
+            for include_history in [false, true] {
+                let thread = store
+                    .read_thread(ReadThreadParams {
+                        thread_id,
+                        include_archived: false,
+                        include_history,
+                    })
+                    .await
+                    .expect("read thread");
+
+                assert_eq!(thread.thread_source, Some(workflow_source.clone()));
+            }
+            let thread = store
+                .read_thread_by_rollout_path(
+                    rollout_path,
+                    /*include_archived*/ false,
+                    /*include_history*/ false,
+                )
+                .await
+                .expect("read thread by rollout path");
+            assert_eq!(thread.thread_source, Some(workflow_source.clone()));
+        }
     }
 
     #[tokio::test]
