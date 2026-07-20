@@ -209,6 +209,7 @@ mod inject;
 mod input_queue;
 mod mcp;
 mod mcp_runtime;
+mod pending_input_recording;
 pub(crate) mod multi_agents;
 mod review;
 mod rollout_budget;
