@@ -1,3 +1,4 @@
+use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
@@ -6,6 +7,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -26,9 +28,53 @@ pub(crate) enum InputQueueActivity {
 }
 
 /// Turn-local pending input storage owned by the input queue flow.
-#[derive(Default)]
 pub(crate) struct TurnInputQueue {
     items: Vec<TurnInput>,
+    recording: Option<PendingInputRecording>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingInputRecording {
+    token: Arc<()>,
+    turn_state: Weak<Mutex<TurnState>>,
+    turn_context: Arc<TurnContext>,
+    result_rx: watch::Receiver<Option<PendingInputRecordingResult>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingInputRecordingResult {
+    Completed { should_stop: bool },
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingInputClaimMode {
+    CurrentTurn,
+    Finalization,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingInputAvailability {
+    Inactive,
+    Empty,
+    Pending,
+}
+
+pub(crate) enum PendingInputClaim {
+    Inactive,
+    Empty,
+    Recording(PendingInputRecording),
+    Acquired(ClaimedPendingInput),
+}
+
+pub(crate) struct ClaimedPendingInput {
+    items: Vec<TurnInput>,
+    completion: PendingInputRecordingCompletion,
+}
+
+pub(crate) struct PendingInputRecordingCompletion {
+    recording: PendingInputRecording,
+    result_tx: Option<watch::Sender<Option<PendingInputRecordingResult>>>,
 }
 
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
@@ -190,11 +236,140 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.extend(input);
     }
 
+    #[cfg(test)]
     pub(crate) async fn take_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
     ) -> Vec<TurnInput> {
         turn_state.lock().await.pending_input.items.split_off(0)
+    }
+
+    /// Claims pending input for the exact running turn and installs its durable recorder handle.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the running-turn check, input claim, and mailbox drain must remain atomic"
+    )]
+    pub(crate) async fn claim_pending_input_for_turn(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        turn_context: &Arc<TurnContext>,
+        mode: PendingInputClaimMode,
+    ) -> PendingInputClaim {
+        let active = active_turn.lock().await;
+        let Some(active_turn) = active.as_ref().filter(|active_turn| {
+            active_turn
+                .task
+                .as_ref()
+                .is_some_and(|task| task.turn_context.sub_id == turn_context.sub_id)
+        }) else {
+            return PendingInputClaim::Inactive;
+        };
+        let turn_state = Arc::clone(&active_turn.turn_state);
+        let mut state = turn_state.lock().await;
+        if let Some(recording) = state.pending_input.recording.as_ref() {
+            return recording
+                .matches_turn(turn_context)
+                .then(|| PendingInputClaim::Recording(recording.clone()))
+                .unwrap_or(PendingInputClaim::Inactive);
+        }
+
+        let accepts_mailbox_delivery = state.accepts_mailbox_delivery_for_current_turn();
+        if mode == PendingInputClaimMode::CurrentTurn && !accepts_mailbox_delivery {
+            return PendingInputClaim::Empty;
+        }
+        let mut mailbox = if mode == PendingInputClaimMode::CurrentTurn {
+            Some(self.mailbox_pending_mails.lock().await)
+        } else {
+            None
+        };
+        let mut items = state.pending_input.items.split_off(0);
+        if let Some(mailbox) = mailbox.as_mut() {
+            items.extend(mailbox.drain(..).map(TurnInput::InterAgentCommunication));
+        }
+        Self::install_pending_input_recording(&mut state, &turn_state, turn_context, items)
+    }
+
+    /// Claims only turn-local input from a displaced turn during teardown.
+    pub(crate) async fn claim_pending_input_for_displaced_turn(
+        &self,
+        turn_state: &Arc<Mutex<TurnState>>,
+        turn_context: &Arc<TurnContext>,
+    ) -> PendingInputClaim {
+        let mut state = turn_state.lock().await;
+        if let Some(recording) = state.pending_input.recording.as_ref() {
+            return recording
+                .matches_turn(turn_context)
+                .then(|| PendingInputClaim::Recording(recording.clone()))
+                .unwrap_or(PendingInputClaim::Inactive);
+        }
+        let items = state.pending_input.items.split_off(0);
+        Self::install_pending_input_recording(&mut state, turn_state, turn_context, items)
+    }
+
+    fn install_pending_input_recording(
+        state: &mut TurnState,
+        turn_state: &Arc<Mutex<TurnState>>,
+        turn_context: &Arc<TurnContext>,
+        items: Vec<TurnInput>,
+    ) -> PendingInputClaim {
+        if items.is_empty() {
+            return PendingInputClaim::Empty;
+        }
+        let token = Arc::new(());
+        let (result_tx, result_rx) = watch::channel(None);
+        let recording = PendingInputRecording {
+            token,
+            turn_state: Arc::downgrade(turn_state),
+            turn_context: Arc::clone(turn_context),
+            result_rx,
+        };
+        state.pending_input.recording = Some(recording.clone());
+        PendingInputClaim::Acquired(ClaimedPendingInput {
+            items,
+            completion: PendingInputRecordingCompletion {
+                recording,
+                result_tx: Some(result_tx),
+            },
+        })
+    }
+
+    /// Reports queued input only for the exact running turn.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the running-turn check and mailbox read must remain atomic"
+    )]
+    pub(crate) async fn pending_input_availability_for_turn(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        turn_id: &str,
+    ) -> PendingInputAvailability {
+        let active = active_turn.lock().await;
+        let Some(active_turn) = active.as_ref().filter(|active_turn| {
+            active_turn
+                .task
+                .as_ref()
+                .is_some_and(|task| task.turn_context.sub_id == turn_id)
+        }) else {
+            return PendingInputAvailability::Inactive;
+        };
+        let state = active_turn.turn_state.lock().await;
+        if !state.accepts_mailbox_delivery_for_current_turn() {
+            return PendingInputAvailability::Empty;
+        }
+        if !state.pending_input.items.is_empty()
+            || !self.mailbox_pending_mails.lock().await.is_empty()
+        {
+            PendingInputAvailability::Pending
+        } else {
+            PendingInputAvailability::Empty
+        }
+    }
+
+    pub(crate) async fn pending_input_recording(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) -> Option<PendingInputRecording> {
+        turn_state.lock().await.pending_input.recording.clone()
     }
 
     #[expect(
@@ -235,6 +410,7 @@ impl InputQueue {
         }
     }
 
+    #[cfg(test)]
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state reads must remain atomic"
@@ -263,11 +439,95 @@ impl InputQueue {
     }
 }
 
+impl Default for TurnInputQueue {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            recording: None,
+        }
+    }
+}
+
 impl TurnInputQueue {
     fn has_user_input(&self) -> bool {
         self.items
             .iter()
             .any(|input| matches!(input, TurnInput::UserInput { .. }))
+    }
+
+    pub(crate) fn is_empty_and_idle(&self) -> bool {
+        self.items.is_empty() && self.recording.is_none()
+    }
+}
+
+impl ClaimedPendingInput {
+    pub(crate) fn recording(&self) -> PendingInputRecording {
+        self.completion.recording.clone()
+    }
+
+    pub(crate) fn into_parts(self) -> (Vec<TurnInput>, PendingInputRecordingCompletion) {
+        (self.items, self.completion)
+    }
+}
+
+impl PendingInputRecording {
+    pub(crate) fn turn_context(&self) -> Arc<TurnContext> {
+        Arc::clone(&self.turn_context)
+    }
+
+    fn matches_turn(&self, turn_context: &TurnContext) -> bool {
+        self.turn_context.sub_id == turn_context.sub_id
+    }
+
+    pub(crate) async fn wait(mut self) -> PendingInputRecordingResult {
+        loop {
+            let result = {
+                let result = self.result_rx.borrow_and_update();
+                *result
+            };
+            if let Some(result) = result {
+                if result == PendingInputRecordingResult::Failed {
+                    self.clear_if_current().await;
+                }
+                return result;
+            }
+            if self.result_rx.changed().await.is_err() {
+                self.clear_if_current().await;
+                return PendingInputRecordingResult::Failed;
+            }
+        }
+    }
+
+    async fn clear_if_current(&self) {
+        let Some(turn_state) = self.turn_state.upgrade() else {
+            return;
+        };
+        let mut state = turn_state.lock().await;
+        if state
+            .pending_input
+            .recording
+            .as_ref()
+            .is_some_and(|recording| Arc::ptr_eq(&recording.token, &self.token))
+        {
+            state.pending_input.recording = None;
+        }
+    }
+}
+
+impl PendingInputRecordingCompletion {
+    pub(crate) async fn finish(mut self, result: PendingInputRecordingResult) {
+        self.recording.clear_if_current().await;
+        if let Some(result_tx) = self.result_tx.take() {
+            result_tx.send_replace(Some(result));
+        }
+    }
+}
+
+impl Drop for PendingInputRecordingCompletion {
+    fn drop(&mut self) {
+        if let Some(result_tx) = self.result_tx.take() {
+            result_tx.send_replace(Some(PendingInputRecordingResult::Failed));
+        }
     }
 }
 
