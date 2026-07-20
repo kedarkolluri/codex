@@ -358,6 +358,28 @@ impl AgentControl {
         session_source: Option<SessionSource>,
         options: SpawnAgentOptions,
     ) -> CodexResult<LiveAgent> {
+        if !options.parent_completion_delivery.notifies_parent() {
+            if options.fork_mode.is_some() {
+                return Err(CodexErr::InvalidRequest(
+                    "workflow-supervised agents cannot fork parent history".to_string(),
+                ));
+            }
+            let has_matching_parent = matches!(
+                (&session_source, options.parent_thread_id),
+                (
+                    Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                        parent_thread_id: source_parent_thread_id,
+                        ..
+                    })),
+                    Some(parent_thread_id),
+                ) if *source_parent_thread_id == parent_thread_id
+            );
+            if !has_matching_parent {
+                return Err(CodexErr::InvalidRequest(
+                    "workflow-supervised agents require a matching thread-spawn parent".to_string(),
+                ));
+            }
+        }
         let state = self.upgrade()?;
         let multi_agent_version = state
             .effective_multi_agent_version_for_spawn(
@@ -454,6 +476,7 @@ impl AgentControl {
                     options.parent_thread_id,
                     /*forked_from_thread_id*/ None,
                     /*thread_source*/ Some(ThreadSource::Subagent),
+                    options.parent_completion_delivery,
                     /*metrics_service_name*/ None,
                     inheritance.environments,
                     inheritance.exec_policy,

@@ -1,5 +1,7 @@
 use super::input_queue::InputQueue;
 use super::*;
+use crate::agent::ParentCompletionDelivery;
+use crate::agent::resolve_parent_completion_delivery;
 use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
@@ -101,6 +103,8 @@ pub(crate) struct SessionConfiguration {
     pub(super) parent_thread_id: Option<ThreadId>,
     /// Optional analytics source classification for this thread.
     pub(super) thread_source: Option<ThreadSource>,
+    /// Trusted owner of this thread's terminal result.
+    pub(super) parent_completion_delivery: ParentCompletionDelivery,
     /// Effective originator used for this thread's Responses requests and analytics events.
     pub(super) originator: String,
     pub(super) dynamic_tools: Vec<DynamicToolSpec>,
@@ -540,6 +544,11 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
         };
+        session_configuration.parent_completion_delivery = resolve_parent_completion_delivery(
+            thread_id,
+            &initial_history,
+            session_configuration.parent_completion_delivery,
+        );
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
@@ -610,7 +619,9 @@ impl Session {
                             parent_thread_id,
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
-                            workflow_supervisor_ownership: None,
+                            workflow_supervisor_ownership: session_configuration
+                                .parent_completion_delivery
+                                .workflow_supervisor_ownership(),
                             originator: session_configuration.originator.clone(),
                             base_instructions: BaseInstructions {
                                 text: session_configuration.base_instructions.clone(),

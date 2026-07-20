@@ -1,4 +1,5 @@
 use crate::agent::AgentStatus;
+use crate::agent::ParentCompletionDelivery;
 use crate::agent::registry::AgentMetadata;
 use crate::agent::registry::AgentRegistry;
 use crate::agent::role::DEFAULT_ROLE_NAME;
@@ -69,6 +70,8 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    /// Selects the trusted owner of this child's terminal result.
+    pub(crate) parent_completion_delivery: ParentCompletionDelivery,
 }
 
 #[derive(Clone, Debug)]

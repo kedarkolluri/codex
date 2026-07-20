@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::ParentCompletionDelivery;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
@@ -119,6 +120,7 @@ async fn handle_spawn_agent(
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
                     environments: Some(turn.environments.to_selections()),
+                    parent_completion_delivery: ParentCompletionDelivery::NotifyParent,
                 },
             ),
     )

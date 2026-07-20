@@ -12,6 +12,7 @@ use std::time::UNIX_EPOCH;
 
 use crate::agent::AgentControl;
 use crate::agent::AgentStatus;
+use crate::agent::ParentCompletionDelivery;
 use crate::agent::agent_status_from_event;
 use crate::agent::status::is_final;
 use crate::agent_communication::AgentCommunicationContext;
@@ -421,6 +422,7 @@ pub(crate) struct SessionSpawnArgs {
     pub(crate) forked_from_thread_id: Option<ThreadId>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) thread_source: Option<ThreadSource>,
+    pub(crate) parent_completion_delivery: ParentCompletionDelivery,
     pub(crate) originator: String,
     pub(crate) agent_control: AgentControl,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
@@ -513,6 +515,7 @@ impl Session {
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
+            parent_completion_delivery,
             originator,
             agent_control,
             dynamic_tools,
@@ -664,6 +667,7 @@ impl Session {
             forked_from_thread_id,
             parent_thread_id,
             thread_source,
+            parent_completion_delivery,
             originator,
             dynamic_tools,
             user_shell_override,
