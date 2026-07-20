@@ -7,6 +7,7 @@ use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::models::AgentMessageInputContent;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AskForApproval;
@@ -16,16 +17,22 @@ use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SandboxPolicy;
+use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadMemoryMode;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_protocol::protocol::WorkflowSupervisorOwnership;
 use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use super::*;
+use crate::AppendThreadItemsParams;
+use crate::CreateThreadParams;
+use crate::ThreadPersistenceMetadata;
 use crate::ThreadStore;
 use crate::local::test_support::test_config;
 use crate::local::test_support::write_session_file_with_history_mode;
@@ -76,6 +83,82 @@ async fn loads_latest_checkpoint_with_required_turn_metadata() {
     }));
     assert!(context.items.iter().any(|item| {
         matches!(item, RolloutItem::TurnContext(context) if context.turn_id.as_deref() == Some("turn-2"))
+    }));
+}
+
+#[tokio::test]
+async fn paginated_model_context_starts_with_canonical_workflow_ownership() {
+    let home = TempDir::new().expect("temp dir");
+    let uuid = Uuid::from_u128(/*v*/ 1007);
+    let thread_id = codex_protocol::ThreadId::from_string(&uuid.to_string()).expect("thread id");
+    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
+    store
+        .create_thread(CreateThreadParams {
+            session_id: thread_id.into(),
+            thread_id,
+            extra_config: None,
+            forked_from_id: None,
+            parent_thread_id: None,
+            source: SessionSource::Exec,
+            thread_source: None,
+            workflow_supervisor_ownership: Some(WorkflowSupervisorOwnership::V1),
+            originator: "test_originator".to_string(),
+            base_instructions: BaseInstructions::default(),
+            dynamic_tools: Vec::new(),
+            selected_capability_roots: Vec::new(),
+            multi_agent_version: None,
+            history_mode: ThreadHistoryMode::Paginated,
+            subagent_history_start_ordinal: None,
+            initial_window_id: "window-1".to_string(),
+            metadata: ThreadPersistenceMetadata {
+                cwd: Some(home.path().to_path_buf()),
+                model_provider: "test-provider".to_string(),
+                memory_mode: ThreadMemoryMode::Enabled,
+            },
+        })
+        .await
+        .expect("create paginated thread");
+    store
+        .append_items(AppendThreadItemsParams {
+            thread_id,
+            items: vec![
+                user_message("outside bounded suffix"),
+                turn_started("turn-1"),
+                user_message("latest turn"),
+                completed_user_message("turn-1", "latest turn"),
+                turn_context(home.path(), "turn-1"),
+                compacted("latest checkpoint", Some(Vec::new())),
+                turn_complete("turn-1"),
+            ],
+        })
+        .await
+        .expect("append bounded model context");
+    store
+        .persist_thread(thread_id)
+        .await
+        .expect("persist session metadata");
+
+    let context = store
+        .load_latest_model_context(LoadThreadHistoryParams {
+            thread_id,
+            include_archived: false,
+        })
+        .await
+        .expect("load model context");
+
+    let head_metadata = context.items.first().map(|item| match item {
+        RolloutItem::SessionMeta(meta_line) => (
+            meta_line.meta.id,
+            meta_line.meta.workflow_supervisor_ownership,
+        ),
+        _ => panic!("model context should start with canonical session metadata"),
+    });
+    assert_eq!(
+        head_metadata,
+        Some((thread_id, Some(WorkflowSupervisorOwnership::V1)))
+    );
+    assert!(!context.items.iter().any(|item| {
+        matches!(item, RolloutItem::ResponseItem(ResponseItem::Message { content, .. }) if content.iter().any(|item| matches!(item, ContentItem::InputText { text } if text == "outside bounded suffix")))
     }));
 }
 

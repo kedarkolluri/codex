@@ -20,6 +20,7 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode as MemoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::WorkflowSupervisorOwnership;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
@@ -82,6 +83,9 @@ pub struct CreateThreadParams {
     pub source: SessionSource,
     /// Optional analytics source classification for this thread.
     pub thread_source: Option<ThreadSource>,
+    /// Durable workflow-supervisor ownership for detached child result delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_supervisor_ownership: Option<WorkflowSupervisorOwnership>,
     /// Effective originator used for this thread's Responses requests and analytics events.
     pub originator: String,
     /// Base instructions persisted in session metadata.

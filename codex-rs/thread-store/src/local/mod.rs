@@ -1496,6 +1496,7 @@ mod tests {
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
+            workflow_supervisor_ownership: None,
             originator: "test_originator".to_string(),
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),

@@ -200,6 +200,7 @@ async fn thread_delete_with_non_local_thread_store_does_not_create_local_persist
             parent_thread_id: None,
             source: SessionSource::Cli,
             thread_source: None,
+            workflow_supervisor_ownership: None,
             originator: "test_originator".to_string(),
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),

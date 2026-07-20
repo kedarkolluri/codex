@@ -610,6 +610,7 @@ impl Session {
                             parent_thread_id,
                             source: session_source,
                             thread_source: session_configuration.thread_source.clone(),
+                            workflow_supervisor_ownership: None,
                             originator: session_configuration.originator.clone(),
                             base_instructions: BaseInstructions {
                                 text: session_configuration.base_instructions.clone(),

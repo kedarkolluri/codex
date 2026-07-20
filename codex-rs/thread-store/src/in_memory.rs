@@ -58,6 +58,7 @@ mod tests {
     use crate::ThreadSortKey;
     use codex_protocol::models::BaseInstructions;
     use codex_protocol::protocol::SessionSource;
+    use codex_protocol::protocol::WorkflowSupervisorOwnership;
 
     #[tokio::test]
     async fn default_turn_pagination_methods_return_unsupported() {
@@ -126,6 +127,7 @@ mod tests {
                     parent_thread_id,
                     source: SessionSource::Exec,
                     thread_source: None,
+                    workflow_supervisor_ownership: None,
                     originator: "test_originator".to_string(),
                     base_instructions: BaseInstructions::default(),
                     dynamic_tools: Vec::new(),
@@ -308,6 +310,35 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn latest_model_context_retains_workflow_supervisor_ownership() {
+        let store = InMemoryThreadStore::default();
+        let thread_id = ThreadId::default();
+        let mut params = create_thread_params(thread_id, ThreadHistoryMode::Legacy);
+        params.workflow_supervisor_ownership = Some(WorkflowSupervisorOwnership::V1);
+        store.create_thread(params).await.expect("create thread");
+
+        let context = store
+            .load_latest_model_context(LoadThreadHistoryParams {
+                thread_id,
+                include_archived: false,
+            })
+            .await
+            .expect("load latest model context");
+
+        let head_metadata = context.items.first().map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => (
+                meta_line.meta.id,
+                meta_line.meta.workflow_supervisor_ownership,
+            ),
+            _ => panic!("model context should start with canonical session metadata"),
+        });
+        assert_eq!(
+            head_metadata,
+            Some((thread_id, Some(WorkflowSupervisorOwnership::V1)))
+        );
+    }
+
     fn create_thread_params(
         thread_id: ThreadId,
         history_mode: ThreadHistoryMode,
@@ -320,6 +351,7 @@ mod tests {
             parent_thread_id: None,
             source: SessionSource::Exec,
             thread_source: None,
+            workflow_supervisor_ownership: None,
             originator: "test_originator".to_string(),
             base_instructions: BaseInstructions::default(),
             dynamic_tools: Vec::new(),
@@ -436,6 +468,7 @@ impl InMemoryThreadStore {
             originator: params.originator.clone(),
             source: params.source.clone(),
             thread_source: params.thread_source.clone(),
+            workflow_supervisor_ownership: params.workflow_supervisor_ownership,
             model_provider: Some(params.metadata.model_provider.clone()),
             base_instructions: Some(params.base_instructions.clone()),
             dynamic_tools: (!params.dynamic_tools.is_empty()).then(|| params.dynamic_tools.clone()),
