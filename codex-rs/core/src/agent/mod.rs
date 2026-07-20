@@ -2,6 +2,7 @@ pub(crate) mod agent_resolver;
 pub(crate) mod control;
 mod registry;
 pub(crate) mod role;
+mod role_catalog_bounds;
 pub(crate) mod status;
 
 pub(crate) use codex_protocol::protocol::AgentStatus;

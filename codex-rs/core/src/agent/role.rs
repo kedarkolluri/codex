@@ -6,6 +6,7 @@
 //! and service tier unless the role layer sets them. It does not decide when to spawn a sub-agent
 //! or which role to use; the multi-agent tool handler owns that orchestration.
 
+use super::role_catalog_bounds;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
@@ -242,19 +243,12 @@ pub(crate) mod spawn_tool_spec {
         user_defined_roles: &BTreeMap<String, AgentRoleConfig>,
     ) -> String {
         let mut seen = BTreeSet::new();
-        let mut formatted_roles = Vec::new();
-        for (name, declaration) in user_defined_roles {
-            if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
-            }
-        }
-        for (name, declaration) in built_in_roles {
-            if seen.insert(name.as_str()) {
-                formatted_roles.push(format_role(name, declaration));
-            }
-        }
-
-        format!("Available roles:\n{}", formatted_roles.join("\n"))
+        let entries = user_defined_roles
+            .iter()
+            .chain(built_in_roles)
+            .filter(|(name, _)| seen.insert(name.as_str()))
+            .map(|(name, declaration)| format_role(name, declaration));
+        role_catalog_bounds::bound_role_catalog(entries)
     }
 
     fn format_role(name: &str, declaration: &AgentRoleConfig) -> String {

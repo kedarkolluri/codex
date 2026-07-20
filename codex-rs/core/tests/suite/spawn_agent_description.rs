@@ -304,3 +304,88 @@ async fn configured_agent_roles_control_spawn_agent_type(
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_agent_role_catalog_is_bounded_in_the_model_request() -> Result<()> {
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    let test = test_codex()
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Collab)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::MultiAgentV2)
+                .expect("test config should allow feature update");
+            config
+                .features
+                .enable(Feature::CodeMode)
+                .expect("test config should allow feature update");
+            config.multi_agent_v2.non_code_mode_only = false;
+            for index in 0..40 {
+                let description = if index == 0 {
+                    format!("role description {index}: {}", "🦀".repeat(1_000))
+                } else {
+                    (0..80)
+                        .map(|line| format!("role {index} line {line}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                config.agent_roles.insert(
+                    format!("role-{index:02}"),
+                    AgentRoleConfig {
+                        description: Some(description),
+                        config_file: None,
+                        nickname_candidates: None,
+                    },
+                );
+            }
+        })
+        .build_with_auto_env(&server)
+        .await?;
+
+    test.submit_turn("hello").await?;
+
+    let body = response.single_request().body_json();
+    let spawn_agent = namespace_child_tool(&body, "collaboration", SPAWN_AGENT_TOOL_NAME)
+        .expect("spawn_agent should be present");
+    let description = spawn_agent
+        .pointer("/parameters/properties/agent_type/description")
+        .and_then(Value::as_str)
+        .expect("spawn_agent agent_type description should be present");
+    let catalog_start = description
+        .find("Available roles:")
+        .expect("agent_type description should contain the role catalog");
+    let catalog = &description[catalog_start..];
+    let catalog_lines = catalog
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert!(catalog.len() <= 4_000);
+    assert!(catalog_lines.len() <= 64);
+    assert!(catalog.contains("role-00"));
+    assert!(catalog.contains("... [entry truncated]"));
+    assert!(!catalog.contains("role-01"));
+    assert!(catalog.ends_with("... [additional roles omitted]"));
+
+    let rendered_catalog = catalog_lines
+        .iter()
+        .map(|line| format!("  // {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let augmented_description = spawn_agent
+        .get("description")
+        .and_then(Value::as_str)
+        .expect("Code Mode spawn_agent description should be present");
+    assert!(augmented_description.contains("exec tool declaration:"));
+    assert!(augmented_description.contains(&rendered_catalog));
+    assert!(catalog.len() + rendered_catalog.len() <= 8_320);
+    Ok(())
+}
