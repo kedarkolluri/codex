@@ -7,6 +7,7 @@
 //! or which role to use; the multi-agent tool handler owns that orchestration.
 
 use super::role_catalog_bounds;
+use super::role_context_bounds;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigOverrides;
@@ -40,13 +41,39 @@ pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
 ) -> Result<(), String> {
+    apply_role_to_config_with_policy(config, role_name, RoleContextPolicy::Ordinary).await
+}
+
+/// Applies a role for a workflow-managed child without exposing unbounded role-authored context.
+///
+/// The workflow spawn path consumes this staged entrypoint after child ownership lands.
+#[allow(dead_code)]
+pub(crate) async fn apply_workflow_role_to_config(
+    config: &mut Config,
+    role_name: Option<&str>,
+) -> Result<(), String> {
+    apply_role_to_config_with_policy(config, role_name, RoleContextPolicy::Workflow).await
+}
+
+#[derive(Clone, Copy)]
+enum RoleContextPolicy {
+    Ordinary,
+    #[allow(dead_code)]
+    Workflow,
+}
+
+async fn apply_role_to_config_with_policy(
+    config: &mut Config,
+    role_name: Option<&str>,
+    context_policy: RoleContextPolicy,
+) -> Result<(), String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
         .cloned()
         .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
 
-    apply_role_to_config_inner(config, role_name, &role)
+    apply_role_to_config_inner(config, role_name, &role, context_policy)
         .await
         .map_err(|err| {
             tracing::warn!("failed to apply role to config: {err}");
@@ -58,6 +85,7 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
+    context_policy: RoleContextPolicy,
 ) -> anyhow::Result<()> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
@@ -73,13 +101,17 @@ async fn apply_role_to_config_inner(
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
 
-    *config = reload::build_next_config(
+    let next_config = reload::build_next_config(
         config,
-        role_layer_toml,
+        &role_layer_toml,
         preserve_current_provider,
         preserve_current_service_tier,
     )
     .await?;
+    if matches!(context_policy, RoleContextPolicy::Workflow) {
+        role_context_bounds::validate_effective_role_context(&role_layer_toml, &next_config)?;
+    }
+    *config = next_config;
     Ok(())
 }
 
@@ -132,14 +164,14 @@ mod reload {
 
     pub(super) async fn build_next_config(
         config: &Config,
-        role_layer_toml: TomlValue,
+        role_layer_toml: &TomlValue,
         preserve_current_provider: bool,
         preserve_current_service_tier: bool,
     ) -> anyhow::Result<Config> {
         let preserve_current_model = role_layer_toml.get("model").is_none();
         let preserve_current_reasoning_effort =
             role_layer_toml.get("model_reasoning_effort").is_none();
-        let config_layer_stack = build_config_layer_stack(config, &role_layer_toml)?;
+        let config_layer_stack = build_config_layer_stack(config, role_layer_toml)?;
         let merged_config = deserialize_effective_config(config, &config_layer_stack)?;
 
         let mut next_config = Config::load_config_with_layer_stack(
