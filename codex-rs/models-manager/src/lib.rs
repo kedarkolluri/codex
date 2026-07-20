@@ -1,3 +1,4 @@
+mod audited_instructions;
 pub(crate) mod cache;
 pub mod collaboration_mode_presets;
 pub(crate) mod config;
@@ -6,6 +7,7 @@ pub mod model_info;
 pub mod model_presets;
 pub mod test_support;
 
+pub use audited_instructions::is_audited_model_instruction;
 pub use codex_protocol::auth::AuthMode;
 pub use config::ModelsManagerConfig;
 

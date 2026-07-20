@@ -21,6 +21,8 @@ const LOCAL_FRIENDLY_TEMPLATE: &str =
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 const PERSONALITY_SECTION_HEADER: &str = "# Personality";
+pub(crate) const LOCAL_PERSONALITY_MODEL_SLUGS: &[&str] =
+    &["gpt-5.2-codex", "exp-codex-personality"];
 
 pub fn with_config_overrides(mut model: ModelInfo, config: &ModelsManagerConfig) -> ModelInfo {
     if let Some(context_window) = config.model_context_window {
@@ -168,8 +170,8 @@ pub fn model_info_from_slug(slug: &str) -> ModelInfo {
 }
 
 fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
-    match slug {
-        "gpt-5.2-codex" | "exp-codex-personality" => Some(ModelMessages {
+    if LOCAL_PERSONALITY_MODEL_SLUGS.contains(&slug) {
+        Some(ModelMessages {
             instructions_template: Some(format!(
                 "{DEFAULT_PERSONALITY_HEADER}\n\n{PERSONALITY_PLACEHOLDER}\n\n{BASE_INSTRUCTIONS}"
             )),
@@ -181,8 +183,9 @@ fn local_personality_messages_for_slug(slug: &str) -> Option<ModelMessages> {
             approvals: None,
             auto_review: None,
             permissions: None,
-        }),
-        _ => None,
+        })
+    } else {
+        None
     }
 }
 
