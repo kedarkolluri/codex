@@ -1,5 +1,6 @@
 use super::event_observer::EventObserverTap;
 use super::input_queue::InputQueue;
+use super::turn_admission_registry::TurnAdmissionRegistry;
 use super::*;
 use crate::agent::ParentCompletionDelivery;
 use crate::agent::resolve_parent_completion_delivery;
@@ -47,6 +48,7 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
+    pub(super) turn_admissions: Arc<TurnAdmissionRegistry>,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -1173,6 +1175,7 @@ impl Session {
                 active_turn: Mutex::new(None),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
+                turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });

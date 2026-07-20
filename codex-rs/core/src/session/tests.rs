@@ -5452,6 +5452,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -7722,6 +7723,7 @@ where
         active_turn: Mutex::new(None),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });
