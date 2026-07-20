@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use crate::session::TurnInput;
+use crate::session::PendingInputAvailability;
 use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
@@ -81,8 +82,15 @@ impl SessionTask for RegularTask {
             )
             .instrument(run_turn_span.clone())
             .await?;
-            if !sess.input_queue.has_pending_input(&sess.active_turn).await {
-                return Ok(last_agent_message);
+            match sess
+                .input_queue
+                .pending_input_availability_for_turn(&sess.active_turn, &ctx.sub_id)
+                .await
+            {
+                PendingInputAvailability::Pending => {}
+                PendingInputAvailability::Inactive | PendingInputAvailability::Empty => {
+                    return Ok(last_agent_message);
+                }
             }
             next_input = Vec::new();
         }

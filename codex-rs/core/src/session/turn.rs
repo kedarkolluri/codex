@@ -40,6 +40,9 @@ use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::PreviousTurnSettings;
+use crate::session::PendingInputClaimMode;
+use crate::session::PendingInputAvailability;
+use crate::session::PendingInputRecordResult;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -228,14 +231,23 @@ pub(crate) async fn run_turn(
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
-        let pending_input = if can_drain_pending_input {
-            sess.input_queue.get_pending_input(&sess.active_turn).await
+        let pending_input_result = if can_drain_pending_input {
+            sess.record_pending_input_for_turn(
+                &turn_context,
+                PendingInputClaimMode::CurrentTurn,
+            )
+            .await
         } else {
-            Vec::new()
+            PendingInputRecordResult::Empty
         };
-
-        if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
-            break;
+        match pending_input_result {
+            PendingInputRecordResult::Recorded {
+                should_stop: false,
+            }
+            | PendingInputRecordResult::Empty => {}
+            PendingInputRecordResult::Recorded { should_stop: true }
+            | PendingInputRecordResult::Failed
+            | PendingInputRecordResult::Inactive => break,
         }
 
         let window_id = sess.current_window_id().await;
@@ -305,9 +317,14 @@ pub(crate) async fn run_turn(
                         .await;
                 }
                 can_drain_pending_input = true;
-                let (has_pending_input, token_status, estimated_token_count) = async {
-                    let has_pending_input =
-                        sess.input_queue.has_pending_input(&sess.active_turn).await;
+                let (pending_input_availability, token_status, estimated_token_count) = async {
+                    let pending_input_availability = sess
+                        .input_queue
+                        .pending_input_availability_for_turn(
+                            &sess.active_turn,
+                            &turn_context.sub_id,
+                        )
+                        .await;
                     let token_status = super::context_window::context_window_token_status(
                         sess.as_ref(),
                         turn_context.as_ref(),
@@ -315,10 +332,19 @@ pub(crate) async fn run_turn(
                     .await;
                     let estimated_token_count =
                         sess.get_estimated_token_count(turn_context.as_ref()).await;
-                    (has_pending_input, token_status, estimated_token_count)
+                    (
+                        pending_input_availability,
+                        token_status,
+                        estimated_token_count,
+                    )
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
+                if pending_input_availability == PendingInputAvailability::Inactive {
+                    break;
+                }
+                let has_pending_input =
+                    pending_input_availability == PendingInputAvailability::Pending;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
                 let token_limit_reached = token_status.token_limit_reached;
 
@@ -491,7 +517,7 @@ async fn turn_diff_display_roots(turn_context: &TurnContext) -> Vec<(String, Pat
 }
 
 #[instrument(level = "trace", skip_all)]
-async fn run_hooks_and_record_inputs(
+pub(super) async fn run_hooks_and_record_inputs(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     input: &[TurnInput],
