@@ -9,6 +9,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
 use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
 use tokio::sync::watch;
 
 mod pending_input_claims;
@@ -80,6 +81,67 @@ pub(crate) struct PendingInputRecordingCompletion {
 pub(crate) struct InputQueue {
     activity_tx: watch::Sender<InputQueueActivity>,
     mailbox_pending_mails: Mutex<VecDeque<InterAgentCommunication>>,
+}
+
+/// Reversible attachment of explicit and mailbox input to an admitted start.
+///
+/// Both source and destination remain locked until activation commits. Dropping
+/// this guard removes the exact appended suffix and restores drained mailbox
+/// messages in FIFO order.
+#[must_use = "prepared turn input must be committed or rolled back"]
+pub(crate) struct PreparedStartingTurnInput<'a> {
+    activity_tx: &'a watch::Sender<InputQueueActivity>,
+    turn_state: MutexGuard<'a, TurnState>,
+    mailbox: MutexGuard<'a, VecDeque<InterAgentCommunication>>,
+    original_pending_len: usize,
+    explicit_pending_len: usize,
+    committed: bool,
+}
+
+impl PreparedStartingTurnInput<'_> {
+    pub(crate) fn has_trigger_turn_mailbox_items(&self) -> bool {
+        self.turn_state.pending_input.items
+            [self.original_pending_len + self.explicit_pending_len..]
+            .iter()
+            .any(|input| {
+                matches!(
+                    input,
+                    TurnInput::InterAgentCommunication(communication) if communication.trigger_turn
+                )
+            })
+    }
+
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+
+    fn rollback(&mut self) {
+        let attached = self
+            .turn_state
+            .pending_input
+            .items
+            .split_off(self.original_pending_len);
+        let mailbox = attached.into_iter().skip(self.explicit_pending_len);
+        let mut restored_mail = false;
+        for input in mailbox.rev() {
+            let TurnInput::InterAgentCommunication(communication) = input else {
+                unreachable!("mailbox attachment must append only inter-agent communication");
+            };
+            self.mailbox.push_front(communication);
+            restored_mail = true;
+        }
+        if restored_mail {
+            self.activity_tx.send_replace(InputQueueActivity::Mailbox);
+        }
+    }
+}
+
+impl Drop for PreparedStartingTurnInput<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.rollback();
+        }
+    }
 }
 
 impl InputQueue {
@@ -223,12 +285,41 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Steer);
     }
 
+    #[cfg(test)]
     pub(crate) async fn extend_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,
         input: Vec<TurnInput>,
     ) {
         turn_state.lock().await.pending_input.items.extend(input);
+    }
+
+    /// Prepares explicit and mailbox input for one admitted task start.
+    pub(crate) async fn prepare_starting_turn_input<'a>(
+        &'a self,
+        turn_state: &'a Mutex<TurnState>,
+        pending_input: Vec<TurnInput>,
+    ) -> PreparedStartingTurnInput<'a> {
+        let mut turn_state = turn_state.lock().await;
+        let mut mailbox = self.mailbox_pending_mails.lock().await;
+        let original_pending_len = turn_state.pending_input.items.len();
+        let explicit_pending_len = pending_input.len();
+        turn_state.pending_input.items.extend(pending_input);
+        if turn_state.accepts_mailbox_delivery_for_current_turn() {
+            turn_state.pending_input.items.extend(
+                mailbox
+                    .drain(..)
+                    .map(TurnInput::InterAgentCommunication),
+            );
+        }
+        PreparedStartingTurnInput {
+            activity_tx: &self.activity_tx,
+            turn_state,
+            mailbox,
+            original_pending_len,
+            explicit_pending_len,
+            committed: false,
+        }
     }
 
     pub(crate) async fn take_pending_input_for_turn_state(
@@ -303,6 +394,10 @@ impl InputQueue {
         self.has_pending_mailbox_items().await
     }
 }
+
+#[cfg(test)]
+#[path = "input_queue_tests.rs"]
+mod prepared_start_tests;
 
 impl TurnInputQueue {
     fn has_user_input(&self) -> bool {

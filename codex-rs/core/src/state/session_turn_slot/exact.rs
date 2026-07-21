@@ -52,6 +52,7 @@ impl SessionTurnSlot {
         self.lifecycle.is_idle()
     }
 
+    #[cfg(test)]
     pub(crate) fn can_begin_reserved_start(
         &self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -70,6 +71,7 @@ impl SessionTurnSlot {
         }
         self.lifecycle.start(execution_guard)
     }
+    #[cfg(test)]
     pub(crate) fn begin_reserved_start(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -122,9 +124,27 @@ impl SessionTurnSlot {
         self.lifecycle.commit_start(driver, task)
     }
     pub(crate) fn begin_abort(&mut self, reason: TurnAbortReason) -> SessionTurnAbortTransition {
-        if self.legacy_start.is_none()
-            && let Some(generation) = self.lifecycle.cancel_start(reason)
+        #[cfg(test)]
         {
+            if let Some(driver) = self.legacy_start.take() {
+                let generation = driver.generation();
+                if !self
+                    .lifecycle
+                    .cancel_start_exact(&generation, reason.clone())
+                {
+                    self.legacy_start = Some(driver);
+                    return SessionTurnAbortTransition::Inactive;
+                }
+                match self.lifecycle.complete_cancelled_start(driver) {
+                    Ok(_) => return SessionTurnAbortTransition::Starting(generation),
+                    Err(driver) => {
+                        self.legacy_start = Some(driver);
+                        return SessionTurnAbortTransition::Inactive;
+                    }
+                }
+            }
+        }
+        if let Some(generation) = self.lifecycle.cancel_start(reason) {
             return SessionTurnAbortTransition::Starting(generation);
         }
         if let Some((generation, turn_context)) = self.running_identity()
@@ -132,7 +152,11 @@ impl SessionTurnSlot {
         {
             return SessionTurnAbortTransition::Running(turn);
         }
-        if self.legacy_finalization.is_none()
+        #[cfg(test)]
+        let legacy_finalization_active = self.legacy_finalization.is_some();
+        #[cfg(not(test))]
+        let legacy_finalization_active = false;
+        if !legacy_finalization_active
             && let Some(generation) = self.lifecycle.finalizing_generation().cloned()
         {
             return SessionTurnAbortTransition::Finalizing(generation);
@@ -144,6 +168,7 @@ impl SessionTurnSlot {
         generation: &TurnGeneration,
         turn_context: &Arc<TurnContext>,
     ) -> Option<FinalizingTurn> {
+        #[cfg(test)]
         if self.legacy_running {
             return None;
         }

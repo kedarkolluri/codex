@@ -308,8 +308,11 @@ pub async fn inter_agent_communication(
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn {
-        sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
-            .await;
+        // The scheduler owns a detached driver before returning this observer.
+        // Do not block the submission loop while that driver waits for a
+        // competing Starting generation or execution-capacity release.
+        let observer = sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id);
+        let _observer = sess.services.runtime_handle.spawn(observer);
     }
 }
 
@@ -606,7 +609,17 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
     }
 }
 
+async fn stop_task_starts_for_shutdown(sess: &Session) {
+    // Exact task start performs its final gate check and commit while holding
+    // this lock. Closing the gate under the same lock gives shutdown one
+    // linearization point: a start either commits before shutdown closes the
+    // gate, or observes the closed gate and compensates without committing.
+    let _active_turn = sess.active_turn.lock().await;
+    sess.turn_start_gate.close();
+}
+
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    stop_task_starts_for_shutdown(sess.as_ref()).await;
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
@@ -966,3 +979,7 @@ pub(super) fn submission_dispatch_span(sub: &Submission) -> tracing::Span {
     }
     dispatch_span
 }
+
+#[cfg(test)]
+#[path = "handlers_shutdown_tests.rs"]
+mod shutdown_tests;

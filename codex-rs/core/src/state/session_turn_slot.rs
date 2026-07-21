@@ -1,24 +1,25 @@
 use std::sync::Arc;
 
-use codex_protocol::protocol::TurnAbortReason;
 use tokio::sync::Mutex;
 
 use crate::agent::control::AgentExecutionGuard;
 
+#[cfg(test)]
+use codex_protocol::protocol::TurnAbortReason;
+#[cfg(test)]
 use super::ActiveTurn;
 use super::RunningTask;
 use super::TurnState;
-use super::turn_lifecycle::TurnFinalization;
 use super::turn_lifecycle::TurnGeneration;
 use super::turn_lifecycle::TurnLifecycleSlot;
+#[cfg(test)]
+use super::turn_lifecycle::TurnFinalization;
+#[cfg(test)]
 use super::turn_lifecycle::TurnStartDriver;
 
-#[allow(dead_code)] // Activated by the next stacked atomic-start change.
 mod exact;
 
-#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
 pub(crate) use exact::SessionTurnAbortTransition;
-#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
 pub(crate) use exact::SessionTurnFinalization;
 
 type SessionLifecycle = TurnLifecycleSlot<Option<AgentExecutionGuard>, RunningTask>;
@@ -30,11 +31,15 @@ type SessionLifecycle = TurnLifecycleSlot<Option<AgentExecutionGuard>, RunningTa
 #[derive(Default)]
 pub(crate) struct SessionTurnSlot {
     lifecycle: SessionLifecycle,
+    #[cfg(test)]
     legacy_start: Option<TurnStartDriver>,
+    #[cfg(test)]
     legacy_running: bool,
+    #[cfg(test)]
     legacy_finalization: Option<LegacyFinalization>,
 }
 
+#[cfg(test)]
 struct LegacyFinalization {
     authority: TurnFinalization,
     turn_state: Arc<Mutex<TurnState>>,
@@ -71,6 +76,10 @@ impl SessionTurnSlot {
             .map(TurnGeneration::turn_state)
     }
 
+    pub(crate) fn starting_generation(&self) -> Option<TurnGeneration> {
+        self.lifecycle.starting_generation().cloned()
+    }
+
     pub(crate) fn running_turn(&self) -> Option<RunningTurnRef<'_>> {
         let (generation, _turn_context, task) = self.lifecycle.running()?;
         Some(RunningTurnRef {
@@ -79,7 +88,8 @@ impl SessionTurnSlot {
         })
     }
 
-    /// Legacy taskless reservation; removed by the next lifecycle activation.
+    /// Test-only compatibility reservation for fixtures that model taskless turns.
+    #[cfg(test)]
     pub(crate) fn reserve_taskless(&mut self) -> Option<&Arc<Mutex<TurnState>>> {
         if self.lifecycle.running().is_some() {
             return None;
@@ -95,7 +105,8 @@ impl SessionTurnSlot {
         self.current_turn_state()
     }
 
-    /// Legacy first get-or-insert and debug-only running-task check.
+    /// Test-only first get-or-insert and running-task check.
+    #[cfg(test)]
     pub(crate) fn reserve_taskless_for_legacy_start(&mut self) -> &Arc<Mutex<TurnState>> {
         let Some(turn_state) = self.reserve_taskless() else {
             unreachable!("legacy start must not overlap an exact lifecycle owner");
@@ -103,7 +114,8 @@ impl SessionTurnSlot {
         turn_state
     }
 
-    /// Legacy second get-or-insert and running-task assignment.
+    /// Test-only second get-or-insert and running-task assignment.
+    #[cfg(test)]
     pub(crate) fn install_running_task_for_legacy_start(&mut self, task: RunningTask) {
         debug_assert!(self.lifecycle.running().is_none());
         if let Some(driver) = self.legacy_start.take() {
@@ -141,7 +153,8 @@ impl SessionTurnSlot {
         }
     }
 
-    /// Unconditional legacy abort take; removed by the next lifecycle activation.
+    /// Test-only unconditional legacy abort take.
+    #[cfg(test)]
     pub(crate) fn take_for_legacy_abort(&mut self) -> Option<ActiveTurn> {
         if let Some((task, turn_state)) = self.take_running_for_legacy_removal() {
             return Some(ActiveTurn::from_parts(Some(task), turn_state));
@@ -168,7 +181,8 @@ impl SessionTurnSlot {
         Some(ActiveTurn::from_parts(/*task*/ None, turn_state))
     }
 
-    /// Exact legacy running-turn abort take; removed by the next lifecycle activation.
+    /// Test-only exact legacy running-turn abort take.
+    #[cfg(test)]
     pub(crate) fn take_running_turn_for_abort(&mut self, turn_id: &str) -> Option<ActiveTurn> {
         let is_target = self
             .lifecycle
@@ -181,7 +195,8 @@ impl SessionTurnSlot {
         Some(ActiveTurn::from_parts(Some(task), turn_state))
     }
 
-    /// Legacy finish projection; removed by the next lifecycle activation.
+    /// Test-only legacy finish projection.
+    #[cfg(test)]
     pub(crate) fn take_running_task_for_legacy_finish(
         &mut self,
     ) -> Option<(RunningTask, Arc<Mutex<TurnState>>)> {
@@ -203,7 +218,8 @@ impl SessionTurnSlot {
         Some((task, turn_state))
     }
 
-    /// Exact taskless cleanup; removed by the next lifecycle activation.
+    /// Test-only exact taskless cleanup.
+    #[cfg(test)]
     pub(crate) fn clear_taskless_exact_state(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -211,7 +227,8 @@ impl SessionTurnSlot {
         self.clear_taskless_exact_state_inner(expected_turn_state)
     }
 
-    /// Exact legacy finish cleanup; removed by the next lifecycle activation.
+    /// Test-only exact legacy finish cleanup.
+    #[cfg(test)]
     pub(crate) fn clear_legacy_finished_exact_state(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -219,6 +236,7 @@ impl SessionTurnSlot {
         self.clear_taskless_exact_state_inner(expected_turn_state)
     }
 
+    #[cfg(test)]
     fn take_running_for_legacy_removal(&mut self) -> Option<(RunningTask, Arc<Mutex<TurnState>>)> {
         if !self.legacy_running {
             return None;
@@ -237,6 +255,7 @@ impl SessionTurnSlot {
         Some((task, turn_state))
     }
 
+    #[cfg(test)]
     fn clear_taskless_exact_state_inner(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,

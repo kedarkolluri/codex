@@ -18,6 +18,7 @@ use crate::agent::control::AgentExecutionGuard;
 use crate::session::tests::make_session_and_context;
 use crate::state::TurnState;
 use crate::state::session_turn_slot::tests::running_task;
+use crate::state::turn_lifecycle::TurnStartOutcome;
 
 fn limited_source() -> SessionSource {
     SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()))
@@ -126,6 +127,19 @@ async fn abort_transition_tracks_starting_running_and_finalizing() {
     let (_session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
     let mut slot = SessionTurnSlot::default();
+    let reserved_state = Arc::clone(slot.reserve_taskless().expect("idle slot should reserve"));
+    let SessionTurnAbortTransition::Starting(reserved) =
+        slot.begin_abort(TurnAbortReason::Replaced)
+    else {
+        panic!("reserved start should cancel and release its stored driver");
+    };
+    assert!(Arc::ptr_eq(reserved.turn_state(), &reserved_state));
+    assert_eq!(
+        reserved.finished_outcome(),
+        Some(TurnStartOutcome::Cancelled(TurnAbortReason::Replaced))
+    );
+    assert!(slot.is_idle());
+
     let Ok(driver) = slot.begin_fresh_start(/*execution_guard*/ None) else {
         panic!("idle slot should start");
     };

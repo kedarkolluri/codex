@@ -5498,6 +5498,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
+        turn_start_gate: super::turn_start_gate::TurnStartGate::default(),
+        trigger_turn_retry: super::trigger_turn_retry::TriggerTurnRetry::default(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
@@ -7814,6 +7816,8 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
+        turn_start_gate: super::turn_start_gate::TurnStartGate::default(),
+        trigger_turn_retry: super::trigger_turn_retry::TriggerTurnRetry::default(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
@@ -9856,7 +9860,33 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
+    struct FinishGate {
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl SessionTask for FinishGate {
+        fn kind(&self) -> TaskKind {
+            TaskKind::Regular
+        }
+
+        fn span_name(&self) -> &'static str {
+            "session_task.finish_gate"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _session: Arc<SessionTaskContext>,
+            _ctx: Arc<TurnContext>,
+            _input: Vec<TurnInput>,
+            _cancellation_token: CancellationToken,
+        ) -> SessionTaskResult {
+            self.release.notified().await;
+            Ok(None)
+        }
+    }
+
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let finish = Arc::new(tokio::sync::Notify::new());
     let input = vec![TurnInput::UserInput {
         content: vec![UserInput::Text {
             text: "hello".to_string(),
@@ -9867,9 +9897,8 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     sess.spawn_task(
         Arc::clone(&tc),
         input,
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
+        FinishGate {
+            release: Arc::clone(&finish),
         },
     )
     .await;
@@ -9894,23 +9923,7 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("steer pending input into active turn");
 
-    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
-        .await;
-
-    let history = sess.clone_history().await;
-    let expected = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputText {
-            text: "late pending input".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    assert!(
-        strip_metadata_from_items(history.raw_items()).contains(&expected),
-        "expected pending input to be persisted into history on turn completion"
-    );
+    finish.notify_one();
 
     let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
         .await
@@ -9975,6 +9988,21 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             ..
         }) if turn_id == tc.sub_id
     ));
+
+    let history = sess.clone_history().await;
+    let expected = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: "late pending input".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    assert!(
+        strip_metadata_from_items(history.raw_items()).contains(&expected),
+        "expected pending input to be persisted into history on turn completion"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -10120,7 +10148,7 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
 }
 
 #[tokio::test]
-async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting() {
+async fn try_start_turn_if_idle_rejects_idle_input_and_schedules_pending_trigger_turn() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     sess.input_queue
         .enqueue_mailbox_communication(InterAgentCommunication::new(
@@ -10143,8 +10171,10 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
         err.reason()
     );
     assert_eq!(vec![item], err.into_input());
-    assert!(sess.active_turn.lock().await.is_idle());
-    assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(sess.active_turn.lock().await.has_active_turn());
+    assert!(!sess.input_queue.has_trigger_turn_mailbox_items().await);
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
 #[tokio::test]

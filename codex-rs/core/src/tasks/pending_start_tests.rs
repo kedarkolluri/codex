@@ -3,6 +3,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_protocol::AgentPath;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
@@ -12,6 +14,8 @@ use tokio::time::timeout;
 use super::PendingTaskStart;
 use super::PendingTaskStartOutcome;
 use super::PendingTaskStartRecovery;
+use crate::tasks::RegularTask;
+use crate::tasks::TaskStartOutcome;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
@@ -30,6 +34,7 @@ struct LifecycleProbe {
     abort_calls: AtomicUsize,
     abort_completions: AtomicUsize,
     start_entered: Notify,
+    start_release: Notify,
     abort_entered: Notify,
 }
 
@@ -42,7 +47,7 @@ impl codex_extension_api::TurnLifecycleContributor for LifecycleProbe {
             self.start_calls.fetch_add(/*val*/ 1, Ordering::SeqCst);
             if self.block_start {
                 self.start_entered.notify_one();
-                std::future::pending::<()>().await;
+                self.start_release.notified().await;
             }
         })
     }
@@ -159,6 +164,139 @@ async fn ordinary_compensation_aborts_entered_callbacks_and_restores_idle() {
     );
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
     assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn explicit_poison_aborts_entered_callbacks_and_keeps_slot_closed() {
+    let probe = Arc::new(LifecycleProbe::default());
+    let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    let mut pending_start = begin_pending_start(&session, &turn_context).await;
+    let generation = pending_start.generation();
+    enter_start_lifecycle(&session, &turn_context, &mut pending_start).await;
+
+    assert_eq!(
+        pending_start.poison().await,
+        PendingTaskStartOutcome::Poisoned
+    );
+    assert_eq!(
+        wait_for_outcome(&generation, "poisoned start should finish").await,
+        TurnStartOutcome::Poisoned(TurnAbortReason::Interrupted)
+    );
+    assert!(!session.active_turn.lock().await.can_begin_fresh_start());
+    assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_abort_cancels_a_real_starting_task_and_restores_idle() {
+    let probe = Arc::new(LifecycleProbe {
+        block_start: true,
+        ..Default::default()
+    });
+    let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    let session_for_start = Arc::clone(&session);
+    let start = tokio::spawn(async move {
+        let admission_permit = session_for_start
+            .turn_start_gate
+            .acquire_start_permit()
+            .await;
+        session_for_start
+            .start_task_with_admission_permit(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                admission_permit,
+            )
+            .await
+    });
+    wait_for(
+        &probe.start_entered,
+        "start callback should be entered before replacement",
+    )
+    .await;
+
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let outcome = timeout(TEST_TIMEOUT, start)
+        .await
+        .expect("starting task should finish cancellation")
+        .expect("starting task should not panic");
+    assert!(matches!(
+        outcome,
+        TaskStartOutcome::Cancelled(TurnAbortReason::Replaced)
+    ));
+    assert!(session.active_turn.lock().await.can_begin_fresh_start());
+    assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_pending_work_caller_does_not_strand_trigger_mail() {
+    let probe = Arc::new(LifecycleProbe {
+        block_start: true,
+        ..Default::default()
+    });
+    let (session, _turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path should parse"),
+            AgentPath::root(),
+            Vec::new(),
+            "queued update".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+    let pending_work = tokio::spawn(
+        session.maybe_start_turn_for_pending_work_with_sub_id("cancelled-caller".to_string()),
+    );
+    wait_for(
+        &probe.start_entered,
+        "pending-work start callback should be entered before caller cancellation",
+    )
+    .await;
+
+    abort_task(
+        pending_work,
+        "pending-work caller should be independently cancellable",
+    )
+    .await;
+    probe.start_release.notify_one();
+    timeout(TEST_TIMEOUT, async {
+        while session.input_queue.has_trigger_turn_mailbox_items().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached pending-work driver should attach queued trigger mail");
+
+    assert!(session.active_turn.lock().await.has_active_turn());
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+}
+
+#[tokio::test]
+async fn suppressed_completion_ticket_leaves_trigger_mail_queued() {
+    let (session, _turn_context) = make_session(&[]).await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path should parse"),
+            AgentPath::root(),
+            Vec::new(),
+            "queued update".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+    let stale_ticket = session
+        .turn_start_gate
+        .automatic_start_ticket()
+        .expect("gate open");
+    session.turn_start_gate.suppress_automatic_starts();
+
+    session
+        .maybe_start_turn_for_pending_work_with_ticket(stale_ticket)
+        .await;
+
+    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(session.active_turn.lock().await.can_begin_fresh_start());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

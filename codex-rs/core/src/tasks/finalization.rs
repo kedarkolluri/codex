@@ -4,7 +4,6 @@ use crate::session::session::Session;
 use crate::state::SessionTurnFinalization;
 use crate::state::TurnState;
 
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum PendingFinalizationOutcome {
     Completed,
@@ -12,14 +11,12 @@ pub(super) enum PendingFinalizationOutcome {
 }
 
 /// Linear authority for completing one exact finalizing turn.
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 #[must_use = "an exact finalization must be completed or poisoned"]
 pub(super) struct PendingFinalization {
     session: Arc<Session>,
     completion: Option<SessionTurnFinalization>,
 }
 
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 impl PendingFinalization {
     pub(super) fn new(session: Arc<Session>, completion: SessionTurnFinalization) -> Self {
         Self {
@@ -48,6 +45,19 @@ impl PendingFinalization {
                 self.completion = Some(completion);
                 PendingFinalizationOutcome::Displaced
             }
+        }
+    }
+
+    pub(super) async fn poison(mut self) {
+        let mut active_turn = self.session.active_turn.lock().await;
+        let Some(completion) = self.completion.take() else {
+            unreachable!("pending finalization must retain its authority");
+        };
+        let completion = active_turn.poison_abandoned_finalization(completion);
+        drop(active_turn);
+        if let Err(completion) = completion {
+            self.session.turn_start_gate.close();
+            drop(completion);
         }
     }
 }

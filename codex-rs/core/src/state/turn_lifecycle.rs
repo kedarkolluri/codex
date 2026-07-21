@@ -246,6 +246,13 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         }
     }
 
+    pub(crate) fn starting_generation(&self) -> Option<&TurnGeneration> {
+        let TurnLifecycleState::Starting { generation, .. } = &self.state else {
+            return None;
+        };
+        Some(generation)
+    }
+
     pub(crate) fn running(&self) -> Option<(&TurnGeneration, &Arc<TurnContext>, &R)> {
         let TurnLifecycleState::Running { owner, task, .. } = &self.state else {
             return None;
@@ -266,6 +273,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
     /// finalization is reopened as running. The latter invalidates its exact
     /// finalization authority, matching the legacy state check that prevents
     /// the old cleanup from clearing the newly installed task.
+    #[cfg(test)]
     pub(crate) fn install_running_task_for_legacy(&mut self, task: R) -> Result<Option<R>, R>
     where
         R: TurnLifecycleTask,
@@ -317,6 +325,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         Ok(TurnStartDriver { generation })
     }
 
+    #[cfg(test)]
     pub(crate) fn replace_start_lease(
         &mut self,
         driver: &TurnStartDriver,
@@ -538,6 +547,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
     }
 
     /// Poisons an exact finalizing generation whose async driver was lost.
+    #[cfg(test)]
     pub(crate) fn poison_finalization_for_turn(
         &mut self,
         generation: &TurnGeneration,

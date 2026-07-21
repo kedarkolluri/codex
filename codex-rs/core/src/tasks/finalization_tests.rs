@@ -106,6 +106,66 @@ async fn ordinary_completion_releases_the_exact_slot() {
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
 }
 
+#[tokio::test]
+async fn explicit_poison_keeps_the_exact_slot_fail_closed() {
+    let (session, generation, pending) = begin_pending_finalization().await;
+
+    pending.poison().await;
+
+    wait_for_lifecycle(&generation, "explicit poison should finish lifecycle").await;
+    assert!(!session.active_turn.lock().await.can_begin_fresh_start());
+}
+
+#[tokio::test]
+async fn wrong_turn_abort_does_not_invalidate_automatic_start_ticket() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let Ok(driver) = session
+        .active_turn
+        .lock()
+        .await
+        .begin_fresh_start(/*execution_guard*/ None)
+    else {
+        panic!("idle session should accept an exact start");
+    };
+    let generation = driver.generation();
+    assert!(
+        session
+            .active_turn
+            .lock()
+            .await
+            .commit_start(driver, running_task(Arc::clone(&turn_context)))
+            .is_ok()
+    );
+    let ticket = session
+        .turn_start_gate
+        .automatic_start_ticket()
+        .expect("gate open");
+
+    assert!(
+        !session
+            .abort_turn_if_active("different-turn", TurnAbortReason::Replaced)
+            .await
+    );
+    assert!(session.turn_start_gate.admits_automatic_start(ticket));
+
+    let finalizing_turn = session
+        .active_turn
+        .lock()
+        .await
+        .begin_finalization(&generation, &turn_context)
+        .expect("original turn should remain running");
+    let (task, completion) = finalizing_turn.into_parts();
+    task.handle.abort();
+    assert_eq!(
+        PendingFinalization::new(Arc::clone(&session), completion)
+            .complete()
+            .await,
+        PendingFinalizationOutcome::Completed
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_finalization_off_runtime_uses_the_session_runtime() {
     let (session, generation, pending) = begin_pending_finalization().await;
