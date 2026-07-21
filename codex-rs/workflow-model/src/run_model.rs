@@ -13,6 +13,7 @@ use codex_protocol::protocol::WorkflowEvent;
 use codex_protocol::protocol::WorkflowRunBeginEvent;
 use codex_protocol::protocol::WorkflowRunTerminalReason;
 
+mod agent_lifecycle;
 mod agent_topology;
 mod phase_lifecycle;
 mod topology;
@@ -169,10 +170,16 @@ impl WorkflowRunModel {
                 self.reduce_agent_bound(event)?;
                 Ok(ReductionDisposition::Applied)
             }
+            WorkflowEvent::AgentUpdated(event) => {
+                self.reduce_agent_updated(event)?;
+                Ok(ReductionDisposition::Applied)
+            }
+            WorkflowEvent::AgentEnd(event) => {
+                self.reduce_agent_end(event)?;
+                Ok(ReductionDisposition::Applied)
+            }
             WorkflowEvent::RunBegin(_) => unreachable!("run begin rejected above"),
-            WorkflowEvent::RunEnd(_)
-            | WorkflowEvent::AgentUpdated(_)
-            | WorkflowEvent::AgentEnd(_) => Ok(ReductionDisposition::Unhandled),
+            WorkflowEvent::RunEnd(_) => Ok(ReductionDisposition::Unhandled),
         }
     }
 
@@ -281,3 +288,7 @@ mod topology_tests;
 #[cfg(test)]
 #[path = "run_model_agent_topology_tests.rs"]
 mod agent_topology_tests;
+
+#[cfg(test)]
+#[path = "run_model_agent_lifecycle_tests.rs"]
+mod agent_lifecycle_tests;

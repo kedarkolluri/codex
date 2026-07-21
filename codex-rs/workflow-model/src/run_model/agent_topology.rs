@@ -3,6 +3,8 @@ use codex_code_mode_protocol::WORKFLOW_AGENT_MAX_RETRIES;
 use codex_code_mode_protocol::WORKFLOW_AGENT_OPTION_MAX_BYTES;
 use codex_code_mode_protocol::WORKFLOW_PHASE_TITLE_MAX_BYTES;
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::WorkflowAgentAttemptReason;
 use codex_protocol::protocol::WorkflowAgentBeginEvent;
 use codex_protocol::protocol::WorkflowAgentBoundEvent;
@@ -56,6 +58,8 @@ impl WorkflowRunModel {
             agent.attempt = event.attempt;
             agent.last_attempt_reason = event.last_attempt_reason;
             agent.child_thread_id = None;
+            agent.status = AgentStatus::Running;
+            agent.returned_null = false;
             return Ok(());
         }
 
@@ -82,6 +86,11 @@ impl WorkflowRunModel {
             effort: event.effort.clone(),
             child_thread_id: None,
             state: WorkflowNodeState::Active,
+            status: AgentStatus::Running,
+            token_usage: TokenUsage::default(),
+            tool_call_count: 0,
+            duration_ms: 0,
+            returned_null: false,
             child_node_ids: Vec::new(),
         }))
     }
