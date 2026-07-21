@@ -237,9 +237,9 @@ pub(crate) struct ResumeThreadWithHistoryOptions {
     pub(crate) inherited_exec_policy: Option<Arc<crate::exec_policy::ExecPolicyManager>>,
 }
 
-/// Reader budget for fresh spawn registration. Recursive collaboration mutations acquire the
-/// complete budget, while each concurrent spawn holds one permit through edge persistence.
-pub(crate) const GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS: u32 = 1 << 20;
+/// Reader budget for fresh spawn registration. Recursive subtree mutations acquire the complete
+/// budget, while each concurrent spawn holds one permit through edge persistence.
+pub(crate) const AGENT_SUBTREE_MUTATION_GATE_PERMITS: u32 = 1 << 20;
 
 /// Shared, `Arc`-owned state for [`ThreadManager`]. This `Arc` is required to have a single
 /// `Arc` reference that can be downgraded to by `AgentControl` while preventing every single
@@ -263,9 +263,9 @@ pub(crate) struct ThreadManagerState {
     session_source: SessionSource,
     installation_id: String,
     analytics_events_client: Option<AnalyticsEventsClient>,
-    /// Serializes generic recursive collaboration mutations against child registration across all
+    /// Serializes recursive subtree mutations against child registration across all
     /// `AgentControl` handles backed by this manager.
-    generic_collaboration_subtree_gate: Semaphore,
+    agent_subtree_mutation_gate: Semaphore,
     // Captures submitted ops for testing purpose when test mode is enabled.
     ops_log: Option<SharedCapturedOps>,
 }
@@ -368,8 +368,8 @@ impl ThreadManager {
                 session_source,
                 installation_id,
                 analytics_events_client,
-                generic_collaboration_subtree_gate: Semaphore::new(
-                    GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS as usize,
+                agent_subtree_mutation_gate: Semaphore::new(
+                    AGENT_SUBTREE_MUTATION_GATE_PERMITS as usize,
                 ),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -489,8 +489,8 @@ impl ThreadManager {
                 session_source: SessionSource::Exec,
                 installation_id,
                 analytics_events_client: None,
-                generic_collaboration_subtree_gate: Semaphore::new(
-                    GENERIC_COLLABORATION_SUBTREE_GATE_PERMITS as usize,
+                agent_subtree_mutation_gate: Semaphore::new(
+                    AGENT_SUBTREE_MUTATION_GATE_PERMITS as usize,
                 ),
                 ops_log: should_use_test_thread_manager_behavior()
                     .then(|| Arc::new(std::sync::Mutex::new(Vec::new()))),
@@ -690,6 +690,19 @@ impl ThreadManager {
         }
 
         Ok(subtree_thread_ids)
+    }
+
+    /// Run a recursive agent-subtree mutation without racing child registration.
+    ///
+    /// The supplied future is not polled until every in-flight spawn has persisted its edge. New
+    /// spawns remain excluded until the future completes, so callers can capture, validate, and
+    /// mutate one immutable subtree snapshot without exposing the underlying synchronization
+    /// primitive. This is intentionally the only public access to the manager-wide mutation gate.
+    pub async fn run_with_agent_subtree_mutation<T>(
+        &self,
+        mutation: impl std::future::Future<Output = T>,
+    ) -> CodexResult<T> {
+        self.state.run_with_agent_subtree_mutation(mutation).await
     }
 
     pub async fn start_thread(&self, config: Config) -> CodexResult<NewThread> {
@@ -1161,8 +1174,20 @@ fn initial_history_workflow_thread_source(history: &InitialHistory) -> Option<&T
 }
 
 impl ThreadManagerState {
-    pub(crate) fn generic_collaboration_subtree_gate(&self) -> &Semaphore {
-        &self.generic_collaboration_subtree_gate
+    pub(crate) fn agent_subtree_mutation_gate(&self) -> &Semaphore {
+        &self.agent_subtree_mutation_gate
+    }
+
+    pub(crate) async fn run_with_agent_subtree_mutation<T>(
+        &self,
+        mutation: impl std::future::Future<Output = T>,
+    ) -> CodexResult<T> {
+        let _mutation_guard = self
+            .agent_subtree_mutation_gate()
+            .acquire_many(AGENT_SUBTREE_MUTATION_GATE_PERMITS)
+            .await
+            .map_err(|_| CodexErr::Fatal("agent subtree mutation gate is closed".to_string()))?;
+        Ok(mutation.await)
     }
 
     pub(crate) fn agent_graph_store(&self) -> Option<Arc<dyn AgentGraphStore>> {

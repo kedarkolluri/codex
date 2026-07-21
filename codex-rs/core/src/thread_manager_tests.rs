@@ -1595,6 +1595,111 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
 }
 
 #[tokio::test]
+async fn agent_subtree_mutation_rejects_workflow_child_spawn_after_capture() {
+    use crate::agent::control::ParentCompletionDelivery;
+    use crate::agent::control::SpawnAgentOptions;
+    use codex_protocol::AgentPath;
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let manager = Arc::new(ThreadManager::with_models_provider_and_home_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+    ));
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("start parent thread");
+    let parent_thread_id = parent.thread_id;
+    let agent_control = manager.agent_control();
+
+    let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+    let release_mutation = Arc::new(tokio::sync::Notify::new());
+    let mutation_manager = Arc::clone(&manager);
+    let mutation_release = Arc::clone(&release_mutation);
+    let mutation_task = tokio::spawn(async move {
+        mutation_manager
+            .run_with_agent_subtree_mutation(async {
+                let captured_thread_ids = mutation_manager
+                    .list_agent_subtree_thread_ids(parent_thread_id)
+                    .await
+                    .expect("capture parent subtree");
+                captured_tx
+                    .send(captured_thread_ids.clone())
+                    .expect("report captured subtree");
+                mutation_release.notified().await;
+                captured_thread_ids
+            })
+            .await
+    });
+
+    assert_eq!(
+        captured_rx.await.expect("mutation should capture subtree"),
+        vec![parent_thread_id]
+    );
+
+    let spawn_error = agent_control
+        .spawn_agent_deferred_input(
+            config,
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: Some(
+                    AgentPath::root()
+                        .join("late_workflow_child")
+                        .expect("workflow child path"),
+                ),
+                agent_nickname: None,
+                agent_role: None,
+            })),
+            SpawnAgentOptions {
+                parent_thread_id: Some(parent_thread_id),
+                preferred_agent_nickname: Some("late-workflow-agent".to_string()),
+                parent_completion_delivery: ParentCompletionDelivery::WorkflowSupervisor,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("late workflow child spawn must not register");
+    let CodexErr::InvalidRequest(message) = spawn_error else {
+        panic!("unexpected late-spawn error: {spawn_error}");
+    };
+    assert_eq!(
+        message,
+        "agent spawn is unavailable during a recursive subtree mutation"
+    );
+    assert_eq!(
+        manager
+            .list_agent_subtree_thread_ids(parent_thread_id)
+            .await
+            .expect("subtree remains readable"),
+        vec![parent_thread_id]
+    );
+
+    release_mutation.notify_one();
+    assert_eq!(
+        mutation_task
+            .await
+            .expect("mutation task should join")
+            .expect("mutation gate should remain open"),
+        vec![parent_thread_id]
+    );
+
+    parent
+        .thread
+        .shutdown_and_wait()
+        .await
+        .expect("shutdown parent thread");
+    let _ = manager.remove_thread(&parent_thread_id).await;
+}
+
+#[tokio::test]
 async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

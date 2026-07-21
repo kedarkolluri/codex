@@ -1,5 +1,6 @@
 //! `thread/delete` request handling.
 
+use super::thread_processor::core_thread_write_error;
 use super::thread_processor::unsupported_thread_store_operation;
 use super::*;
 
@@ -12,8 +13,12 @@ impl ThreadRequestProcessor {
         let mut deleted_thread_ids = Vec::new();
         let result = {
             let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
-            self.thread_delete_response(params, &mut deleted_thread_ids)
+            self.thread_manager
+                .run_with_agent_subtree_mutation(
+                    self.thread_delete_response(params, &mut deleted_thread_ids),
+                )
                 .await
+                .map_err(|err| core_thread_write_error("coordinate agent subtree mutation", err))?
         };
         match result {
             Ok(response) => {
