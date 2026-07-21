@@ -114,8 +114,10 @@ fn declared_and_dynamic_phases_reduce_deterministically() {
                     /*implicit*/ false,
                 ),
             ],
+            topology: BTreeMap::new(),
             active_phase_index: None,
             next_phase_index: 2,
+            next_topology_id: 0,
             log_event_count: 1,
         }
     );
@@ -167,8 +169,10 @@ fn first_explicit_phase_replaces_the_implicit_root() {
                     /*implicit*/ false,
                 ),
             ],
+            topology: BTreeMap::new(),
             active_phase_index: Some(1),
             next_phase_index: 2,
+            next_topology_id: 0,
             log_event_count: 0,
         }
     );
@@ -421,5 +425,6 @@ fn phase(index: u64, title: &str, state: WorkflowPhaseState, implicit: bool) -> 
         title: title.to_string(),
         state,
         implicit,
+        root_node_ids: Vec::new(),
     }
 }
