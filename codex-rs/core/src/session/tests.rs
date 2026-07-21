@@ -7241,8 +7241,10 @@ async fn submission_loop_channel_close_runs_full_thread_teardown() {
     let (tx_sub, rx_sub) = async_channel::bounded(1);
     drop(tx_sub);
     let session = Arc::new(session);
+    let session_for_assert = Arc::clone(&session);
     submission_loop(session, Arc::clone(&turn_context.config), rx_sub).await;
 
+    assert!(!session_for_assert.turn_start_gate.is_open());
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
         codex_thread_store::InMemoryThreadStoreCalls {

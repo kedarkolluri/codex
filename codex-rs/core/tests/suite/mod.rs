@@ -122,6 +122,7 @@ mod search_tool;
 mod shell_command;
 mod shell_serialization;
 mod shell_snapshot;
+mod shutdown_start;
 mod skill_approval;
 mod skills;
 mod spawn_agent_description;
