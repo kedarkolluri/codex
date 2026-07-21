@@ -308,8 +308,11 @@ pub async fn inter_agent_communication(
         .await;
     crate::agent_communication::emit_agent_communication_receive(&sub_id);
     if trigger_turn {
-        sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id)
-            .await;
+        // The scheduler owns a detached driver before returning this observer.
+        // Do not block the submission loop while that driver waits for a
+        // competing Starting generation or execution-capacity release.
+        let observer = sess.maybe_start_turn_for_pending_work_with_sub_id(sub_id);
+        let _observer = sess.services.runtime_handle.spawn(observer);
     }
 }
 

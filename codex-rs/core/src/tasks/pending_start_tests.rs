@@ -3,6 +3,8 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use codex_protocol::AgentPath;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
@@ -38,6 +40,7 @@ struct LifecycleProbe {
     abort_calls: AtomicUsize,
     abort_completions: AtomicUsize,
     start_entered: Notify,
+    start_release: Notify,
     abort_entered: Notify,
 }
 
@@ -50,7 +53,7 @@ impl codex_extension_api::TurnLifecycleContributor for LifecycleProbe {
             self.start_calls.fetch_add(/*val*/ 1, Ordering::SeqCst);
             if self.block_start {
                 self.start_entered.notify_one();
-                std::future::pending::<()>().await;
+                self.start_release.notified().await;
             }
         })
     }
@@ -293,6 +296,53 @@ async fn session_abort_cancels_a_real_starting_task_and_restores_idle() {
     ));
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
     assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_pending_work_caller_does_not_strand_trigger_mail() {
+    let probe = Arc::new(LifecycleProbe {
+        block_start: true,
+        ..Default::default()
+    });
+    let (session, _turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path should parse"),
+            AgentPath::root(),
+            Vec::new(),
+            "queued update".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+    let pending_work = tokio::spawn(
+        session.maybe_start_turn_for_pending_work_with_sub_id("cancelled-caller".to_string()),
+    );
+    wait_for(
+        &probe.start_entered,
+        "pending-work start callback should be entered before caller cancellation",
+    )
+    .await;
+    let generation = session
+        .active_turn
+        .lock()
+        .await
+        .starting_generation()
+        .expect("pending-work driver should own a starting generation");
+
+    abort_task(
+        pending_work,
+        "pending-work caller should be independently cancellable",
+    )
+    .await;
+    probe.start_release.notify_one();
+    assert_eq!(
+        wait_for_outcome(&generation, "detached pending-work start should commit").await,
+        TurnStartOutcome::Committed
+    );
+
+    assert!(!session.input_queue.has_trigger_turn_mailbox_items().await);
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
 #[tokio::test]

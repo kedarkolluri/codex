@@ -59,6 +59,7 @@ use finalization::PendingFinalization;
 use finalization::PendingFinalizationOutcome;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
+pub(crate) use start_transaction::TaskStartOutcome;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
@@ -313,6 +314,7 @@ impl Session {
     pub async fn on_task_finished(
         self: &Arc<Self>,
         generation: TurnGeneration,
+        automatic_start_ticket: Option<crate::session::AutomaticTurnStartTicket>,
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
@@ -559,8 +561,9 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
-        if cleared_active_turn {
-            self.maybe_start_turn_for_pending_work().await;
+        if cleared_active_turn && let Some(ticket) = automatic_start_ticket {
+            self.maybe_start_turn_for_pending_work_with_ticket(ticket)
+                .await;
         }
     }
 
