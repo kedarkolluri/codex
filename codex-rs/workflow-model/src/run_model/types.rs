@@ -23,6 +23,8 @@ pub struct WorkflowPhase {
     pub(super) state: WorkflowPhaseState,
     /// True only for the synthetic phase used when a script declares and calls no phases.
     pub(super) implicit: bool,
+    /// Topology roots in deterministic source order.
+    pub(super) root_node_ids: Vec<u64>,
 }
 
 impl WorkflowPhase {
@@ -40,6 +42,10 @@ impl WorkflowPhase {
 
     pub fn is_implicit(&self) -> bool {
         self.implicit
+    }
+
+    pub fn root_node_ids(&self) -> &[u64] {
+        &self.root_node_ids
     }
 }
 
@@ -70,6 +76,11 @@ pub enum WorkflowModelError {
     PhaseNotActive {
         phase_index: u64,
     },
+    NoActivePhase,
+    ActiveTopologyAtPhaseBoundary {
+        phase_index: u64,
+        node_id: u64,
+    },
     PhaseLimitExceeded {
         maximum: u64,
     },
@@ -87,6 +98,43 @@ pub enum WorkflowModelError {
     TooManyDeclaredPhases {
         maximum: usize,
         actual: usize,
+    },
+    UnexpectedTopologyId {
+        expected: u64,
+        actual: u64,
+    },
+    TopologyLimitExceeded {
+        maximum: u64,
+    },
+    DuplicateTopologyId {
+        node_id: u64,
+    },
+    MissingParent {
+        node_id: u64,
+        parent_node_id: u64,
+    },
+    ParentNotActive {
+        node_id: u64,
+        parent_node_id: u64,
+    },
+    ParentPhaseMismatch {
+        node_id: u64,
+        parent_node_id: u64,
+        phase_index: u64,
+        parent_phase_index: u64,
+    },
+    UnknownGroup {
+        group_id: u64,
+    },
+    GroupDefinitionMismatch {
+        group_id: u64,
+    },
+    ActiveChildAtGroupEnd {
+        group_id: u64,
+        node_id: u64,
+    },
+    NodeAlreadyCompleted {
+        node_id: u64,
     },
 }
 
@@ -121,6 +169,7 @@ impl fmt::Display for WorkflowModelError {
             Self::PhaseNotActive { phase_index } => {
                 write!(formatter, "workflow phase {phase_index} is not active")
             }
+            Self::NoActivePhase => formatter.write_str("workflow has no active phase"),
             Self::PhaseLimitExceeded { maximum } => {
                 write!(
                     formatter,
@@ -146,6 +195,19 @@ impl fmt::Display for WorkflowModelError {
                 formatter,
                 "workflow declares {actual} phases; maximum is {maximum}"
             ),
+            Self::ActiveTopologyAtPhaseBoundary { .. }
+            | Self::UnexpectedTopologyId { .. }
+            | Self::TopologyLimitExceeded { .. }
+            | Self::DuplicateTopologyId { .. }
+            | Self::MissingParent { .. }
+            | Self::ParentNotActive { .. }
+            | Self::ParentPhaseMismatch { .. }
+            | Self::UnknownGroup { .. }
+            | Self::GroupDefinitionMismatch { .. }
+            | Self::ActiveChildAtGroupEnd { .. }
+            | Self::NodeAlreadyCompleted { .. } => {
+                write!(formatter, "invalid workflow topology event: {self:?}")
+            }
         }
     }
 }
