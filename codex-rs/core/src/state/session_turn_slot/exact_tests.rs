@@ -116,8 +116,7 @@ async fn execution_guard_is_held_by_the_exact_lifecycle_until_completion() {
     };
     let generation = driver.generation();
     assert!(slot.cancel_start_exact(&generation, TurnAbortReason::Interrupted));
-    drop(driver);
-    assert!(slot.poison_abandoned_start(&generation));
+    assert!(slot.poison_abandoned_start(driver).is_ok());
     assert!(slot.reserve_taskless().is_none());
     assert_at_capacity(&control, &source);
 }

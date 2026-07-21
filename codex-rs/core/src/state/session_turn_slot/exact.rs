@@ -105,8 +105,11 @@ impl SessionTurnSlot {
     ) -> Result<TurnAbortReason, TurnStartDriver> {
         self.lifecycle.complete_cancelled_start(driver)
     }
-    pub(crate) fn poison_abandoned_start(&mut self, generation: &TurnGeneration) -> bool {
-        self.lifecycle.poison_abandoned_start(generation)
+    pub(crate) fn poison_abandoned_start(
+        &mut self,
+        driver: TurnStartDriver,
+    ) -> Result<(), TurnStartDriver> {
+        self.lifecycle.poison_abandoned_start(driver)
     }
     pub(crate) fn commit_start(
         &mut self,
