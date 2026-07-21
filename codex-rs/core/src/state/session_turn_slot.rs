@@ -71,6 +71,11 @@ impl SessionTurnSlot {
             .map(TurnGeneration::turn_state)
     }
 
+    #[allow(dead_code)] // Activated by the atomic task-start stage.
+    pub(crate) fn starting_generation(&self) -> Option<TurnGeneration> {
+        self.lifecycle.starting_generation().cloned()
+    }
+
     pub(crate) fn running_turn(&self) -> Option<RunningTurnRef<'_>> {
         let (generation, _turn_context, task) = self.lifecycle.running()?;
         Some(RunningTurnRef {

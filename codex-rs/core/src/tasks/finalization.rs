@@ -50,6 +50,19 @@ impl PendingFinalization {
             }
         }
     }
+
+    pub(super) async fn poison(mut self) {
+        let mut active_turn = self.session.active_turn.lock().await;
+        let Some(completion) = self.completion.take() else {
+            unreachable!("pending finalization must retain its authority");
+        };
+        let completion = active_turn.poison_abandoned_finalization(completion);
+        drop(active_turn);
+        if let Err(completion) = completion {
+            self.session.turn_start_gate.close();
+            drop(completion);
+        }
+    }
 }
 
 impl Drop for PendingFinalization {

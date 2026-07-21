@@ -106,6 +106,16 @@ async fn ordinary_completion_releases_the_exact_slot() {
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
 }
 
+#[tokio::test]
+async fn explicit_poison_keeps_the_exact_slot_fail_closed() {
+    let (session, generation, pending) = begin_pending_finalization().await;
+
+    pending.poison().await;
+
+    wait_for_lifecycle(&generation, "explicit poison should finish lifecycle").await;
+    assert!(!session.active_turn.lock().await.can_begin_fresh_start());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_finalization_off_runtime_uses_the_session_runtime() {
     let (session, generation, pending) = begin_pending_finalization().await;

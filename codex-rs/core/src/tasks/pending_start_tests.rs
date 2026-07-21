@@ -6,8 +6,11 @@ use std::time::Duration;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use pretty_assertions::assert_eq;
+use pretty_assertions::assert_ne;
 use tokio::sync::Notify;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use super::PendingTaskStart;
 use super::PendingTaskStartOutcome;
@@ -15,9 +18,13 @@ use super::PendingTaskStartRecovery;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
+use crate::state::RunningTask;
 use crate::state::SessionTurnAbortTransition;
+use crate::state::TaskKind;
 use crate::state::turn_lifecycle::TurnGeneration;
 use crate::state::turn_lifecycle::TurnStartOutcome;
+use crate::tasks::AnySessionTask;
+use crate::tasks::RegularTask;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -98,6 +105,21 @@ async fn begin_pending_start(
     PendingTaskStart::new(Arc::clone(session), Arc::clone(turn_context), driver)
 }
 
+fn running_task(turn_context: Arc<TurnContext>) -> RunningTask {
+    let handle = tokio::spawn(std::future::pending::<()>());
+    RunningTask {
+        done: Arc::new(Notify::new()),
+        handle: AbortOnDropHandle::new(handle),
+        kind: TaskKind::Regular,
+        task: Arc::new(RegularTask::new()) as Arc<dyn AnySessionTask>,
+        cancellation_token: CancellationToken::new(),
+        turn_context: Arc::clone(&turn_context),
+        turn_extension_data: Arc::clone(&turn_context.extension_data),
+        _agent_execution_guard: None,
+        _timer: None,
+    }
+}
+
 async fn enter_start_lifecycle(
     session: &Session,
     turn_context: &TurnContext,
@@ -135,6 +157,75 @@ async fn wait_for_outcome(generation: &TurnGeneration, message: &str) -> TurnSta
 }
 
 #[tokio::test]
+async fn commit_transfers_the_exact_task_and_lifecycle_progress() {
+    let probe = Arc::new(LifecycleProbe::default());
+    let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    let mut pending_start = begin_pending_start(&session, &turn_context).await;
+    let generation = pending_start.generation();
+    enter_start_lifecycle(&session, &turn_context, &mut pending_start).await;
+
+    let lifecycle_progress = {
+        let mut active_turn = session.active_turn.lock().await;
+        let Ok(lifecycle_progress) =
+            pending_start.commit(&mut active_turn, running_task(Arc::clone(&turn_context)))
+        else {
+            panic!("exact pending start should commit");
+        };
+        let running_turn = active_turn
+            .running_turn()
+            .expect("committed task should be running");
+        assert!(Arc::ptr_eq(
+            running_turn.turn_state(),
+            generation.turn_state()
+        ));
+        assert!(Arc::ptr_eq(
+            &running_turn.task().turn_context,
+            &turn_context
+        ));
+        lifecycle_progress
+    };
+
+    assert_eq!(
+        wait_for_outcome(&generation, "committed start should finish admission").await,
+        TurnStartOutcome::Committed
+    );
+    assert_ne!(lifecycle_progress, Default::default());
+    assert_eq!(probe.snapshot(), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn cancelled_commit_returns_the_task_and_usable_recovery_authority() {
+    let probe = Arc::new(LifecycleProbe::default());
+    let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    let mut pending_start = begin_pending_start(&session, &turn_context).await;
+    let generation = pending_start.generation();
+    enter_start_lifecycle(&session, &turn_context, &mut pending_start).await;
+    let (pending_start, task) = {
+        let mut active_turn = session.active_turn.lock().await;
+        assert!(active_turn.cancel_start_exact(&generation, TurnAbortReason::Replaced));
+        let Err((pending_start, task)) =
+            pending_start.commit(&mut active_turn, running_task(Arc::clone(&turn_context)))
+        else {
+            panic!("cancelled start must reject commit");
+        };
+        (pending_start, task)
+    };
+    assert!(Arc::ptr_eq(&task.turn_context, &turn_context));
+    drop(task);
+
+    assert_eq!(
+        pending_start.compensate().await,
+        PendingTaskStartOutcome::Cancelled(TurnAbortReason::Replaced)
+    );
+    assert_eq!(
+        wait_for_outcome(&generation, "rejected commit should compensate exactly").await,
+        TurnStartOutcome::Cancelled(TurnAbortReason::Replaced)
+    );
+    assert!(session.active_turn.lock().await.can_begin_fresh_start());
+    assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test]
 async fn ordinary_compensation_aborts_entered_callbacks_and_restores_idle() {
     let probe = Arc::new(LifecycleProbe::default());
     let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
@@ -158,6 +249,26 @@ async fn ordinary_compensation_aborts_entered_callbacks_and_restores_idle() {
         TurnStartOutcome::Cancelled(TurnAbortReason::Replaced)
     );
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
+    assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn explicit_poison_aborts_entered_callbacks_and_keeps_slot_closed() {
+    let probe = Arc::new(LifecycleProbe::default());
+    let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    let mut pending_start = begin_pending_start(&session, &turn_context).await;
+    let generation = pending_start.generation();
+    enter_start_lifecycle(&session, &turn_context, &mut pending_start).await;
+
+    assert_eq!(
+        pending_start.poison().await,
+        PendingTaskStartOutcome::Poisoned
+    );
+    assert_eq!(
+        wait_for_outcome(&generation, "poisoned start should finish").await,
+        TurnStartOutcome::Poisoned(TurnAbortReason::Interrupted)
+    );
+    assert!(!session.active_turn.lock().await.can_begin_fresh_start());
     assert_eq!(probe.snapshot(), (1, 1, 1));
 }
 
