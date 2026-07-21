@@ -15,6 +15,7 @@ use codex_protocol::protocol::WorkflowRunTerminalReason;
 
 mod agent_lifecycle;
 mod agent_topology;
+mod aggregate;
 mod phase_lifecycle;
 mod topology;
 mod topology_types;
@@ -24,6 +25,7 @@ pub use topology_types::WorkflowAgent;
 pub use topology_types::WorkflowGroup;
 pub use topology_types::WorkflowNodeState;
 pub use topology_types::WorkflowTopologyNode;
+pub use types::WorkflowAggregate;
 pub use types::WorkflowModelError;
 pub use types::WorkflowPhase;
 pub use types::WorkflowPhaseState;
@@ -49,6 +51,7 @@ pub struct WorkflowRunModel {
     terminal_reason: Option<WorkflowRunTerminalReason>,
     phases: Vec<WorkflowPhase>,
     topology: BTreeMap<u64, WorkflowTopologyNode>,
+    aggregate: WorkflowAggregate,
     active_phase_index: Option<u64>,
     next_phase_index: u64,
     next_topology_id: u64,
@@ -105,6 +108,10 @@ impl WorkflowRunModel {
     /// Topology keyed by the contiguous shared group/agent ID, which is also source order.
     pub fn topology(&self) -> &BTreeMap<u64, WorkflowTopologyNode> {
         &self.topology
+    }
+
+    pub fn aggregate(&self) -> &WorkflowAggregate {
+        &self.aggregate
     }
 
     /// Staging seam for the ordered reducer. Stage 05d makes the reducer public only after every
@@ -216,6 +223,7 @@ impl WorkflowRunModel {
                 state: WorkflowPhaseState::Active,
                 implicit: true,
                 root_node_ids: Vec::new(),
+                aggregate: WorkflowAggregate::default(),
             }]
         } else {
             event
@@ -231,6 +239,7 @@ impl WorkflowRunModel {
                         state: WorkflowPhaseState::Pending,
                         implicit: false,
                         root_node_ids: Vec::new(),
+                        aggregate: WorkflowAggregate::default(),
                     })
                 })
                 .collect::<Result<Vec<_>, WorkflowModelError>>()?
@@ -247,6 +256,7 @@ impl WorkflowRunModel {
             terminal_reason: None,
             phases,
             topology: BTreeMap::new(),
+            aggregate: WorkflowAggregate::default(),
             active_phase_index,
             next_phase_index: 0,
             next_topology_id: 0,
@@ -292,3 +302,7 @@ mod agent_topology_tests;
 #[cfg(test)]
 #[path = "run_model_agent_lifecycle_tests.rs"]
 mod agent_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "run_model_aggregate_tests.rs"]
+mod aggregate_tests;

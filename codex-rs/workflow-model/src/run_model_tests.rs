@@ -52,6 +52,7 @@ fn run_begin_seeds_every_declared_phase_pending() {
                 ),
             ],
             topology: BTreeMap::new(),
+            aggregate: WorkflowAggregate::default(),
             active_phase_index: None,
             next_phase_index: 0,
             next_topology_id: 0,
@@ -82,6 +83,7 @@ fn empty_phase_list_seeds_one_active_implicit_root() {
                 /*implicit*/ true,
             )],
             topology: BTreeMap::new(),
+            aggregate: WorkflowAggregate::default(),
             active_phase_index: Some(0),
             next_phase_index: 0,
             next_topology_id: 0,
@@ -273,5 +275,6 @@ fn phase(index: u64, title: &str, state: WorkflowPhaseState, implicit: bool) -> 
         state,
         implicit,
         root_node_ids: Vec::new(),
+        aggregate: WorkflowAggregate::default(),
     }
 }
