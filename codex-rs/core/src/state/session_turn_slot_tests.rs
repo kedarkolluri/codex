@@ -13,7 +13,7 @@ use crate::state::TaskKind;
 use crate::tasks::AnySessionTask;
 use crate::tasks::RegularTask;
 
-fn running_task(turn_context: Arc<TurnContext>) -> RunningTask {
+pub(super) fn running_task(turn_context: Arc<TurnContext>) -> RunningTask {
     let handle = tokio::spawn(std::future::pending::<()>());
     RunningTask {
         done: Arc::new(Notify::new()),
@@ -117,7 +117,7 @@ async fn targeted_abort_removes_only_the_matching_running_turn() {
     slot.install_running_task_for_legacy_start(running_task(turn_context));
 
     assert!(slot.take_running_turn_for_abort("other-turn").is_none());
-    assert!(slot.running_turn().is_some());
+    assert!(slot.begin_running_finalization_for_turn(&turn_id).is_none());
     let active_turn = slot
         .take_running_turn_for_abort(&turn_id)
         .expect("matching running turn should be removed");
