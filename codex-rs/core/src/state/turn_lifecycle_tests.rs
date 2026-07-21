@@ -148,6 +148,44 @@ async fn abandoned_start_driver_publishes_poison_and_leaves_slot_fail_closed() {
 }
 
 #[tokio::test]
+async fn abandoned_finalization_authority_finishes_lifecycle_and_leaves_slot_fail_closed() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let mut slot = TurnLifecycleSlot::<String, TestTask>::default();
+    let driver = slot.start("held lease".to_string()).expect("idle slot");
+    let generation = driver.generation();
+    assert!(
+        slot.commit_start(driver, TestTask(Arc::clone(&turn_context), "task"))
+            .is_ok()
+    );
+    let (_task, finalization) = slot
+        .begin_finalization(&generation, &turn_context)
+        .expect("exact owner should finalize");
+
+    drop(finalization);
+
+    generation.wait_lifecycle_finished().await;
+    assert!(
+        slot.finalizing_generation()
+            .is_some_and(|current| current.matches(&generation))
+    );
+    let Err(replacement) = slot
+        .install_running_task_for_legacy(TestTask(Arc::clone(&turn_context), "replacement task"))
+    else {
+        panic!("abandoned finalization must not be reopened by a legacy install");
+    };
+    assert_eq!(replacement.1, "replacement task");
+    assert!(
+        slot.finalizing_generation()
+            .is_some_and(|current| current.matches(&generation))
+    );
+    let Err(lease) = slot.start("successor lease".to_string()) else {
+        panic!("abandoned finalization must leave the slot fail closed");
+    };
+    assert_eq!(lease, "successor lease");
+}
+
+#[tokio::test]
 async fn cancelled_start_is_non_committable_until_compensated() {
     let (_session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);

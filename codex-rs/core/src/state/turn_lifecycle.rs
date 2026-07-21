@@ -4,6 +4,8 @@ use crate::state::TurnState;
 use codex_protocol::protocol::TurnAbortReason;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -167,7 +169,20 @@ impl TurnOwner {
 /// Exact authority to finish or poison one finalizing generation.
 #[must_use = "a finalizing turn must be completed or poisoned"]
 pub(crate) struct TurnFinalization {
-    token: Arc<()>,
+    token: Arc<AtomicBool>,
+    generation: TurnGeneration,
+}
+
+impl Drop for TurnFinalization {
+    fn drop(&mut self) {
+        if self
+            .token
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            self.generation.finish_lifecycle();
+        }
+    }
 }
 enum TurnLifecycleState<L, R> {
     Idle,
@@ -183,7 +198,7 @@ enum TurnLifecycleState<L, R> {
     Finalizing {
         owner: TurnOwner,
         lease: L,
-        token: Arc<()>,
+        token: Arc<AtomicBool>,
     },
     Poisoned {
         _generation: TurnGeneration,
@@ -265,7 +280,13 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             owner.turn_context = turn_context;
             return Ok(Some(std::mem::replace(running_task, task)));
         }
-        if !matches!(self.state, TurnLifecycleState::Finalizing { .. }) {
+        let TurnLifecycleState::Finalizing { token, .. } = &self.state else {
+            return Err(task);
+        };
+        if token
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
             return Err(task);
         }
         let TurnLifecycleState::Finalizing {
@@ -465,9 +486,10 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         else {
             unreachable!("running state was authenticated before replacement");
         };
-        let token = Arc::new(());
+        let token = Arc::new(AtomicBool::new(true));
         let finalization = TurnFinalization {
             token: Arc::clone(&token),
+            generation: owner.generation.clone(),
         };
         self.state = TurnLifecycleState::Finalizing {
             owner,
@@ -481,7 +503,12 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         &mut self,
         finalization: TurnFinalization,
     ) -> Result<(), TurnFinalization> {
-        if !self.authenticate_finalization(&finalization) {
+        if !self.authenticate_finalization(&finalization)
+            || finalization
+                .token
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             return Err(finalization);
         }
         let TurnLifecycleState::Finalizing { owner, lease, .. } =
@@ -498,7 +525,12 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         &mut self,
         finalization: TurnFinalization,
     ) -> Result<(), TurnFinalization> {
-        if !self.authenticate_finalization(&finalization) {
+        if !self.authenticate_finalization(&finalization)
+            || finalization
+                .token
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
             return Err(finalization);
         }
         self.poison_current_finalization();
@@ -522,11 +554,15 @@ impl<L, R> TurnLifecycleSlot<L, R> {
     }
 
     fn poison_current_finalization(&mut self) {
-        let TurnLifecycleState::Finalizing { owner, lease, .. } =
-            std::mem::replace(&mut self.state, TurnLifecycleState::Idle)
+        let TurnLifecycleState::Finalizing {
+            owner,
+            lease,
+            token,
+        } = std::mem::replace(&mut self.state, TurnLifecycleState::Idle)
         else {
             unreachable!("finalizing state was authenticated before replacement");
         };
+        token.store(false, Ordering::Release);
         let lifecycle_generation = owner.generation.clone();
         self.state = TurnLifecycleState::Poisoned {
             _generation: owner.generation,
