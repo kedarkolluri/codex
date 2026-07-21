@@ -1,6 +1,6 @@
 use crate::session::turn_context::TurnContext;
-use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
+use crate::state::SessionTurnSlot;
 use crate::state::TurnState;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
@@ -148,29 +148,25 @@ impl InputQueue {
 
     pub(crate) async fn turn_state_for_sub_id(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
         sub_id: &str,
     ) -> Option<Arc<Mutex<TurnState>>> {
         let active = active_turn.lock().await;
-        active.as_ref().and_then(|active_turn| {
-            active_turn
-                .task
-                .as_ref()
-                .is_some_and(|task| task.turn_context.sub_id == sub_id)
-                .then(|| Arc::clone(&active_turn.turn_state))
-        })
+        let running_turn = active.running_turn()?;
+        (running_turn.task().turn_context.sub_id == sub_id)
+            .then(|| Arc::clone(running_turn.turn_state()))
     }
 
     /// Clear any pending waiters and input buffered for the current turn.
-    pub(crate) async fn clear_pending(&self, active_turn: &ActiveTurn) {
-        let mut turn_state = active_turn.turn_state.lock().await;
+    pub(crate) async fn clear_pending(&self, turn_state: &Mutex<TurnState>) {
+        let mut turn_state = turn_state.lock().await;
         turn_state.clear_pending_waiters();
         turn_state.pending_input.items.clear();
     }
 
     pub(crate) async fn defer_mailbox_delivery_to_next_turn(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
         sub_id: &str,
     ) {
         let turn_state = self.turn_state_for_sub_id(active_turn, sub_id).await;
@@ -193,7 +189,7 @@ impl InputQueue {
 
     pub(crate) async fn accept_mailbox_delivery_for_current_turn(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
         sub_id: &str,
     ) {
         let turn_state = self.turn_state_for_sub_id(active_turn, sub_id).await;
@@ -248,13 +244,13 @@ impl InputQueue {
     )]
     pub(crate) async fn get_pending_input(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
     ) -> Vec<TurnInput> {
         let (pending_input, accepts_mailbox_delivery) = {
-            let mut active = active_turn.lock().await;
-            match active.as_mut() {
-                Some(active_turn) => {
-                    let mut turn_state = active_turn.turn_state.lock().await;
+            let active = active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut turn_state = turn_state.lock().await;
                     let accepts_mailbox_delivery =
                         turn_state.accepts_mailbox_delivery_for_current_turn();
                     let pending_input = if accepts_mailbox_delivery {
@@ -284,12 +280,12 @@ impl InputQueue {
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state reads must remain atomic"
     )]
-    pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<Option<ActiveTurn>>) -> bool {
+    pub(crate) async fn has_pending_input(&self, active_turn: &Mutex<SessionTurnSlot>) -> bool {
         let (has_turn_pending_input, accepts_mailbox_delivery) = {
             let active = active_turn.lock().await;
-            match active.as_ref() {
-                Some(active_turn) => {
-                    let turn_state = active_turn.turn_state.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let turn_state = turn_state.lock().await;
                     (
                         !turn_state.pending_input.items.is_empty(),
                         turn_state.accepts_mailbox_delivery_for_current_turn(),

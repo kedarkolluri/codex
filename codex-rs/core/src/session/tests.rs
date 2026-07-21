@@ -78,7 +78,7 @@ use tracing::Span;
 
 use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
-use crate::state::ActiveTurn;
+use crate::state::SessionTurnSlot;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -3718,7 +3718,11 @@ async fn thread_rollback_fails_when_turn_in_progress() {
     sess.record_conversation_items(tc.as_ref(), &initial_context)
         .await;
 
-    *sess.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    sess.active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     handlers::thread_rollback(&sess, "sub-1".to_string(), /*num_turns*/ 1).await;
 
     let error_event = wait_for_thread_rollback_failed(&rx).await;
@@ -5492,7 +5496,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
-        active_turn: Mutex::new(None),
+        active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
@@ -5919,7 +5923,12 @@ async fn resumed_subagent_session_restores_persisted_session_id() {
 #[tokio::test]
 async fn notify_request_permissions_response_ignores_unmatched_call_id() {
     let (session, _turn_context) = make_session_and_context().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
 
     session
         .notify_request_permissions_response(
@@ -5948,13 +5957,23 @@ async fn notify_request_permissions_response_ignores_unmatched_call_id() {
 #[tokio::test]
 async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
     let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
-
-    let current_active_turn = ActiveTurn::default();
-    let current_turn_state = Arc::clone(&current_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(current_active_turn);
+    let (originating_turn_state, current_turn_state) = {
+        let mut active_turn = session.active_turn.lock().await;
+        let originating_turn_state = Arc::clone(
+            active_turn
+                .reserve_taskless()
+                .expect("session should be idle"),
+        );
+        let _ = active_turn
+            .take_for_legacy_abort()
+            .expect("taskless reservation should be active");
+        let current_turn_state = Arc::clone(
+            active_turn
+                .reserve_taskless()
+                .expect("session should be idle after displacement"),
+        );
+        (originating_turn_state, current_turn_state)
+    };
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -5999,9 +6018,14 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
 #[tokio::test]
 async fn request_permission_grants_are_environment_keyed() {
     let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let originating_turn_state = {
+        let mut active_turn = session.active_turn.lock().await;
+        Arc::clone(
+            active_turn
+                .reserve_taskless()
+                .expect("session should be idle"),
+        )
+    };
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -6052,9 +6076,14 @@ async fn request_permission_grants_are_environment_keyed() {
 #[tokio::test]
 async fn enable_strict_auto_review_for_turn_uses_originating_turn() {
     let (session, _turn_context) = make_session_and_context().await;
-    let originating_active_turn = ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&originating_active_turn.turn_state);
-    *session.active_turn.lock().await = Some(originating_active_turn);
+    let originating_turn_state = {
+        let mut active_turn = session.active_turn.lock().await;
+        Arc::clone(
+            active_turn
+                .reserve_taskless()
+                .expect("session should be idle"),
+        )
+    };
 
     let requested_permissions = RequestPermissionProfile {
         network: Some(codex_protocol::models::NetworkPermissions {
@@ -6114,7 +6143,12 @@ fn strict_auto_review_session_scope_grants_no_permissions() {
 #[tokio::test]
 async fn request_permissions_emits_event_when_granular_policy_allows_requests() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     Arc::get_mut(&mut turn_context)
         .expect("single thread settings ref")
         .approval_policy
@@ -6203,7 +6237,12 @@ async fn request_permissions_emits_event_when_granular_policy_allows_requests() 
 #[tokio::test]
 async fn request_permissions_tool_resolves_relative_paths_against_selected_environment() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let environment_cwd = {
         #[allow(deprecated)]
         let legacy_cwd = turn_context.cwd.clone();
@@ -6356,7 +6395,12 @@ async fn request_permissions_tool_rejects_unknown_environment_id() {
 #[tokio::test]
 async fn request_permissions_response_materializes_session_cwd_grants_before_recording() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     Arc::get_mut(&mut turn_context)
         .expect("single thread settings ref")
         .approval_policy
@@ -6466,7 +6510,12 @@ async fn request_permissions_response_materializes_session_cwd_grants_before_rec
 #[tokio::test]
 async fn request_permissions_is_auto_denied_when_granular_policy_blocks_tool_requests() {
     let (session, mut turn_context, rx) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     Arc::get_mut(&mut turn_context)
         .expect("single thread settings ref")
         .approval_policy
@@ -7763,7 +7812,7 @@ where
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
-        active_turn: Mutex::new(None),
+        active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
@@ -9973,7 +10022,7 @@ async fn task_finish_emits_thread_idle_lifecycle_after_active_turn_clears() {
         .expect("thread idle lifecycle")
         .expect("idle receiver open");
     assert_eq!(1, calls.load(std::sync::atomic::Ordering::SeqCst));
-    assert!(session.active_turn.lock().await.is_none());
+    assert!(session.active_turn.lock().await.is_idle());
 }
 
 #[tokio::test]
@@ -10063,7 +10112,7 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
 
     assert_eq!(TryStartTurnIfIdleRejectionReason::PlanMode, err.reason());
     assert_eq!(vec![item], err.into_input());
-    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.active_turn.lock().await.is_idle());
     assert_eq!(
         Vec::<TurnInput>::new(),
         sess.input_queue.get_pending_input(&sess.active_turn).await
@@ -10094,7 +10143,7 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
         err.reason()
     );
     assert_eq!(vec![item], err.into_input());
-    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.active_turn.lock().await.is_idle());
     assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
 }
 
@@ -10294,8 +10343,7 @@ async fn abort_empty_active_turn_preserves_pending_input() {
     };
     let turn_state = {
         let mut active = sess.active_turn.lock().await;
-        let active_turn = active.get_or_insert_with(ActiveTurn::default);
-        Arc::clone(&active_turn.turn_state)
+        Arc::clone(active.reserve_taskless().expect("session should be idle"))
     };
     sess.input_queue
         .extend_pending_input_for_turn_state(
@@ -10306,7 +10354,7 @@ async fn abort_empty_active_turn_preserves_pending_input() {
 
     sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 
-    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.active_turn.lock().await.is_idle());
     assert_eq!(
         sess.input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())

@@ -46,7 +46,7 @@ impl AgentControl {
         }
         let state = self.upgrade()?;
         let thread = state.get_thread(thread_id).await?;
-        if thread.session.active_turn.lock().await.is_some() {
+        if thread.session.active_turn.lock().await.has_active_turn() {
             return Ok(());
         }
         let config = thread.session.get_config().await;

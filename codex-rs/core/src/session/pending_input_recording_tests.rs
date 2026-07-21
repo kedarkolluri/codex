@@ -20,10 +20,10 @@ fn response_item(text: &str) -> ResponseItem {
 async fn active_turn_state(session: &Session) -> Arc<Mutex<TurnState>> {
     let active = session.active_turn.lock().await;
     Arc::clone(
-        &active
-            .as_ref()
-            .expect("test task should own the active turn")
-            .turn_state,
+        active
+            .running_turn()
+            .expect("test task should own the running turn")
+            .turn_state(),
     )
 }
 
@@ -214,29 +214,14 @@ async fn pending_input_claim_failure_retains_exact_turn_ownership() {
     let other_turn = session
         .new_default_turn_with_sub_id(turn_context.sub_id.clone())
         .await;
-    {
-        let mut active = session.active_turn.lock().await;
-        let running = active
-            .as_mut()
-            .and_then(|active| active.task.as_mut())
-            .expect("the original task should still be running");
-        running.turn_context = Arc::clone(&other_turn);
-    }
+    let turn_state = active_turn_state(&session).await;
     assert!(matches!(
         session
             .input_queue
-            .claim_pending_input_for_turn(&session.active_turn, &other_turn)
+            .claim_pending_input_for_displaced_turn(&turn_state, &other_turn)
             .await,
         PendingInputClaim::Inactive
     ));
-    {
-        let mut active = session.active_turn.lock().await;
-        let running = active
-            .as_mut()
-            .and_then(|active| active.task.as_mut())
-            .expect("the original task should still be running");
-        running.turn_context = Arc::clone(&turn_context);
-    }
 
     drop(completion);
     assert_eq!(

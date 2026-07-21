@@ -91,7 +91,12 @@ async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     turn_context_raw
         .approval_policy
         .set(AskForApproval::OnRequest)
@@ -178,7 +183,12 @@ async fn request_permissions_guardian_review_stops_when_cancelled() {
     .await;
 
     let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let turn_context_raw = Arc::get_mut(&mut turn_context).expect("single turn context ref");
     turn_context_raw
         .approval_policy
@@ -392,9 +402,14 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
     .await;
 
     let (mut session, mut turn_context_raw) = make_session_and_context().await;
-    let active_turn = crate::state::ActiveTurn::default();
-    let originating_turn_state = Arc::clone(&active_turn.turn_state);
-    *session.active_turn.lock().await = Some(active_turn);
+    let originating_turn_state = {
+        let mut active_turn = session.active_turn.lock().await;
+        Arc::clone(
+            active_turn
+                .reserve_taskless()
+                .expect("session should be idle"),
+        )
+    };
     session
         .record_granted_request_permissions_for_turn(
             &RequestPermissionsResponse {
@@ -590,21 +605,22 @@ async fn process_compacted_history_preserves_separate_guardian_developer_message
 
 #[tokio::test]
 #[cfg(unix)]
-#[expect(
-    clippy::await_holding_invalid_type,
-    reason = "test mutates active turn state directly to seed granted permissions"
-)]
 async fn shell_command_allows_sticky_turn_permissions_without_inline_request_permissions_feature() {
     let (mut session, turn_context_raw) = make_session_and_context().await;
     session
         .features
         .enable(Feature::RequestPermissionsTool)
         .expect("test setup should allow enabling request permissions tool");
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
     {
-        let mut active_turn = session.active_turn.lock().await;
-        let active_turn = active_turn.as_mut().expect("active turn");
-        let mut turn_state = active_turn.turn_state.lock().await;
+        let turn_state = {
+            let mut active_turn = session.active_turn.lock().await;
+            Arc::clone(
+                active_turn
+                    .reserve_taskless()
+                    .expect("session should be idle"),
+            )
+        };
+        let mut turn_state = turn_state.lock().await;
         turn_state.record_granted_permissions(
             codex_exec_server::LOCAL_ENVIRONMENT_ID,
             PermissionProfile {

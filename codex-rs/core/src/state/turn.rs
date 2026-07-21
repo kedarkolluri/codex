@@ -28,8 +28,8 @@ use codex_protocol::protocol::TokenUsage;
 
 /// Metadata about the currently running turn.
 pub(crate) struct ActiveTurn {
-    pub(crate) task: Option<RunningTask>,
-    pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    task: Option<RunningTask>,
+    turn_state: Arc<Mutex<TurnState>>,
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -59,6 +59,28 @@ impl Default for ActiveTurn {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
         }
+    }
+}
+
+impl ActiveTurn {
+    pub(super) fn running_task(&self) -> Option<&RunningTask> {
+        self.task.as_ref()
+    }
+
+    pub(super) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
+        &self.turn_state
+    }
+
+    pub(super) fn install_running_task(&mut self, task: RunningTask) {
+        self.task = Some(task);
+    }
+
+    pub(crate) fn take_running_task(&mut self) -> Option<RunningTask> {
+        self.task.take()
+    }
+
+    pub(crate) fn into_turn_state(self) -> Arc<Mutex<TurnState>> {
+        self.turn_state
     }
 }
 

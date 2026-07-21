@@ -11,7 +11,7 @@ impl InputQueue {
     #[allow(dead_code)] // Used by the next stacked runtime activation change.
     pub(crate) async fn claim_pending_input_for_turn(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
         turn_context: &Arc<TurnContext>,
     ) -> PendingInputClaim {
         self.claim_pending_input_for_active_turn(
@@ -26,7 +26,7 @@ impl InputQueue {
     #[allow(dead_code)] // Used by the next stacked runtime activation change.
     pub(crate) async fn claim_pending_input_for_finalizing_turn(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
         turn_context: &Arc<TurnContext>,
     ) -> PendingInputClaim {
         self.claim_pending_input_for_active_turn(
@@ -65,20 +65,18 @@ impl InputQueue {
     )]
     async fn claim_pending_input_for_active_turn(
         &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
+        active_turn: &Mutex<SessionTurnSlot>,
         turn_context: &Arc<TurnContext>,
         phase: ActiveTurnClaimPhase,
     ) -> PendingInputClaim {
         let active = active_turn.lock().await;
-        let Some(active_turn) = active.as_ref().filter(|active_turn| {
-            active_turn
-                .task
-                .as_ref()
-                .is_some_and(|task| Arc::ptr_eq(&task.turn_context, turn_context))
-        }) else {
+        let Some(running_turn) = active
+            .running_turn()
+            .filter(|running_turn| Arc::ptr_eq(&running_turn.task().turn_context, turn_context))
+        else {
             return PendingInputClaim::Inactive;
         };
-        let turn_state = Arc::clone(&active_turn.turn_state);
+        let turn_state = Arc::clone(running_turn.turn_state());
         let mut state = turn_state.lock().await;
         if let Some(recording) = state.pending_input.recording.as_ref() {
             return if recording.matches_turn(turn_context) {

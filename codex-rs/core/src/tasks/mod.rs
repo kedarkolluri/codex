@@ -353,9 +353,8 @@ impl Session {
         let pending_items = self.input_queue.get_pending_input(&self.active_turn).await;
         let turn_state = {
             let mut active = self.active_turn.lock().await;
-            let turn = active.get_or_insert_with(ActiveTurn::default);
-            debug_assert!(turn.task.is_none());
-            Arc::clone(&turn.turn_state)
+            let turn_state = active.reserve_taskless_for_legacy_start();
+            Arc::clone(turn_state)
         };
         turn_state.lock().await.token_usage_at_turn_start = token_usage_at_turn_start.clone();
         self.input_queue
@@ -366,8 +365,6 @@ impl Session {
 
         let turn_extension_data = Arc::clone(&turn_context.extension_data);
         let mut active = self.active_turn.lock().await;
-        let turn = active.get_or_insert_with(ActiveTurn::default);
-        debug_assert!(turn.task.is_none());
         let agent_execution_guard = self.services.agent_control.execution_guard(
             turn_context.multi_agent_version,
             &turn_context.session_source,
@@ -448,7 +445,7 @@ impl Session {
             _agent_execution_guard: agent_execution_guard,
             _timer: timer,
         };
-        turn.task = Some(running_task);
+        active.install_running_task_for_legacy_start(running_task);
     }
 
     /// Starts a regular turn when the session is idle and pending work is waiting.
@@ -481,10 +478,12 @@ impl Session {
 
         {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            if active_turn.has_active_turn() {
                 return;
             }
-            *active_turn = Some(ActiveTurn::default());
+            let Some(_) = active_turn.reserve_taskless() else {
+                unreachable!("idle turn slot must accept a taskless reservation");
+            };
         }
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
@@ -496,17 +495,17 @@ impl Session {
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {
         let mut aborted_turn = false;
-        let mut active_turn_to_clear = None;
+        let mut turn_state_to_clear = None;
         let mut turn_context = None;
         if let Some(mut active_turn) = self.take_active_turn().await {
-            let task = active_turn.task.take();
+            let task = active_turn.take_running_task();
             aborted_turn = task.is_some();
             turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
             if let Some(task) = task {
                 self.handle_task_abort(task, reason.clone()).await;
             }
             if aborted_turn {
-                active_turn_to_clear = Some(active_turn);
+                turn_state_to_clear = Some(active_turn.into_turn_state());
             }
         }
 
@@ -514,10 +513,10 @@ impl Session {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
         }
-        if let Some(active_turn) = active_turn_to_clear {
+        if let Some(turn_state) = turn_state_to_clear {
             // Let interrupted tasks observe cancellation before dropping pending approvals, or an
             // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-            self.input_queue.clear_pending(&active_turn).await;
+            self.input_queue.clear_pending(turn_state.as_ref()).await;
         }
         if reason == TurnAbortReason::Interrupted && aborted_turn {
             self.maybe_start_turn_for_pending_work().await;
@@ -531,21 +530,13 @@ impl Session {
     ) -> bool {
         let active_turn = {
             let mut active = self.active_turn.lock().await;
-            if active
-                .as_ref()
-                .and_then(|active_turn| active_turn.task.as_ref())
-                .is_some_and(|task| task.turn_context.sub_id == turn_id)
-            {
-                active.take()
-            } else {
-                None
-            }
+            active.take_running_turn_for_abort(turn_id)
         };
         let Some(mut active_turn) = active_turn else {
             return false;
         };
 
-        let task = active_turn.task.take();
+        let task = active_turn.take_running_task();
         let turn_context = task.as_ref().map(|task| Arc::clone(&task.turn_context));
         if let Some(task) = task {
             self.handle_task_abort(task, reason.clone()).await;
@@ -556,7 +547,8 @@ impl Session {
         }
         // Let interrupted tasks observe cancellation before dropping pending approvals, or an
         // in-flight approval wait can surface as a model-visible rejection before TurnAborted.
-        self.input_queue.clear_pending(&active_turn).await;
+        let turn_state = active_turn.into_turn_state();
+        self.input_queue.clear_pending(turn_state.as_ref()).await;
 
         if reason == TurnAbortReason::Interrupted {
             self.maybe_start_turn_for_pending_work().await;
@@ -584,11 +576,12 @@ impl Session {
 
         let turn_state = {
             let mut active = self.active_turn.lock().await;
-            active.as_mut().and_then(|active_turn| {
-                let task = active_turn.task.take()?;
-                task.handle.detach();
-                Some(Arc::clone(&active_turn.turn_state))
-            })
+            active
+                .take_running_task_for_legacy_finish()
+                .map(|(task, turn_state)| {
+                    task.handle.detach();
+                    turn_state
+                })
         };
         let Some(turn_state) = turn_state else {
             return;
@@ -805,15 +798,7 @@ impl Session {
 
         let cleared_active_turn = {
             let mut active = self.active_turn.lock().await;
-            if let Some(active_turn) = active.as_ref()
-                && active_turn.task.is_none()
-                && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            {
-                *active = None;
-                true
-            } else {
-                false
-            }
+            active.clear_legacy_finished_exact_state(&turn_state)
         };
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
@@ -830,7 +815,7 @@ impl Session {
 
     async fn take_active_turn(&self) -> Option<ActiveTurn> {
         let mut active = self.active_turn.lock().await;
-        active.take()
+        active.take_for_legacy_abort()
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {

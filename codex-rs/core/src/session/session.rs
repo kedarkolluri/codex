@@ -10,7 +10,7 @@ use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
-use crate::state::ActiveTurn;
+use crate::state::SessionTurnSlot;
 use codex_extension_api::ExtensionDataInit;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_protocol::SessionId;
@@ -45,7 +45,7 @@ pub(crate) struct Session {
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
-    pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    pub(crate) active_turn: Mutex<SessionTurnSlot>,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(super) turn_admissions: Arc<TurnAdmissionRegistry>,
@@ -1172,7 +1172,7 @@ impl Session {
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
-                active_turn: Mutex::new(None),
+                active_turn: Mutex::new(SessionTurnSlot::default()),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 turn_admissions: Arc::new(TurnAdmissionRegistry::default()),

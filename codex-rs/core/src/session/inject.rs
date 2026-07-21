@@ -3,7 +3,6 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
-use crate::state::ActiveTurn;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
 use codex_protocol::config_types::ModeKind;
@@ -20,12 +19,12 @@ impl Session {
         &self,
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
-        let mut active = self.active_turn.lock().await;
-        match active.as_mut() {
-            Some(active_turn) => {
+        let active = self.active_turn.lock().await;
+        match active.current_turn_state() {
+            Some(turn_state) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                        active_turn.turn_state.as_ref(),
+                        turn_state.as_ref(),
                         input.into_iter().map(TurnInput::ResponseItem).collect(),
                     )
                     .await;
@@ -64,14 +63,16 @@ impl Session {
 
         let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
-            if active_turn.is_some() {
+            if active_turn.has_active_turn() {
                 return Err(TryStartTurnIfIdleError::new(
                     TryStartTurnIfIdleRejectionReason::Busy,
                     input,
                 ));
             }
-            let active_turn = active_turn.get_or_insert_with(ActiveTurn::default);
-            Arc::clone(&active_turn.turn_state)
+            let Some(turn_state) = active_turn.reserve_taskless() else {
+                unreachable!("idle turn slot must accept a taskless reservation");
+            };
+            Arc::clone(turn_state)
         };
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
@@ -106,9 +107,10 @@ impl Session {
         }
         let still_reserved = {
             let active_turn = self.active_turn.lock().await;
-            active_turn.as_ref().is_some_and(|active_turn| {
-                active_turn.task.is_none() && Arc::ptr_eq(&active_turn.turn_state, &turn_state)
-            })
+            active_turn.running_turn().is_none()
+                && active_turn
+                    .current_turn_state()
+                    .is_some_and(|active_state| Arc::ptr_eq(active_state, &turn_state))
         };
         if !still_reserved {
             self.clear_reserved_idle_turn(&turn_state).await;
@@ -131,12 +133,7 @@ impl Session {
 
     async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
         let mut active_turn_guard = self.active_turn.lock().await;
-        if let Some(active_turn) = active_turn_guard.as_ref()
-            && active_turn.task.is_none()
-            && Arc::ptr_eq(&active_turn.turn_state, turn_state)
-        {
-            *active_turn_guard = None;
-        }
+        active_turn_guard.clear_taskless_exact_state(turn_state);
     }
 
     /// Injects items into active work, or records them without starting a turn.
