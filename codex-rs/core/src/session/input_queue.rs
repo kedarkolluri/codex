@@ -88,7 +88,6 @@ pub(crate) struct InputQueue {
 /// Both source and destination remain locked until activation commits. Dropping
 /// this guard removes the exact appended suffix and restores drained mailbox
 /// messages in FIFO order.
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 #[must_use = "prepared turn input must be committed or rolled back"]
 pub(crate) struct PreparedStartingTurnInput<'a> {
     activity_tx: &'a watch::Sender<InputQueueActivity>,
@@ -99,8 +98,8 @@ pub(crate) struct PreparedStartingTurnInput<'a> {
     committed: bool,
 }
 
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 impl PreparedStartingTurnInput<'_> {
+    #[allow(dead_code)] // Used by the automatic-start activation stages.
     pub(crate) fn has_trigger_turn_mailbox_items(&self) -> bool {
         self.turn_state.pending_input.items[self.original_pending_len + self.explicit_pending_len..]
             .iter()
@@ -295,7 +294,6 @@ impl InputQueue {
     }
 
     /// Prepares explicit and mailbox input for one admitted task start.
-    #[allow(dead_code)] // Activated by the atomic task-start stage.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "turn-state and mailbox attachment must remain atomic for rollback or commit"
