@@ -30,7 +30,12 @@ impl WorkflowRunModel {
             .ok_or(WorkflowModelError::UnknownGroup {
                 group_id: event.group_id,
             })?;
-        let WorkflowTopologyNode::Group(group) = node;
+        let WorkflowTopologyNode::Group(group) = node else {
+            return Err(WorkflowModelError::TopologyKindMismatch {
+                node_id: event.group_id,
+                expected: "group",
+            });
+        };
         if group.state == WorkflowNodeState::Completed {
             return Err(WorkflowModelError::NodeAlreadyCompleted {
                 node_id: event.group_id,
@@ -52,10 +57,15 @@ impl WorkflowRunModel {
             });
         }
 
-        let Some(WorkflowTopologyNode::Group(group)) = self.topology.get_mut(&event.group_id)
-        else {
+        let Some(node) = self.topology.get_mut(&event.group_id) else {
             return Err(WorkflowModelError::UnknownGroup {
                 group_id: event.group_id,
+            });
+        };
+        let WorkflowTopologyNode::Group(group) = node else {
+            return Err(WorkflowModelError::TopologyKindMismatch {
+                node_id: event.group_id,
+                expected: "group",
             });
         };
         group.state = WorkflowNodeState::Completed;
@@ -79,7 +89,7 @@ impl WorkflowRunModel {
         }
     }
 
-    fn insert_topology_node(
+    pub(super) fn insert_topology_node(
         &mut self,
         node: WorkflowTopologyNode,
     ) -> Result<(), WorkflowModelError> {
@@ -130,7 +140,7 @@ impl WorkflowRunModel {
         Ok(())
     }
 
-    fn validate_parent(
+    pub(super) fn validate_parent(
         &self,
         node_id: u64,
         parent_node_id: Option<u64>,
@@ -164,7 +174,7 @@ impl WorkflowRunModel {
         Ok(())
     }
 
-    fn require_active_phase(&self) -> Result<u64, WorkflowModelError> {
+    pub(super) fn require_active_phase(&self) -> Result<u64, WorkflowModelError> {
         self.active_phase_index
             .ok_or(WorkflowModelError::NoActivePhase)
     }
