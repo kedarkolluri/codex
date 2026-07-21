@@ -40,6 +40,10 @@ impl TurnGeneration {
         self.start_control.wait_finished().await
     }
 
+    pub(crate) fn finished_outcome(&self) -> Option<TurnStartOutcome> {
+        self.start_control.outcome()
+    }
+
     pub(crate) async fn wait_lifecycle_finished(&self) {
         self.lifecycle_finished.cancelled().await;
     }
@@ -56,6 +60,26 @@ pub(crate) struct TurnStartDriver {
 impl TurnStartDriver {
     pub(crate) fn generation(&self) -> TurnGeneration {
         self.generation.clone()
+    }
+}
+impl Drop for TurnStartDriver {
+    fn drop(&mut self) {
+        if self.generation.finished_outcome().is_some() {
+            return;
+        }
+        self.generation
+            .start_control
+            .request_cancel(TurnAbortReason::Interrupted);
+        let Some(reason) = self.generation.start_control.cancel_reason() else {
+            unreachable!("abandoned task start must retain its cancellation reason");
+        };
+        if self
+            .generation
+            .start_control
+            .finish_if_unfinished(TurnStartOutcome::Poisoned(reason))
+        {
+            self.generation.finish_lifecycle();
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq)]
@@ -99,9 +123,20 @@ impl TurnStartControl {
 
     fn finish(&self, outcome: TurnStartOutcome) {
         assert!(
-            self.outcome_tx.send_replace(Some(outcome)).is_none(),
+            self.finish_if_unfinished(outcome),
             "task start finished twice"
         );
+    }
+
+    fn finish_if_unfinished(&self, outcome: TurnStartOutcome) -> bool {
+        self.outcome_tx.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(outcome);
+                true
+            }
+        })
     }
 
     async fn wait_finished(&self) -> TurnStartOutcome {
@@ -114,6 +149,10 @@ impl TurnStartControl {
                 unreachable!("task-start control owns the watch sender");
             };
         }
+    }
+
+    fn outcome(&self) -> Option<TurnStartOutcome> {
+        self.outcome_tx.borrow().clone()
     }
 }
 struct TurnOwner {
@@ -374,20 +413,23 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         Ok(())
     }
 
-    /// Poisons an exact cancelled start whose linear driver was lost.
-    pub(crate) fn poison_abandoned_start(&mut self, generation: &TurnGeneration) -> bool {
+    /// Poisons an exact cancelled start while consuming its linear driver.
+    pub(crate) fn poison_abandoned_start(
+        &mut self,
+        driver: TurnStartDriver,
+    ) -> Result<(), TurnStartDriver> {
         let TurnLifecycleState::Starting {
             generation: active_generation,
             ..
         } = &self.state
         else {
-            return false;
+            return Err(driver);
         };
-        if !active_generation.matches(generation) {
-            return false;
+        if !active_generation.matches(&driver.generation) {
+            return Err(driver);
         }
         let Some(reason) = active_generation.start_control.cancel_reason() else {
-            return false;
+            return Err(driver);
         };
         let TurnLifecycleState::Starting { generation, lease } =
             std::mem::replace(&mut self.state, TurnLifecycleState::Idle)
@@ -403,7 +445,8 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         };
         start_control.finish(TurnStartOutcome::Poisoned(reason));
         lifecycle_generation.finish_lifecycle();
-        true
+        drop(driver);
+        Ok(())
     }
 
     pub(crate) fn begin_finalization(

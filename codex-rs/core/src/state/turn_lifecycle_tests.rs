@@ -103,8 +103,7 @@ async fn cancelled_and_poisoned_transitions_finish_the_lifecycle() {
     let abandoned_driver = slot.start(()).expect("idle slot");
     let abandoned = abandoned_driver.generation();
     assert!(slot.cancel_start_exact(&abandoned, TurnAbortReason::Replaced));
-    drop(abandoned_driver);
-    assert!(slot.poison_abandoned_start(&abandoned));
+    assert!(slot.poison_abandoned_start(abandoned_driver).is_ok());
     abandoned.wait_lifecycle_finished().await;
     assert_eq!(
         abandoned.wait_finished().await,
@@ -128,6 +127,26 @@ async fn cancelled_and_poisoned_transitions_finish_the_lifecycle() {
     assert!(finalizing_slot.poison_finalization(finalization).is_ok());
     finalizing.wait_lifecycle_finished().await;
 }
+
+#[tokio::test]
+async fn abandoned_start_driver_publishes_poison_and_leaves_slot_fail_closed() {
+    let mut slot = TurnLifecycleSlot::<String, TestTask>::default();
+    let driver = slot.start("held lease".to_string()).expect("idle slot");
+    let generation = driver.generation();
+
+    drop(driver);
+
+    assert_eq!(
+        generation.wait_finished().await,
+        TurnStartOutcome::Poisoned(TurnAbortReason::Interrupted)
+    );
+    generation.wait_lifecycle_finished().await;
+    let Err(lease) = slot.start("successor lease".to_string()) else {
+        panic!("abandoned start must leave the slot fail closed");
+    };
+    assert_eq!(lease, "successor lease");
+}
+
 #[tokio::test]
 async fn cancelled_start_is_non_committable_until_compensated() {
     let (_session, turn_context) = make_session_and_context().await;
@@ -151,7 +170,10 @@ async fn cancelled_start_is_non_committable_until_compensated() {
         .expect("current start should cancel");
     assert_eq!(control.cancelled().await, TurnAbortReason::Replaced);
     assert!(slot.cancel_start(TurnAbortReason::Interrupted).is_some());
-    assert!(!slot.poison_abandoned_start(&foreign_generation));
+    let Err(foreign_driver) = slot.poison_abandoned_start(foreign_driver) else {
+        panic!("foreign driver must not poison the active start");
+    };
+    assert_eq!(foreign_generation.finished_outcome(), None);
     let Err(foreign_driver) = slot.complete_cancelled_start(foreign_driver) else {
         panic!("foreign driver must not compensate");
     };
@@ -171,8 +193,7 @@ async fn cancelled_start_is_non_committable_until_compensated() {
     let abandoned_driver = slot.start("held".to_string()).expect("idle slot");
     let abandoned = abandoned_driver.generation();
     assert!(slot.cancel_start(TurnAbortReason::Interrupted).is_some());
-    drop(abandoned_driver);
-    assert!(slot.poison_abandoned_start(&abandoned));
+    assert!(slot.poison_abandoned_start(abandoned_driver).is_ok());
     assert_eq!(
         abandoned.wait_finished().await,
         TurnStartOutcome::Poisoned(TurnAbortReason::Interrupted)
@@ -341,8 +362,7 @@ async fn lease_is_released_only_after_success_and_retained_while_poisoned() {
                     .cancel_start(TurnAbortReason::Interrupted)
                     .is_some()
             );
-            drop(driver);
-            assert!(poisoned_slot.poison_abandoned_start(&generation));
+            assert!(poisoned_slot.poison_abandoned_start(driver).is_ok());
         }
         assert_eq!(drops.load(Ordering::SeqCst), 0);
         drop(poisoned_slot);
