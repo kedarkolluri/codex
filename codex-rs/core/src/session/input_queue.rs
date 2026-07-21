@@ -285,6 +285,7 @@ impl InputQueue {
         self.activity_tx.send_replace(InputQueueActivity::Steer);
     }
 
+    #[cfg(test)]
     pub(crate) async fn extend_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,

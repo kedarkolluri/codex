@@ -3,14 +3,14 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
-use crate::state::TurnState;
 use crate::tasks::RegularTask;
+use crate::tasks::TaskStartOutcome;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
 
 impl Session {
-    /// Returns the input if there is no active turn to inject into.
+    /// Returns the input if there is no running turn to inject into.
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -20,11 +20,11 @@ impl Session {
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         let active = self.active_turn.lock().await;
-        match active.current_turn_state() {
-            Some(turn_state) => {
+        match active.running_turn() {
+            Some(running_turn) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                        turn_state.as_ref(),
+                        running_turn.turn_state().as_ref(),
                         input.into_iter().map(TurnInput::ResponseItem).collect(),
                     )
                     .await;
@@ -49,7 +49,16 @@ impl Session {
             return Ok(());
         }
         let admission_permit = self.turn_start_gate.acquire_start_permit().await;
+        let Some(ticket) = self.turn_start_gate.automatic_start_ticket() else {
+            return Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                input,
+            ));
+        };
         if self.input_queue.has_trigger_turn_mailbox_items().await {
+            drop(admission_permit);
+            self.maybe_start_turn_for_pending_work_with_retry_ticket(ticket)
+                .await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
@@ -62,24 +71,21 @@ impl Session {
             ));
         }
 
-        let turn_state = {
-            let mut active_turn = self.active_turn.lock().await;
-            if active_turn.has_active_turn() {
+        {
+            let active_turn = self.active_turn.lock().await;
+            if !self.turn_start_gate.admits_automatic_start(ticket) || active_turn.has_active_turn()
+            {
                 return Err(TryStartTurnIfIdleError::new(
                     TryStartTurnIfIdleRejectionReason::Busy,
                     input,
                 ));
             }
-            let Some(turn_state) = active_turn.reserve_taskless() else {
-                unreachable!("idle turn slot must accept a taskless reservation");
-            };
-            Arc::clone(turn_state)
-        };
+        }
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
             drop(admission_permit);
-            self.maybe_start_turn_for_pending_work().await;
+            self.maybe_start_turn_for_pending_work_with_retry_ticket(ticket)
+                .await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
@@ -90,9 +96,9 @@ impl Session {
             .new_default_turn_with_sub_id(uuid::Uuid::new_v4().to_string())
             .await;
         if turn_context.mode == ModeKind::Plan {
-            self.clear_reserved_idle_turn(&turn_state).await;
             drop(admission_permit);
-            self.maybe_start_turn_for_pending_work().await;
+            self.maybe_start_turn_for_pending_work_with_retry_ticket(ticket)
+                .await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
                 input,
@@ -101,49 +107,43 @@ impl Session {
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
-            self.clear_reserved_idle_turn(&turn_state).await;
             drop(admission_permit);
-            self.maybe_start_turn_for_pending_work().await;
+            self.maybe_start_turn_for_pending_work_with_retry_ticket(ticket)
+                .await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
                 input,
             ));
         }
-        let still_reserved = {
-            let active_turn = self.active_turn.lock().await;
-            active_turn.running_turn().is_none()
-                && active_turn
-                    .current_turn_state()
-                    .is_some_and(|active_state| Arc::ptr_eq(active_state, &turn_state))
-        };
-        if !still_reserved {
-            self.clear_reserved_idle_turn(&turn_state).await;
-            return Err(TryStartTurnIfIdleError::new(
-                TryStartTurnIfIdleRejectionReason::Busy,
-                input,
-            ));
-        }
-
-        self.input_queue
-            .extend_pending_input_for_turn_state(
-                turn_state.as_ref(),
+        let rejected_input = input.clone();
+        match self
+            .start_automatic_task_with_pending_input(
+                ticket,
+                turn_context,
                 input.into_iter().map(TurnInput::ResponseItem).collect(),
+                RegularTask::new(),
+                admission_permit,
             )
-            .await;
-        self.start_legacy_task_with_admission_permit(
-            turn_context,
-            Vec::new(),
-            RegularTask::new(),
-            turn_state,
-            admission_permit,
-        )
-        .await;
-        Ok(())
-    }
-
-    async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {
-        let mut active_turn_guard = self.active_turn.lock().await;
-        active_turn_guard.clear_taskless_exact_state(turn_state);
+            .await
+        {
+            TaskStartOutcome::Started => Ok(()),
+            TaskStartOutcome::PendingTriggerTurn => {
+                self.maybe_start_turn_for_pending_work_with_retry_ticket(ticket)
+                    .await;
+                Err(TryStartTurnIfIdleError::new(
+                    TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
+                    rejected_input,
+                ))
+            }
+            TaskStartOutcome::Busy
+            | TaskStartOutcome::StartInProgress(_)
+            | TaskStartOutcome::AtCapacity(_)
+            | TaskStartOutcome::Cancelled(_)
+            | TaskStartOutcome::Poisoned => Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                rejected_input,
+            )),
+        }
     }
 
     /// Injects items into active work, or records them without starting a turn.

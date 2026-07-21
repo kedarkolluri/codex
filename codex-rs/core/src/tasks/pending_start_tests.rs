@@ -346,6 +346,33 @@ async fn cancelling_pending_work_caller_does_not_strand_trigger_mail() {
 }
 
 #[tokio::test]
+async fn suppressed_completion_ticket_leaves_trigger_mail_queued() {
+    let (session, _turn_context) = make_session(&[]).await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::try_from("/root/worker").expect("worker path should parse"),
+            AgentPath::root(),
+            Vec::new(),
+            "queued update".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+    let stale_ticket = session
+        .turn_start_gate
+        .automatic_start_ticket()
+        .expect("gate open");
+    session.turn_start_gate.suppress_automatic_starts();
+
+    session
+        .maybe_start_turn_for_pending_work_with_ticket(stale_ticket)
+        .await;
+
+    assert!(session.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(session.active_turn.lock().await.can_begin_fresh_start());
+}
+
+#[tokio::test]
 async fn explicit_poison_aborts_entered_callbacks_and_keeps_slot_closed() {
     let probe = Arc::new(LifecycleProbe::default());
     let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;

@@ -87,14 +87,13 @@ pub struct ThreadConfigSnapshot {
 /// idle turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TryStartTurnIfIdleRejectionReason {
-    /// User/client-triggered mailbox work is already queued and must take
-    /// priority over extension-initiated idle work.
+    /// Triggered mailbox work took priority and was handed to its start driver.
     PendingTriggerTurn,
     /// The thread is in Plan mode, where automatic idle work must not start a
     /// new model turn.
     PlanMode,
-    /// Another turn or task is active, or the idle reservation was lost before
-    /// the automatic turn could start.
+    /// The automatic turn could not commit because the session was active,
+    /// admission or execution capacity was unavailable, or start failed closed.
     Busy,
 }
 
@@ -298,11 +297,11 @@ impl CodexThread {
             .await
     }
 
-    /// Injects model-visible items into the currently active turn.
+    /// Injects model-visible items into the currently running turn.
     ///
     /// This is the thread-level bridge to `Session::inject_if_running` for
     /// callers that only hold a `CodexThread`.
-    /// It returns the unchanged items when this thread has no active turn.
+    /// It returns the unchanged items when this thread has no running turn.
     pub async fn inject_if_running(
         &self,
         items: Vec<ResponseItem>,
@@ -320,9 +319,9 @@ impl CodexThread {
     /// Review tasks are rejected by the active-task check because Review turns
     /// are not steerable.
     ///
-    /// On rejection, the returned error includes a stable reason and carries
-    /// the original `items` unchanged so the caller can decide whether to drop
-    /// them, retry later, or log why no automatic turn was started.
+    /// On rejection, the error carries the original `items` unchanged and never
+    /// attaches them to the competing turn. The caller can drop them, retry
+    /// later, or log why the automatic turn was not started.
     pub async fn try_start_turn_if_idle(
         &self,
         items: Vec<ResponseItem>,

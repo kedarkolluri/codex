@@ -49,7 +49,9 @@ impl Session {
                 )
                 .await;
             }
-            TaskStartOutcome::Busy | TaskStartOutcome::StartInProgress(_) => {
+            TaskStartOutcome::Busy
+            | TaskStartOutcome::StartInProgress(_)
+            | TaskStartOutcome::PendingTriggerTurn => {
                 self.send_event(
                     turn_context.as_ref(),
                     EventMsg::Error(ErrorEvent {

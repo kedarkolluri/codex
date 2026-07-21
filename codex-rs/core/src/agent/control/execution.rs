@@ -101,6 +101,7 @@ impl AgentControl {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn execution_guard(
         &self,
         multi_agent_version: MultiAgentVersion,
@@ -175,6 +176,7 @@ impl AgentExecutionLimiter {
         self.active.load(Ordering::Acquire) < self.max_threads()
     }
 
+    #[cfg(test)]
     fn guard(self: Arc<Self>) -> AgentExecutionGuard {
         self.active.fetch_add(1, Ordering::AcqRel);
         AgentExecutionGuard { limiter: self }
