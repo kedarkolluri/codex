@@ -136,6 +136,7 @@ mod tool_parallelism;
 mod tools;
 mod truncation;
 mod turn_lifecycle_finalization;
+mod turn_lifecycle_start_races;
 mod turn_state;
 mod unified_exec;
 mod unified_exec_process_events;
