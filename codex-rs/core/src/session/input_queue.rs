@@ -1,3 +1,4 @@
+use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::MailboxDeliveryPhase;
 use crate::state::TurnState;
@@ -6,6 +7,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Weak;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -29,6 +31,47 @@ pub(crate) enum InputQueueActivity {
 #[derive(Default)]
 pub(crate) struct TurnInputQueue {
     items: Vec<TurnInput>,
+    recording: Option<PendingInputRecording>,
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+#[derive(Clone)]
+#[must_use = "pending-input recording results must be observed"]
+pub(crate) struct PendingInputRecording {
+    token: Arc<()>,
+    turn_state: Weak<Mutex<TurnState>>,
+    turn_context: Arc<TurnContext>,
+    claimed_input: Arc<[TurnInput]>,
+    result_rx: watch::Receiver<Option<PendingInputRecordingResult>>,
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PendingInputRecordingResult {
+    Completed { should_stop: bool },
+    Failed,
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+#[must_use = "pending-input claims must be handled"]
+pub(crate) enum PendingInputClaim {
+    Inactive,
+    Empty,
+    Recording(PendingInputRecording),
+    Acquired(ClaimedPendingInput),
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+#[must_use = "dropping an acquired claim marks its recording failed"]
+pub(crate) struct ClaimedPendingInput {
+    completion: PendingInputRecordingCompletion,
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+#[must_use = "dropping a completion guard marks its recording failed"]
+pub(crate) struct PendingInputRecordingCompletion {
+    recording: PendingInputRecording,
+    result_tx: Option<watch::Sender<Option<PendingInputRecordingResult>>>,
 }
 
 /// Session-scoped pending input storage and active-turn mailbox delivery coordination.
@@ -197,6 +240,73 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.split_off(0)
     }
 
+    /// Claims pending input for the exact running turn and installs its durable recorder handle.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the running-turn check, input claim, and mailbox drain must remain atomic"
+    )]
+    #[allow(dead_code)] // Used by the next stacked runtime activation change.
+    pub(crate) async fn claim_pending_input_for_turn(
+        &self,
+        active_turn: &Mutex<Option<ActiveTurn>>,
+        turn_context: &Arc<TurnContext>,
+    ) -> PendingInputClaim {
+        let active = active_turn.lock().await;
+        let Some(active_turn) = active.as_ref().filter(|active_turn| {
+            active_turn
+                .task
+                .as_ref()
+                .is_some_and(|task| Arc::ptr_eq(&task.turn_context, turn_context))
+        }) else {
+            return PendingInputClaim::Inactive;
+        };
+        let turn_state = Arc::clone(&active_turn.turn_state);
+        let mut state = turn_state.lock().await;
+        if let Some(recording) = state.pending_input.recording.as_ref() {
+            return if recording.matches_turn(turn_context) {
+                PendingInputClaim::Recording(recording.clone())
+            } else {
+                PendingInputClaim::Inactive
+            };
+        }
+
+        if !state.accepts_mailbox_delivery_for_current_turn() {
+            return PendingInputClaim::Empty;
+        }
+        let mut mailbox = self.mailbox_pending_mails.lock().await;
+        let mut items = state.pending_input.items.split_off(0);
+        items.extend(mailbox.drain(..).map(TurnInput::InterAgentCommunication));
+        Self::install_pending_input_recording(&mut state, &turn_state, turn_context, items)
+    }
+
+    fn install_pending_input_recording(
+        state: &mut TurnState,
+        turn_state: &Arc<Mutex<TurnState>>,
+        turn_context: &Arc<TurnContext>,
+        items: Vec<TurnInput>,
+    ) -> PendingInputClaim {
+        if items.is_empty() {
+            return PendingInputClaim::Empty;
+        }
+        let claimed_input = Arc::<[TurnInput]>::from(items);
+        let token = Arc::new(());
+        let (result_tx, result_rx) = watch::channel(None);
+        let recording = PendingInputRecording {
+            token,
+            turn_state: Arc::downgrade(turn_state),
+            turn_context: Arc::clone(turn_context),
+            claimed_input,
+            result_rx,
+        };
+        state.pending_input.recording = Some(recording.clone());
+        PendingInputClaim::Acquired(ClaimedPendingInput {
+            completion: PendingInputRecordingCompletion {
+                recording,
+                result_tx: Some(result_tx),
+            },
+        })
+    }
+
     #[expect(
         clippy::await_holding_invalid_type,
         reason = "active turn checks and turn state updates must remain atomic"
@@ -268,6 +378,76 @@ impl TurnInputQueue {
         self.items
             .iter()
             .any(|input| matches!(input, TurnInput::UserInput { .. }))
+    }
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+impl ClaimedPendingInput {
+    pub(crate) fn recording(&self) -> PendingInputRecording {
+        self.completion.recording.clone()
+    }
+
+    pub(crate) fn into_parts(self) -> (Arc<[TurnInput]>, PendingInputRecordingCompletion) {
+        (self.completion.recording.claimed_input(), self.completion)
+    }
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+impl PendingInputRecording {
+    fn matches_turn(&self, turn_context: &Arc<TurnContext>) -> bool {
+        Arc::ptr_eq(&self.turn_context, turn_context)
+    }
+
+    pub(crate) fn claimed_input(&self) -> Arc<[TurnInput]> {
+        Arc::clone(&self.claimed_input)
+    }
+
+    pub(crate) async fn wait(mut self) -> PendingInputRecordingResult {
+        loop {
+            let result = {
+                let result = self.result_rx.borrow_and_update();
+                *result
+            };
+            if let Some(result) = result {
+                return result;
+            }
+            if self.result_rx.changed().await.is_err() {
+                return PendingInputRecordingResult::Failed;
+            }
+        }
+    }
+
+    async fn clear_if_current(&self) {
+        let Some(turn_state) = self.turn_state.upgrade() else {
+            return;
+        };
+        let mut state = turn_state.lock().await;
+        if state
+            .pending_input
+            .recording
+            .as_ref()
+            .is_some_and(|recording| Arc::ptr_eq(&recording.token, &self.token))
+        {
+            state.pending_input.recording = None;
+        }
+    }
+}
+
+#[allow(dead_code)] // Used by the next stacked runtime activation change.
+impl PendingInputRecordingCompletion {
+    pub(crate) async fn complete(mut self, should_stop: bool) {
+        self.recording.clear_if_current().await;
+        if let Some(result_tx) = self.result_tx.take() {
+            result_tx.send_replace(Some(PendingInputRecordingResult::Completed { should_stop }));
+        }
+    }
+}
+
+impl Drop for PendingInputRecordingCompletion {
+    fn drop(&mut self) {
+        if let Some(result_tx) = self.result_tx.take() {
+            result_tx.send_replace(Some(PendingInputRecordingResult::Failed));
+        }
     }
 }
 
