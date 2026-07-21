@@ -4,11 +4,16 @@ use std::io;
 use std::io::Write;
 
 use crate::response::FunctionCallOutputContentItem;
+use crate::workflow_meta::ParsedWorkflowMeta;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 /// Maximum UTF-8 byte length of a saved or nested workflow name.
 pub const WORKFLOW_NAME_MAX_BYTES: usize = 256;
+/// Maximum UTF-8 byte length of a saved workflow description.
+pub const WORKFLOW_DESCRIPTION_MAX_BYTES: usize = 4 * 1024;
+/// Maximum number of statically declared workflow phases.
+pub const WORKFLOW_PHASES_MAX_ITEMS: usize = 256;
 /// Maximum number of topology nodes one workflow runtime may allocate.
 pub const WORKFLOW_TOPOLOGY_MAX_NODES: u64 = 4_000;
 /// Maximum number of dynamic log events one workflow runtime may emit.
@@ -255,6 +260,26 @@ pub fn ensure_workflow_agent_schema(schema: &JsonValue) -> Result<(), String> {
 /// Validate a named workflow agent string option such as model, effort, role, or isolation.
 pub fn ensure_workflow_agent_option(field: &str, value: &str) -> Result<(), String> {
     ensure_bounded_text(field, value, WORKFLOW_AGENT_OPTION_MAX_BYTES)
+}
+
+pub(crate) fn ensure_parsed_workflow_meta(meta: &ParsedWorkflowMeta) -> Result<(), String> {
+    ensure_workflow_name(&meta.name).map_err(|error| format!("`meta.name` {error}"))?;
+    ensure_bounded_text(
+        "`meta.description`",
+        &meta.description,
+        WORKFLOW_DESCRIPTION_MAX_BYTES,
+    )?;
+    if meta.phases.len() > WORKFLOW_PHASES_MAX_ITEMS {
+        return Err(format!(
+            "`meta.phases` has {} entries; at most {WORKFLOW_PHASES_MAX_ITEMS} are allowed",
+            meta.phases.len()
+        ));
+    }
+    for (index, title) in meta.phases.iter().enumerate() {
+        ensure_workflow_phase_title(title)
+            .map_err(|error| format!("`meta.phases[{index}]` {error}"))?;
+    }
+    Ok(())
 }
 
 fn ensure_nonempty_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<(), String> {
