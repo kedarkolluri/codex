@@ -214,6 +214,15 @@ async fn stale_finalizer_cannot_complete_or_poison_reopened_same_owner() {
         slot.poison_abandoned_finalization(first_completion)
             .is_err()
     );
+    let lifecycle_finished = generation.wait_lifecycle_finished();
+    tokio::pin!(lifecycle_finished);
+    assert!(matches!(
+        futures::poll!(&mut lifecycle_finished),
+        Poll::Pending
+    ));
     assert!(slot.has_active_turn());
     assert!(slot.complete_finalization(second_completion).is_ok());
+    timeout(Duration::from_secs(/*secs*/ 1), &mut lifecycle_finished)
+        .await
+        .expect("current finalization should finish the lifecycle");
 }
