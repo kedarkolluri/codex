@@ -1,4 +1,5 @@
 mod compact;
+mod finalization;
 mod lifecycle;
 mod pending_start;
 mod regular;
