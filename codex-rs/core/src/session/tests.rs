@@ -9896,7 +9896,14 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("steer pending input into active turn");
 
-    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
+    let generation = sess
+        .active_turn
+        .lock()
+        .await
+        .current_generation()
+        .cloned()
+        .expect("spawned task should own a lifecycle generation");
+    sess.on_task_finished(generation, Arc::clone(&tc), /*task_result*/ Ok(None))
         .await;
 
     let history = sess.clone_history().await;

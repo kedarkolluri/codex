@@ -48,7 +48,6 @@ impl PendingFinalization {
         }
     }
 
-    #[allow(dead_code)] // Explicit poison is activated by the public atomic-start stage.
     pub(super) async fn poison(mut self) {
         let mut active_turn = self.session.active_turn.lock().await;
         let Some(completion) = self.completion.take() else {

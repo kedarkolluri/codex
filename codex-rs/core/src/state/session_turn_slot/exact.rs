@@ -70,6 +70,7 @@ impl SessionTurnSlot {
         }
         self.lifecycle.start(execution_guard)
     }
+    #[allow(dead_code)] // Activated by the automatic-start stages.
     pub(crate) fn begin_reserved_start(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -156,11 +157,9 @@ impl SessionTurnSlot {
         generation: &TurnGeneration,
         turn_context: &Arc<TurnContext>,
     ) -> Option<FinalizingTurn> {
-        if self.legacy_running {
-            return None;
-        }
         self.begin_running_finalization(generation, turn_context)
     }
+    #[cfg(test)]
     pub(crate) fn begin_running_finalization_for_context(
         &mut self,
         turn_context: &Arc<TurnContext>,

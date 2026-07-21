@@ -48,6 +48,7 @@ impl Session {
         if input.is_empty() {
             return Ok(());
         }
+        let admission_permit = self.turn_start_gate.acquire_start_permit().await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -77,6 +78,7 @@ impl Session {
 
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(admission_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -89,6 +91,7 @@ impl Session {
             .await;
         if turn_context.mode == ModeKind::Plan {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(admission_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PlanMode,
@@ -99,6 +102,7 @@ impl Session {
             .await;
         if self.input_queue.has_trigger_turn_mailbox_items().await {
             self.clear_reserved_idle_turn(&turn_state).await;
+            drop(admission_permit);
             self.maybe_start_turn_for_pending_work().await;
             return Err(TryStartTurnIfIdleError::new(
                 TryStartTurnIfIdleRejectionReason::PendingTriggerTurn,
@@ -126,8 +130,14 @@ impl Session {
                 input.into_iter().map(TurnInput::ResponseItem).collect(),
             )
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        self.start_legacy_task_with_admission_permit(
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+            turn_state,
+            admission_permit,
+        )
+        .await;
         Ok(())
     }
 

@@ -9,7 +9,6 @@ use crate::session::turn_context::TurnContext;
 use crate::state::turn_lifecycle::TurnGeneration;
 
 /// Durable cursor for compensating callbacks entered during exact task start.
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 #[derive(Debug, Default, Eq, PartialEq)]
 #[must_use = "entered turn-start callbacks must be compensated after cancellation"]
 pub(super) struct TurnStartLifecycleProgress {
@@ -40,7 +39,6 @@ impl Session {
 
     /// Emits exact-start callbacks until cancellation while recording every
     /// callback entered before its first await.
-    #[allow(dead_code)] // Activated by the atomic task-start stage.
     pub(super) async fn emit_cancellable_turn_start_lifecycle(
         &self,
         turn_context: &TurnContext,
@@ -116,7 +114,6 @@ impl Session {
 
     /// Compensates only entered start callbacks. A cancelled in-flight abort
     /// is retried, while callbacks that returned successfully are not replayed.
-    #[allow(dead_code)] // Activated by the atomic task-start stage.
     pub(super) async fn emit_entered_turn_abort_lifecycle(
         &self,
         reason: TurnAbortReason,

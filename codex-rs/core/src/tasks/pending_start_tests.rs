@@ -25,6 +25,7 @@ use crate::state::turn_lifecycle::TurnGeneration;
 use crate::state::turn_lifecycle::TurnStartOutcome;
 use crate::tasks::AnySessionTask;
 use crate::tasks::RegularTask;
+use crate::tasks::start_transaction::TaskStartOutcome;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -248,6 +249,48 @@ async fn ordinary_compensation_aborts_entered_callbacks_and_restores_idle() {
         wait_for_outcome(&generation, "ordinary compensation should finish").await,
         TurnStartOutcome::Cancelled(TurnAbortReason::Replaced)
     );
+    assert!(session.active_turn.lock().await.can_begin_fresh_start());
+    assert_eq!(probe.snapshot(), (1, 1, 1));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_abort_cancels_a_real_starting_task_and_restores_idle() {
+    let probe = Arc::new(LifecycleProbe {
+        block_start: true,
+        ..Default::default()
+    });
+    let (session, turn_context) = make_session(&[Arc::clone(&probe)]).await;
+    let session_for_start = Arc::clone(&session);
+    let start = tokio::spawn(async move {
+        let admission_permit = session_for_start
+            .turn_start_gate
+            .acquire_start_permit()
+            .await;
+        session_for_start
+            .start_task_with_admission_permit(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                admission_permit,
+            )
+            .await
+    });
+    wait_for(
+        &probe.start_entered,
+        "start callback should be entered before replacement",
+    )
+    .await;
+
+    session.abort_all_tasks(TurnAbortReason::Replaced).await;
+
+    let outcome = timeout(TEST_TIMEOUT, start)
+        .await
+        .expect("starting task should finish cancellation")
+        .expect("starting task should not panic");
+    assert!(matches!(
+        outcome,
+        TaskStartOutcome::Cancelled(TurnAbortReason::Replaced)
+    ));
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
     assert_eq!(probe.snapshot(), (1, 1, 1));
 }

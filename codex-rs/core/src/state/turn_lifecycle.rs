@@ -246,7 +246,6 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         }
     }
 
-    #[allow(dead_code)] // Activated by the atomic task-start stage.
     pub(crate) fn starting_generation(&self) -> Option<&TurnGeneration> {
         let TurnLifecycleState::Starting { generation, .. } = &self.state else {
             return None;

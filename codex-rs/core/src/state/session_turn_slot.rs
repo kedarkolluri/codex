@@ -14,7 +14,6 @@ use super::turn_lifecycle::TurnGeneration;
 use super::turn_lifecycle::TurnLifecycleSlot;
 use super::turn_lifecycle::TurnStartDriver;
 
-#[allow(dead_code)] // Exact start entry points activate in the public atomic-start stage.
 mod exact;
 
 pub(crate) use exact::SessionTurnAbortTransition;
@@ -64,13 +63,14 @@ impl SessionTurnSlot {
         !self.is_idle()
     }
 
-    pub(crate) fn current_turn_state(&self) -> Option<&Arc<Mutex<TurnState>>> {
-        self.lifecycle
-            .current_generation()
-            .map(TurnGeneration::turn_state)
+    pub(crate) fn current_generation(&self) -> Option<&TurnGeneration> {
+        self.lifecycle.current_generation()
     }
 
-    #[allow(dead_code)] // Activated by the atomic task-start stage.
+    pub(crate) fn current_turn_state(&self) -> Option<&Arc<Mutex<TurnState>>> {
+        self.current_generation().map(TurnGeneration::turn_state)
+    }
+
     pub(crate) fn starting_generation(&self) -> Option<TurnGeneration> {
         self.lifecycle.starting_generation().cloned()
     }
@@ -99,7 +99,8 @@ impl SessionTurnSlot {
         self.current_turn_state()
     }
 
-    /// Legacy first get-or-insert and debug-only running-task check.
+    /// Test-only legacy first get-or-insert projection.
+    #[cfg(test)]
     pub(crate) fn reserve_taskless_for_legacy_start(&mut self) -> &Arc<Mutex<TurnState>> {
         let Some(turn_state) = self.reserve_taskless() else {
             unreachable!("legacy start must not overlap an exact lifecycle owner");

@@ -32,6 +32,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::state::turn_lifecycle::TurnGeneration;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_login::AuthManager;
@@ -311,6 +312,7 @@ where
 impl Session {
     pub async fn on_task_finished(
         self: &Arc<Self>,
+        generation: TurnGeneration,
         turn_context: Arc<TurnContext>,
         task_result: SessionTaskResult,
     ) {
@@ -328,7 +330,7 @@ impl Session {
 
         let finalizing_turn = {
             let mut active = self.active_turn.lock().await;
-            active.begin_running_finalization_for_context(&turn_context)
+            active.begin_finalization(&generation, &turn_context)
         };
         let Some(finalizing_turn) = finalizing_turn else {
             return;

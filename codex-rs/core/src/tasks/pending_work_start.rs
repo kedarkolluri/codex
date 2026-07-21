@@ -33,21 +33,32 @@ impl Session {
         if !self.input_queue.has_trigger_turn_mailbox_items().await {
             return;
         }
+        let admission_permit = self.turn_start_gate.acquire_start_permit().await;
+        if !self.input_queue.has_trigger_turn_mailbox_items().await {
+            return;
+        }
 
-        {
+        let turn_state = {
             let mut active_turn = self.active_turn.lock().await;
             if active_turn.has_active_turn() {
                 return;
             }
-            let Some(_) = active_turn.reserve_taskless() else {
+            let Some(turn_state) = active_turn.reserve_taskless() else {
                 unreachable!("idle turn slot must accept a taskless reservation");
             };
-        }
+            Arc::clone(turn_state)
+        };
 
         let turn_context = self.new_default_turn_with_sub_id(sub_id).await;
         self.maybe_emit_model_warnings_for_turn(turn_context.as_ref())
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
+        self.start_legacy_task_with_admission_permit(
+            turn_context,
+            Vec::new(),
+            RegularTask::new(),
+            turn_state,
+            admission_permit,
+        )
+        .await;
     }
 }

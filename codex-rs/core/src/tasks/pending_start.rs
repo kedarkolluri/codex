@@ -11,7 +11,6 @@ use crate::state::turn_lifecycle::TurnGeneration;
 use crate::state::turn_lifecycle::TurnStartDriver;
 
 /// Terminal result of compensating an uncommitted task start.
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 #[derive(Debug, PartialEq)]
 pub(super) enum PendingTaskStartOutcome {
     Cancelled(TurnAbortReason),
@@ -31,7 +30,6 @@ enum PendingTaskStartResolution {
 }
 
 /// Linear authority for compensating one exact task start.
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 #[must_use = "an exact task start must be compensated or poisoned"]
 pub(super) struct PendingTaskStart {
     session: Arc<Session>,
@@ -39,7 +37,6 @@ pub(super) struct PendingTaskStart {
     recovery_state: Option<PendingTaskStartRecoveryState>,
 }
 
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 impl PendingTaskStart {
     pub(super) fn new(
         session: Arc<Session>,
