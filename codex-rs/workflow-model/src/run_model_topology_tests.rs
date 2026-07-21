@@ -291,13 +291,13 @@ fn project(events: &[WorkflowEvent]) -> Result<WorkflowRunModel, WorkflowModelEr
     let first = events.next().expect("projection needs run_begin");
     let mut model = WorkflowRunModel::from_event(first)?;
     for event in events {
-        assert_eq!(model.reduce_event(event)?, ReductionDisposition::Applied);
+        model.apply(event)?;
     }
     Ok(model)
 }
 
 fn apply(model: &mut WorkflowRunModel, event: &WorkflowEvent) {
-    assert_eq!(model.reduce_event(event), Ok(ReductionDisposition::Applied));
+    assert_eq!(model.apply(event), Ok(()));
 }
 
 fn assert_rejected_unchanged(
@@ -306,6 +306,6 @@ fn assert_rejected_unchanged(
     expected: WorkflowModelError,
 ) {
     let before = model.clone();
-    assert_eq!(model.reduce_event(event), Err(expected));
+    assert_eq!(model.apply(event), Err(expected));
     assert_eq!(*model, before);
 }

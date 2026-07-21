@@ -452,11 +452,11 @@ fn project(events: &[WorkflowEvent]) -> WorkflowRunModel {
 }
 
 fn apply(model: &mut WorkflowRunModel, event: &WorkflowEvent) {
-    assert_eq!(model.reduce_event(event), Ok(ReductionDisposition::Applied));
+    assert_eq!(model.apply(event), Ok(()));
 }
 
 fn assert_rejected_unchanged(model: &mut WorkflowRunModel, event: &WorkflowEvent, expected: Error) {
     let before = model.clone();
-    assert_eq!(model.reduce_event(event), Err(expected));
+    assert_eq!(model.apply(event), Err(expected));
     assert_eq!(*model, before);
 }
