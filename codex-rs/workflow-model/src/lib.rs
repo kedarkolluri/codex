@@ -2,6 +2,7 @@
 
 mod run_model;
 
+pub use run_model::WorkflowAgent;
 pub use run_model::WorkflowGroup;
 pub use run_model::WorkflowModelError;
 pub use run_model::WorkflowNodeState;
