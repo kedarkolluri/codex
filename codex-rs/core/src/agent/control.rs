@@ -49,6 +49,10 @@ use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
 
+#[allow(unused_imports)] // Activated by the next stacked task-start reservation change.
+pub(crate) use self::execution::AgentExecutionAdmission;
+#[allow(unused_imports)] // Activated by the next stacked task-start reservation change.
+pub(crate) use self::execution::AgentExecutionCapacityWaiter;
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;
