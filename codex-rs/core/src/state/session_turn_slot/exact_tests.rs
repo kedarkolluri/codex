@@ -69,6 +69,30 @@ async fn exact_reserved_start_authenticates_and_preserves_state() {
 }
 
 #[tokio::test]
+async fn compatibility_start_holds_execution_capacity_through_finalization() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let control = AgentControl::default().with_session_id(SessionId::new(), /*max_threads*/ 1);
+    let source = limited_source();
+    let mut task = running_task(Arc::clone(&turn_context));
+    task._agent_execution_guard = Some(admit_guard(&control, &source));
+    let mut slot = SessionTurnSlot::default();
+    let turn_state = Arc::clone(slot.reserve_taskless_for_legacy_start());
+
+    slot.install_running_task_for_legacy_start(&turn_state, task);
+    assert_at_capacity(&control, &source);
+    let finalizing = slot
+        .begin_running_finalization_for_context(&turn_context)
+        .expect("compatibility running turn should finalize exactly");
+    let (task, completion) = finalizing.into_parts();
+    assert!(task._agent_execution_guard.is_none());
+    task.handle.abort();
+    assert_at_capacity(&control, &source);
+    assert!(slot.complete_finalization(completion).is_ok());
+    drop(admit_guard(&control, &source));
+}
+
+#[tokio::test]
 async fn execution_guard_is_held_by_the_exact_lifecycle_until_completion() {
     let (_session, turn_context) = make_session_and_context().await;
     let turn_context = Arc::new(turn_context);
@@ -101,7 +125,7 @@ async fn execution_guard_is_held_by_the_exact_lifecycle_until_completion() {
     task.handle.abort();
     let mut legacy_task = running_task(Arc::clone(&turn_context));
     legacy_task._agent_execution_guard = control.execution_guard(MultiAgentVersion::V2, &source);
-    slot.install_running_task_for_legacy_start(legacy_task);
+    slot.install_running_task_for_legacy_start(completion.turn_state(), legacy_task);
     assert!(Arc::ptr_eq(
         completion.turn_state(),
         generation.turn_state()

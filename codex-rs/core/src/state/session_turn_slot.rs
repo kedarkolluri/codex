@@ -5,6 +5,7 @@ use tokio::sync::Mutex;
 
 use crate::agent::control::AgentExecutionGuard;
 
+#[cfg(test)]
 use super::ActiveTurn;
 use super::RunningTask;
 use super::TurnState;
@@ -13,12 +14,10 @@ use super::turn_lifecycle::TurnGeneration;
 use super::turn_lifecycle::TurnLifecycleSlot;
 use super::turn_lifecycle::TurnStartDriver;
 
-#[allow(dead_code)] // Activated by the next stacked atomic-start change.
+#[allow(dead_code)] // Exact start entry points activate in the public atomic-start stage.
 mod exact;
 
-#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
 pub(crate) use exact::SessionTurnAbortTransition;
-#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
 pub(crate) use exact::SessionTurnFinalization;
 
 type SessionLifecycle = TurnLifecycleSlot<Option<AgentExecutionGuard>, RunningTask>;
@@ -109,44 +108,41 @@ impl SessionTurnSlot {
     }
 
     /// Legacy second get-or-insert and running-task assignment.
-    pub(crate) fn install_running_task_for_legacy_start(&mut self, task: RunningTask) {
-        debug_assert!(self.lifecycle.running().is_none());
-        if let Some(driver) = self.legacy_start.take() {
-            match self.lifecycle.commit_start(driver, task) {
-                Ok(()) => self.legacy_running = true,
-                Err((driver, _task)) => {
-                    self.legacy_start = Some(driver);
-                    debug_assert!(false, "legacy task install must commit its reservation");
-                }
-            }
+    pub(crate) fn install_running_task_for_legacy_start(
+        &mut self,
+        expected_turn_state: &Arc<Mutex<TurnState>>,
+        mut task: RunningTask,
+    ) {
+        if !self
+            .current_turn_state()
+            .is_some_and(|turn_state| Arc::ptr_eq(turn_state, expected_turn_state))
+        {
             return;
         }
-
-        if self.lifecycle.is_idle() {
-            let Ok(driver) = self.lifecycle.start(/*lease*/ None) else {
-                unreachable!("idle lifecycle slot must accept a task start");
-            };
-            if let Err((_driver, _task)) = self.lifecycle.commit_start(driver, task) {
-                unreachable!("fresh legacy task start must commit");
-            }
-            self.legacy_running = true;
+        let Some(driver) = self.legacy_start.take() else {
             return;
-        }
-
-        if !self.legacy_running && self.legacy_finalization.is_none() {
-            return;
-        }
-        let finalization = self.legacy_finalization.take();
-        match self.lifecycle.install_running_task_for_legacy(task) {
-            Ok(replaced_task) => {
-                self.legacy_running = true;
-                drop((replaced_task, finalization));
+        };
+        let execution_guard = task._agent_execution_guard.take();
+        let previous_guard = match self.lifecycle.replace_start_lease(&driver, execution_guard) {
+            Ok(previous_guard) => previous_guard,
+            Err(execution_guard) => {
+                task._agent_execution_guard = execution_guard;
+                self.legacy_start = Some(driver);
+                return;
             }
-            Err(_task) => self.legacy_finalization = finalization,
+        };
+        drop(previous_guard);
+        match self.lifecycle.commit_start(driver, task) {
+            Ok(()) => self.legacy_running = true,
+            Err((driver, _task)) => {
+                self.legacy_start = Some(driver);
+                debug_assert!(false, "legacy task install must commit its reservation");
+            }
         }
     }
 
-    /// Unconditional legacy abort take; removed by the next lifecycle activation.
+    /// Test-only unconditional legacy abort take.
+    #[cfg(test)]
     pub(crate) fn take_for_legacy_abort(&mut self) -> Option<ActiveTurn> {
         if let Some((task, turn_state)) = self.take_running_for_legacy_removal() {
             return Some(ActiveTurn::from_parts(Some(task), turn_state));
@@ -173,20 +169,8 @@ impl SessionTurnSlot {
         Some(ActiveTurn::from_parts(/*task*/ None, turn_state))
     }
 
-    /// Exact legacy running-turn abort take; removed by the next lifecycle activation.
-    pub(crate) fn take_running_turn_for_abort(&mut self, turn_id: &str) -> Option<ActiveTurn> {
-        let is_target = self
-            .lifecycle
-            .running()
-            .is_some_and(|(_generation, turn_context, _task)| turn_context.sub_id == turn_id);
-        if !is_target {
-            return None;
-        }
-        let (task, turn_state) = self.take_running_for_legacy_removal()?;
-        Some(ActiveTurn::from_parts(Some(task), turn_state))
-    }
-
-    /// Legacy finish projection; removed by the next lifecycle activation.
+    /// Test-only legacy finish projection.
+    #[cfg(test)]
     pub(crate) fn take_running_task_for_legacy_finish(
         &mut self,
     ) -> Option<(RunningTask, Arc<Mutex<TurnState>>)> {
@@ -216,7 +200,8 @@ impl SessionTurnSlot {
         self.clear_taskless_exact_state_inner(expected_turn_state)
     }
 
-    /// Exact legacy finish cleanup; removed by the next lifecycle activation.
+    /// Test-only exact legacy finish cleanup.
+    #[cfg(test)]
     pub(crate) fn clear_legacy_finished_exact_state(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -224,6 +209,7 @@ impl SessionTurnSlot {
         self.clear_taskless_exact_state_inner(expected_turn_state)
     }
 
+    #[cfg(test)]
     fn take_running_for_legacy_removal(&mut self) -> Option<(RunningTask, Arc<Mutex<TurnState>>)> {
         if !self.legacy_running {
             return None;

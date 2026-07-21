@@ -30,7 +30,6 @@ use crate::hook_runtime::record_pending_input;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
 use codex_analytics::TurnProfileFact;
@@ -55,6 +54,8 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
+use finalization::PendingFinalization;
+use finalization::PendingFinalizationOutcome;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
 pub(crate) use user_shell::UserShellCommandMode;
@@ -325,18 +326,17 @@ impl Session {
             .turn_metadata_state
             .cancel_git_enrichment_task();
 
-        let turn_state = {
+        let finalizing_turn = {
             let mut active = self.active_turn.lock().await;
-            active
-                .take_running_task_for_legacy_finish()
-                .map(|(task, turn_state)| {
-                    task.handle.detach();
-                    turn_state
-                })
+            active.begin_running_finalization_for_context(&turn_context)
         };
-        let Some(turn_state) = turn_state else {
+        let Some(finalizing_turn) = finalizing_turn else {
             return;
         };
+        let (task, completion) = finalizing_turn.into_parts();
+        task.handle.detach();
+        let pending_finalization = PendingFinalization::new(Arc::clone(self), completion);
+        let turn_state = Arc::clone(pending_finalization.turn_state());
         let pending_input = self
             .input_queue
             .take_pending_input_for_turn_state(turn_state.as_ref())
@@ -547,10 +547,8 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        let cleared_active_turn = {
-            let mut active = self.active_turn.lock().await;
-            active.clear_legacy_finished_exact_state(&turn_state)
-        };
+        let cleared_active_turn =
+            pending_finalization.complete().await == PendingFinalizationOutcome::Completed;
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
         }
@@ -562,11 +560,6 @@ impl Session {
         if cleared_active_turn {
             self.maybe_start_turn_for_pending_work().await;
         }
-    }
-
-    async fn take_active_turn(&self) -> Option<ActiveTurn> {
-        let mut active = self.active_turn.lock().await;
-        active.take_for_legacy_abort()
     }
 
     pub(crate) async fn close_unified_exec_processes(&self) {

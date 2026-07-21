@@ -12,11 +12,10 @@ pub(crate) use auto_compact_window::AutoCompactWindowIds;
 pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;
-#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
 pub(crate) use session_turn_slot::SessionTurnAbortTransition;
-#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
 pub(crate) use session_turn_slot::SessionTurnFinalization;
 pub(crate) use session_turn_slot::SessionTurnSlot;
+#[cfg(test)]
 pub(crate) use turn::ActiveTurn;
 pub(crate) use turn::MailboxDeliveryPhase;
 pub(crate) use turn::PendingRequestPermissions;
