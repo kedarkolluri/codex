@@ -5,6 +5,8 @@ use codex_protocol::protocol::TurnAbortReason;
 use super::lifecycle::TurnStartLifecycleProgress;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::state::RunningTask;
+use crate::state::SessionTurnSlot;
 use crate::state::turn_lifecycle::TurnGeneration;
 use crate::state::turn_lifecycle::TurnStartDriver;
 
@@ -19,6 +21,13 @@ pub(super) enum PendingTaskStartOutcome {
 struct PendingTaskStartRecoveryState {
     driver: TurnStartDriver,
     lifecycle_progress: TurnStartLifecycleProgress,
+    resolution: PendingTaskStartResolution,
+}
+
+#[derive(Clone, Copy)]
+enum PendingTaskStartResolution {
+    CompleteCancelled,
+    Poison,
 }
 
 /// Linear authority for compensating one exact task start.
@@ -43,6 +52,7 @@ impl PendingTaskStart {
             recovery_state: Some(PendingTaskStartRecoveryState {
                 driver,
                 lifecycle_progress: TurnStartLifecycleProgress::default(),
+                resolution: PendingTaskStartResolution::CompleteCancelled,
             }),
         }
     }
@@ -61,7 +71,46 @@ impl PendingTaskStart {
         &mut recovery_state.lifecycle_progress
     }
 
+    pub(super) fn commit(
+        mut self,
+        active_turn: &mut SessionTurnSlot,
+        task: RunningTask,
+    ) -> Result<TurnStartLifecycleProgress, (Self, RunningTask)> {
+        let Some(recovery_state) = self.recovery_state.take() else {
+            unreachable!("pending start must retain its recovery authority");
+        };
+        let PendingTaskStartRecoveryState {
+            driver,
+            lifecycle_progress,
+            resolution,
+        } = recovery_state;
+        match active_turn.commit_start(driver, task) {
+            Ok(()) => Ok(lifecycle_progress),
+            Err((driver, task)) => {
+                self.recovery_state = Some(PendingTaskStartRecoveryState {
+                    driver,
+                    lifecycle_progress,
+                    resolution,
+                });
+                Err((self, task))
+            }
+        }
+    }
+
     pub(super) async fn compensate(mut self) -> PendingTaskStartOutcome {
+        recover_pending_start(
+            self.session.as_ref(),
+            self.turn_context.as_ref(),
+            &mut self.recovery_state,
+        )
+        .await
+    }
+
+    pub(super) async fn poison(mut self) -> PendingTaskStartOutcome {
+        let Some(recovery_state) = self.recovery_state.as_mut() else {
+            unreachable!("pending start must retain its recovery authority");
+        };
+        recovery_state.resolution = PendingTaskStartResolution::Poison;
         recover_pending_start(
             self.session.as_ref(),
             self.turn_context.as_ref(),
@@ -120,6 +169,7 @@ impl Drop for PendingTaskStartRecovery {
                 let PendingTaskStartRecoveryState {
                     driver,
                     lifecycle_progress: _,
+                    resolution: _,
                 } = recovery_state;
                 let generation = driver.generation();
                 let mut active_turn = session.active_turn.blocking_lock();
@@ -185,23 +235,42 @@ async fn recover_pending_start(
     let PendingTaskStartRecoveryState {
         driver,
         lifecycle_progress: _,
+        resolution,
     } = recovery_state;
-    match active_turn.complete_cancelled_start(driver) {
-        Ok(reason) => PendingTaskStartOutcome::Cancelled(reason),
-        Err(driver) => {
+    match resolution {
+        PendingTaskStartResolution::CompleteCancelled => {
+            match active_turn.complete_cancelled_start(driver) {
+                Ok(reason) => PendingTaskStartOutcome::Cancelled(reason),
+                Err(driver) => {
+                    let generation = driver.generation();
+                    let cancelled_exact =
+                        active_turn.cancel_start_exact(&generation, TurnAbortReason::Interrupted);
+                    if cancelled_exact {
+                        assert!(
+                            active_turn.poison_abandoned_start(driver).is_ok(),
+                            "exact cancelled start must remain poisonable while its slot lock is held"
+                        );
+                    } else {
+                        assert!(
+                            generation.finished_outcome().is_some(),
+                            "a displaced start driver must already have a terminal outcome"
+                        );
+                        drop(driver);
+                    }
+                    PendingTaskStartOutcome::Poisoned
+                }
+            }
+        }
+        PendingTaskStartResolution::Poison => {
             let generation = driver.generation();
             let cancelled_exact =
                 active_turn.cancel_start_exact(&generation, TurnAbortReason::Interrupted);
             if cancelled_exact {
-                assert!(
-                    active_turn.poison_abandoned_start(driver).is_ok(),
-                    "exact cancelled start must remain poisonable while its slot lock is held"
-                );
+                if active_turn.poison_abandoned_start(driver).is_err() {
+                    session.turn_start_gate.close();
+                }
             } else {
-                assert!(
-                    generation.finished_outcome().is_some(),
-                    "a displaced start driver must already have a terminal outcome"
-                );
+                session.turn_start_gate.close();
                 drop(driver);
             }
             PendingTaskStartOutcome::Poisoned
