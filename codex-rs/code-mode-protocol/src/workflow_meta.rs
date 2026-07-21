@@ -4,6 +4,9 @@
 //! JavaScript literal grammar, never evaluates code, and stops as soon as the manifest statement
 //! ends.
 
+#[path = "workflow_phase_meta.rs"]
+mod phase_meta;
+
 use crate::workflow_bounds::WORKFLOW_PHASES_MAX_ITEMS;
 use crate::workflow_bounds::ensure_parsed_workflow_meta;
 
@@ -120,7 +123,11 @@ impl<'a> Parser<'a> {
                     "`meta.phases` has more than {WORKFLOW_PHASES_MAX_ITEMS} entries"
                 ));
             }
-            let title = self.parse_string_field("`meta.phases` entry")?;
+            let title = if self.peek() == Some('{') {
+                self.parse_phase_object()?
+            } else {
+                self.parse_string_field("`meta.phases` entry")?
+            };
             phases.push(title);
             self.expect_entry_end(']')?;
         }
