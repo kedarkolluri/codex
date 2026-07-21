@@ -53,6 +53,7 @@ fn run_begin_seeds_every_declared_phase_pending() {
             ],
             active_phase_index: None,
             next_phase_index: 0,
+            log_event_count: 0,
         }
     );
 }
@@ -80,6 +81,7 @@ fn empty_phase_list_seeds_one_active_implicit_root() {
             )],
             active_phase_index: Some(0),
             next_phase_index: 0,
+            log_event_count: 0,
         }
     );
 }

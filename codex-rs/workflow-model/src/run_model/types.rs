@@ -48,7 +48,34 @@ impl WorkflowPhase {
 #[non_exhaustive]
 pub enum WorkflowModelError {
     ExpectedRunBegin,
+    DuplicateRunBegin,
+    RunIdMismatch {
+        expected: String,
+        actual: String,
+    },
+    RunAlreadyCompleted,
     PhaseIndexOverflow,
+    UnexpectedPhaseIndex {
+        expected: u64,
+        actual: u64,
+    },
+    PhaseTitleMismatch {
+        phase_index: u64,
+        expected: String,
+        actual: String,
+    },
+    PhaseAlreadyActive {
+        phase_index: u64,
+    },
+    PhaseNotActive {
+        phase_index: u64,
+    },
+    PhaseLimitExceeded {
+        maximum: u64,
+    },
+    LogLimitExceeded {
+        maximum: u64,
+    },
     EmptyText {
         field: &'static str,
     },
@@ -69,7 +96,43 @@ impl fmt::Display for WorkflowModelError {
             Self::ExpectedRunBegin => {
                 formatter.write_str("workflow model must start with run_begin")
             }
+            Self::DuplicateRunBegin => formatter.write_str("workflow run already began"),
+            Self::RunIdMismatch { expected, actual } => write!(
+                formatter,
+                "workflow event belongs to run {actual}; expected {expected}"
+            ),
+            Self::RunAlreadyCompleted => formatter.write_str("workflow run already completed"),
             Self::PhaseIndexOverflow => formatter.write_str("workflow phase index overflow"),
+            Self::UnexpectedPhaseIndex { expected, actual } => write!(
+                formatter,
+                "workflow phase index is {actual}; expected {expected}"
+            ),
+            Self::PhaseTitleMismatch {
+                phase_index,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "workflow phase {phase_index} is titled {actual}; expected {expected}"
+            ),
+            Self::PhaseAlreadyActive { phase_index } => {
+                write!(formatter, "workflow phase {phase_index} is already active")
+            }
+            Self::PhaseNotActive { phase_index } => {
+                write!(formatter, "workflow phase {phase_index} is not active")
+            }
+            Self::PhaseLimitExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "workflow phase limit exceeded; maximum is {maximum}"
+                )
+            }
+            Self::LogLimitExceeded { maximum } => {
+                write!(
+                    formatter,
+                    "workflow log limit exceeded; maximum is {maximum}"
+                )
+            }
             Self::EmptyText { field } => write!(formatter, "workflow {field} must not be empty"),
             Self::TextTooLong {
                 field,
