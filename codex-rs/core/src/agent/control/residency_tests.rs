@@ -193,10 +193,10 @@ async fn mark_thread_interrupted(thread: &CodexThread) {
 
 async fn clear_active_turn(thread: &CodexThread) {
     // The fixture has no task runner to clear the turn after the terminal event.
-    let _ = thread
-        .session
-        .active_turn
-        .lock()
-        .await
-        .take_for_legacy_abort();
+    let mut active_turn = thread.session.active_turn.lock().await;
+    let turn_state = active_turn
+        .current_turn_state()
+        .cloned()
+        .expect("fixture should retain its taskless turn");
+    assert!(active_turn.clear_taskless_exact_state(&turn_state));
 }

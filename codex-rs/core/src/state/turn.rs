@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
@@ -18,19 +17,13 @@ use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
-use crate::agent::control::AgentExecutionGuard;
 use crate::session::TurnInputQueue;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
+use crate::state::turn_lifecycle::TurnLifecycleTask;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
-
-/// Metadata about the currently running turn.
-pub(crate) struct ActiveTurn {
-    task: Option<RunningTask>,
-    turn_state: Arc<Mutex<TurnState>>,
-}
 
 /// Whether mailbox deliveries should still be folded into the current turn.
 ///
@@ -53,37 +46,6 @@ pub(crate) enum MailboxDeliveryPhase {
     NextTurn,
 }
 
-impl Default for ActiveTurn {
-    fn default() -> Self {
-        Self {
-            task: None,
-            turn_state: Arc::new(Mutex::new(TurnState::default())),
-        }
-    }
-}
-
-impl ActiveTurn {
-    pub(super) fn running_task(&self) -> Option<&RunningTask> {
-        self.task.as_ref()
-    }
-
-    pub(super) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
-        &self.turn_state
-    }
-
-    pub(super) fn install_running_task(&mut self, task: RunningTask) {
-        self.task = Some(task);
-    }
-
-    pub(crate) fn take_running_task(&mut self) -> Option<RunningTask> {
-        self.task.take()
-    }
-
-    pub(crate) fn into_turn_state(self) -> Arc<Mutex<TurnState>> {
-        self.turn_state
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TaskKind {
     Regular,
@@ -99,9 +61,14 @@ pub(crate) struct RunningTask {
     pub(crate) handle: AbortOnDropHandle<()>,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) turn_extension_data: Arc<ExtensionData>,
-    pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
+}
+
+impl TurnLifecycleTask for RunningTask {
+    fn turn_context(&self) -> &Arc<TurnContext> {
+        &self.turn_context
+    }
 }
 
 /// Mutable state for a single turn.

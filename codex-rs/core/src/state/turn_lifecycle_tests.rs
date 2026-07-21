@@ -12,6 +12,82 @@ impl TurnLifecycleTask for TestTask {
         &self.0
     }
 }
+
+#[tokio::test]
+async fn exact_cancel_rejects_foreign_and_stale_generations() {
+    let mut slot = TurnLifecycleSlot::<(), TestTask>::default();
+    let first_driver = slot.start(()).expect("idle slot");
+    let first = first_driver.generation();
+    let mut other_slot = TurnLifecycleSlot::<(), TestTask>::default();
+    let other_driver = other_slot.start(()).expect("other idle slot");
+    let other = other_driver.generation();
+
+    assert!(!slot.cancel_start_exact(&other, TurnAbortReason::Replaced));
+    assert_eq!(first.cancel_reason(), None);
+    assert!(slot.cancel_start_exact(&first, TurnAbortReason::Interrupted));
+    let Ok(TurnAbortReason::Interrupted) = slot.complete_cancelled_start(first_driver) else {
+        panic!("exact owner should complete cancellation");
+    };
+
+    let successor_driver = slot.start(()).expect("idle slot after cancellation");
+    let successor = successor_driver.generation();
+    assert!(!slot.cancel_start_exact(&first, TurnAbortReason::Replaced));
+    assert_eq!(successor.cancel_reason(), None);
+
+    assert!(slot.cancel_start_exact(&successor, TurnAbortReason::Interrupted));
+    assert!(slot.complete_cancelled_start(successor_driver).is_ok());
+    assert!(other_slot.cancel_start_exact(&other, TurnAbortReason::Interrupted));
+    assert!(other_slot.complete_cancelled_start(other_driver).is_ok());
+}
+
+#[tokio::test]
+async fn lifecycle_finishes_only_after_successful_finalization() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let mut slot = TurnLifecycleSlot::<(), TestTask>::default();
+    let driver = slot.start(()).expect("idle slot");
+    let generation = driver.generation();
+
+    assert!(
+        slot.commit_start(driver, TestTask(Arc::clone(&turn_context), "task"))
+            .is_ok()
+    );
+    assert_eq!(generation.wait_finished().await, TurnStartOutcome::Committed);
+    assert!(!generation.lifecycle_finished.is_cancelled());
+    let (_task, finalization) = slot
+        .begin_finalization(&generation, &turn_context)
+        .expect("exact owner should finalize");
+    assert!(!generation.lifecycle_finished.is_cancelled());
+
+    assert!(slot.complete_finalization(finalization).is_ok());
+    generation.wait_lifecycle_finished().await;
+}
+
+#[tokio::test]
+async fn cancelled_and_poisoned_starts_finish_the_lifecycle() {
+    let mut slot = TurnLifecycleSlot::<(), TestTask>::default();
+    let cancelled_driver = slot.start(()).expect("idle slot");
+    let cancelled = cancelled_driver.generation();
+    assert!(slot.cancel_start_exact(&cancelled, TurnAbortReason::Interrupted));
+    assert!(slot.complete_cancelled_start(cancelled_driver).is_ok());
+    cancelled.wait_lifecycle_finished().await;
+    assert_eq!(
+        cancelled.wait_finished().await,
+        TurnStartOutcome::Cancelled(TurnAbortReason::Interrupted)
+    );
+
+    let abandoned_driver = slot.start(()).expect("idle slot");
+    let poisoned = abandoned_driver.generation();
+    assert!(slot.cancel_start_exact(&poisoned, TurnAbortReason::Replaced));
+    drop(abandoned_driver);
+    assert!(slot.poison_abandoned_start(&poisoned));
+    poisoned.wait_lifecycle_finished().await;
+    assert_eq!(
+        poisoned.wait_finished().await,
+        TurnStartOutcome::Poisoned(TurnAbortReason::Replaced)
+    );
+}
+
 #[tokio::test]
 async fn cancelled_start_is_non_committable_until_compensated() {
     let (_session, turn_context) = make_session_and_context().await;

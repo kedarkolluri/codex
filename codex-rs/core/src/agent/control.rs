@@ -49,6 +49,8 @@ use std::sync::Weak;
 use tokio::sync::watch;
 use tracing::warn;
 
+pub(crate) use self::execution::AgentExecutionAdmission;
+pub(crate) use self::execution::AgentExecutionCapacityWaiter;
 pub(crate) use self::execution::AgentExecutionGuard;
 use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;

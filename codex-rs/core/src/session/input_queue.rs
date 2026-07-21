@@ -231,6 +231,24 @@ impl InputQueue {
         turn_state.lock().await.pending_input.items.extend(input);
     }
 
+    /// Moves mailbox input into an admitted turn immediately before its task is committed.
+    pub(crate) async fn attach_mailbox_input_to_starting_turn(
+        &self,
+        turn_state: &Mutex<TurnState>,
+    ) {
+        let mut turn_state = turn_state.lock().await;
+        if !turn_state.accepts_mailbox_delivery_for_current_turn() {
+            return;
+        }
+        turn_state.pending_input.items.extend(
+            self.mailbox_pending_mails
+                .lock()
+                .await
+                .drain(..)
+                .map(TurnInput::InterAgentCommunication),
+        );
+    }
+
     pub(crate) async fn take_pending_input_for_turn_state(
         &self,
         turn_state: &Mutex<TurnState>,

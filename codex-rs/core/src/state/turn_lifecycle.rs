@@ -13,12 +13,22 @@ pub(crate) struct TurnGeneration {
     token: Arc<()>,
     turn_state: Arc<Mutex<TurnState>>,
     start_control: Arc<TurnStartControl>,
+    lifecycle_finished: CancellationToken,
 }
 impl TurnGeneration {
     fn matches(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.token, &other.token)
     }
 
+    pub(crate) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
+        &self.turn_state
+    }
+
+    pub(crate) fn cancel_reason(&self) -> Option<TurnAbortReason> {
+        self.start_control.cancel_reason()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn cancelled(&self) -> TurnAbortReason {
         self.start_control.cancellation.cancelled().await;
         let Some(reason) = self.start_control.cancel_reason() else {
@@ -29,6 +39,14 @@ impl TurnGeneration {
 
     pub(crate) async fn wait_finished(&self) -> TurnStartOutcome {
         self.start_control.wait_finished().await
+    }
+
+    pub(crate) async fn wait_lifecycle_finished(&self) {
+        self.lifecycle_finished.cancelled().await;
+    }
+
+    fn finish_lifecycle(&self) {
+        self.lifecycle_finished.cancel();
     }
 }
 /// Linear authority that alone may commit or compensate a starting turn.
@@ -158,6 +176,37 @@ pub(crate) trait TurnLifecycleTask {
     fn turn_context(&self) -> &Arc<TurnContext>;
 }
 impl<L, R> TurnLifecycleSlot<L, R> {
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self.state, TurnLifecycleState::Idle)
+    }
+
+    pub(crate) fn current_generation(&self) -> Option<&TurnGeneration> {
+        match &self.state {
+            TurnLifecycleState::Idle => None,
+            TurnLifecycleState::Starting { generation, .. }
+            | TurnLifecycleState::Poisoned {
+                _generation: generation,
+                ..
+            } => Some(generation),
+            TurnLifecycleState::Running { owner, .. }
+            | TurnLifecycleState::Finalizing { owner, .. } => Some(&owner.generation),
+        }
+    }
+
+    pub(crate) fn running(&self) -> Option<(&TurnGeneration, &R)> {
+        let TurnLifecycleState::Running { owner, task, .. } = &self.state else {
+            return None;
+        };
+        Some((&owner.generation, task))
+    }
+
+    pub(crate) fn finalizing_generation(&self) -> Option<&TurnGeneration> {
+        let TurnLifecycleState::Finalizing { owner, .. } = &self.state else {
+            return None;
+        };
+        Some(&owner.generation)
+    }
+
     pub(crate) fn start(&mut self, lease: L) -> Result<TurnStartDriver, L> {
         if !matches!(self.state, TurnLifecycleState::Idle) {
             return Err(lease);
@@ -166,6 +215,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             token: Arc::new(()),
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             start_control: Arc::new(TurnStartControl::new()),
+            lifecycle_finished: CancellationToken::new(),
         };
         self.state = TurnLifecycleState::Starting {
             generation: generation.clone(),
@@ -174,12 +224,49 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         Ok(TurnStartDriver { generation })
     }
 
+    pub(crate) fn replace_start_lease(
+        &mut self,
+        driver: &TurnStartDriver,
+        lease: L,
+    ) -> Result<L, L> {
+        let TurnLifecycleState::Starting {
+            generation,
+            lease: active_lease,
+        } = &mut self.state
+        else {
+            return Err(lease);
+        };
+        if !generation.matches(&driver.generation) {
+            return Err(lease);
+        }
+        Ok(std::mem::replace(active_lease, lease))
+    }
+
     pub(crate) fn cancel_start(&mut self, reason: TurnAbortReason) -> Option<TurnGeneration> {
         let TurnLifecycleState::Starting { generation, .. } = &mut self.state else {
             return None;
         };
         generation.start_control.request_cancel(reason);
         Some(generation.clone())
+    }
+
+    pub(crate) fn cancel_start_exact(
+        &mut self,
+        generation: &TurnGeneration,
+        reason: TurnAbortReason,
+    ) -> bool {
+        let TurnLifecycleState::Starting {
+            generation: active_generation,
+            ..
+        } = &mut self.state
+        else {
+            return false;
+        };
+        if !active_generation.matches(generation) {
+            return false;
+        }
+        active_generation.start_control.request_cancel(reason);
+        true
     }
 
     pub(crate) fn complete_cancelled_start(
@@ -209,6 +296,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             .generation
             .start_control
             .finish(TurnStartOutcome::Cancelled(reason.clone()));
+        driver.generation.finish_lifecycle();
         Ok(reason)
     }
 
@@ -274,6 +362,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             unreachable!("starting state was authenticated before replacement");
         };
         let start_control = Arc::clone(&generation.start_control);
+        generation.finish_lifecycle();
         self.state = TurnLifecycleState::Poisoned {
             _generation: generation,
             _turn_context: None,
@@ -318,15 +407,17 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         if !self.authenticate_finalization(&finalization) {
             return Err(finalization);
         }
-        let TurnLifecycleState::Finalizing { lease, .. } =
+        let TurnLifecycleState::Finalizing { owner, lease, .. } =
             std::mem::replace(&mut self.state, TurnLifecycleState::Idle)
         else {
             unreachable!("finalizing state was authenticated before replacement");
         };
         drop(lease);
+        owner.generation.finish_lifecycle();
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn poison_finalization(
         &mut self,
         finalization: TurnFinalization,
@@ -360,6 +451,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         else {
             unreachable!("finalizing state was authenticated before replacement");
         };
+        owner.generation.finish_lifecycle();
         self.state = TurnLifecycleState::Poisoned {
             _generation: owner.generation,
             _turn_context: Some(owner.turn_context),

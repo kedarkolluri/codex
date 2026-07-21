@@ -5,6 +5,7 @@ use crate::codex_thread::TryStartTurnIfIdleError;
 use crate::codex_thread::TryStartTurnIfIdleRejectionReason;
 use crate::state::TurnState;
 use crate::tasks::RegularTask;
+use crate::tasks::TaskStartOutcome;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::models::ResponseItem;
 use std::sync::Arc;
@@ -20,11 +21,11 @@ impl Session {
         input: Vec<ResponseItem>,
     ) -> Result<(), Vec<ResponseItem>> {
         let active = self.active_turn.lock().await;
-        match active.current_turn_state() {
-            Some(turn_state) => {
+        match active.running_turn() {
+            Some(running_turn) => {
                 self.input_queue
                     .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                        turn_state.as_ref(),
+                        running_turn.turn_state().as_ref(),
                         input.into_iter().map(TurnInput::ResponseItem).collect(),
                     )
                     .await;
@@ -120,15 +121,34 @@ impl Session {
             ));
         }
 
+        let rejected_input = input.clone();
         self.input_queue
             .extend_pending_input_for_turn_state(
                 turn_state.as_ref(),
                 input.into_iter().map(TurnInput::ResponseItem).collect(),
             )
             .await;
-        self.start_task(turn_context, Vec::new(), RegularTask::new())
-            .await;
-        Ok(())
+        match self
+            .start_reserved_task(
+                turn_context,
+                Vec::new(),
+                RegularTask::new(),
+                Arc::clone(&turn_state),
+            )
+            .await
+        {
+            TaskStartOutcome::Started => Ok(()),
+            TaskStartOutcome::Busy
+            | TaskStartOutcome::AtCapacity(_)
+            | TaskStartOutcome::Cancelled(_)
+            | TaskStartOutcome::Poisoned => {
+                self.clear_reserved_idle_turn(&turn_state).await;
+                Err(TryStartTurnIfIdleError::new(
+                    TryStartTurnIfIdleRejectionReason::Busy,
+                    rejected_input,
+                ))
+            }
+        }
     }
 
     async fn clear_reserved_idle_turn(&self, turn_state: &Arc<tokio::sync::Mutex<TurnState>>) {

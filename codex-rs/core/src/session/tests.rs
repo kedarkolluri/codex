@@ -5498,6 +5498,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
+        trigger_turn_retry: super::trigger_turn_retry::TriggerTurnRetry::default(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
@@ -5964,9 +5965,7 @@ async fn record_granted_request_permissions_for_turn_uses_originating_turn() {
                 .reserve_taskless()
                 .expect("session should be idle"),
         );
-        let _ = active_turn
-            .take_for_legacy_abort()
-            .expect("taskless reservation should be active");
+        assert!(active_turn.clear_taskless_exact_state(&originating_turn_state));
         let current_turn_state = Arc::clone(
             active_turn
                 .reserve_taskless()
@@ -7544,7 +7543,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
         .expect("ephemeral guardian review should receive a shutdown op");
 }
 
-async fn make_session_and_context_with_auth_and_config_and_rx<F>(
+pub(crate) async fn make_session_and_context_with_auth_and_config_and_rx<F>(
     auth: CodexAuth,
     dynamic_tools: Vec<DynamicToolSpec>,
     configure_config: F,
@@ -7814,6 +7813,7 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
+        trigger_turn_retry: super::trigger_turn_retry::TriggerTurnRetry::default(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
@@ -9894,7 +9894,13 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("steer pending input into active turn");
 
-    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
+    let generation = sess
+        .active_turn
+        .lock()
+        .await
+        .running_generation()
+        .expect("test task should still own the running generation");
+    sess.on_task_finished(generation, Arc::clone(&tc), /*task_result*/ Ok(None))
         .await;
 
     let history = sess.clone_history().await;

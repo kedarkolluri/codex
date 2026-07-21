@@ -1,3 +1,4 @@
+use super::AgentExecutionAdmission;
 use crate::agent::AgentControl;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -25,9 +26,12 @@ fn execution_guards_count_active_v2_subagent_turns() {
     control
         .ensure_execution_capacity(MultiAgentVersion::V2, &source)
         .expect("first active turn should fit");
-    let first = control
-        .execution_guard(MultiAgentVersion::V2, &source)
-        .expect("v2 subagent execution should be counted");
+    let first = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("first active turn should fit and be counted")
+        }
+    };
     let Err(err) = control.ensure_execution_capacity(MultiAgentVersion::V2, &source) else {
         panic!("second active turn should exceed the derived non-root cap");
     };
@@ -46,19 +50,17 @@ fn execution_guards_count_active_v2_subagent_turns() {
 fn execution_guards_ignore_root_and_v1_turns() {
     let control = control_with_limit(/*max_threads*/ 0);
 
-    assert!(
-        control
-            .execution_guard(MultiAgentVersion::V2, &SessionSource::Cli)
-            .is_none()
-    );
-    assert!(
-        control
-            .execution_guard(
-                MultiAgentVersion::V1,
-                &SessionSource::SubAgent(SubAgentSource::Other("worker".to_string())),
-            )
-            .is_none()
-    );
+    assert!(matches!(
+        control.execution_admission(MultiAgentVersion::V2, &SessionSource::Cli),
+        AgentExecutionAdmission::Unrestricted
+    ));
+    assert!(matches!(
+        control.execution_admission(
+            MultiAgentVersion::V1,
+            &SessionSource::SubAgent(SubAgentSource::Other("worker".to_string())),
+        ),
+        AgentExecutionAdmission::Unrestricted
+    ));
 }
 
 #[test]
@@ -73,9 +75,9 @@ fn execution_guard_capacity_reservation_is_atomic() {
         std::thread::spawn(move || {
             let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
             start.wait();
-            let guard = control.try_execution_guard(MultiAgentVersion::V2, &source);
+            let admission = control.execution_admission(MultiAgentVersion::V2, &source);
             finish.wait();
-            guard
+            admission
         })
     });
 
@@ -86,22 +88,96 @@ fn execution_guard_capacity_reservation_is_atomic() {
     for attempt in handles.map(|handle| handle.join().expect("capacity contender should not panic"))
     {
         match attempt {
-            Ok(Some(_guard)) => admitted += 1,
-            Ok(None) => panic!("V2 subagent execution should require capacity"),
-            Err(CodexErr::AgentLimitReached { max_threads }) => {
+            AgentExecutionAdmission::Admitted(_guard) => admitted += 1,
+            AgentExecutionAdmission::AtCapacity(waiter) => {
+                let CodexErr::AgentLimitReached { max_threads } = waiter.into_limit_error() else {
+                    panic!("capacity waiter should preserve the limit error");
+                };
                 assert_eq!(max_threads, 1);
                 rejected += 1;
             }
-            Err(error) => panic!("unexpected capacity error: {error}"),
+            AgentExecutionAdmission::Unrestricted => {
+                panic!("V2 subagent execution should require capacity")
+            }
         }
     }
     assert_eq!((admitted, rejected), (1, 1));
 
     let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
-    assert!(
-        control
-            .try_execution_guard(MultiAgentVersion::V2, &source)
-            .expect("capacity should be released after both contenders exit")
-            .is_some()
-    );
+    assert!(matches!(
+        control.execution_admission(MultiAgentVersion::V2, &source),
+        AgentExecutionAdmission::Admitted(_)
+    ));
+}
+
+#[tokio::test]
+async fn capacity_waiter_observes_release_before_first_poll() {
+    let control = control_with_limit(/*max_threads*/ 1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let guard = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("first limited turn should be admitted")
+        }
+    };
+    let waiter = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::AtCapacity(waiter) => waiter,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::Admitted(_) => {
+            panic!("second limited turn should wait")
+        }
+    };
+
+    drop(guard);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        waiter.wait_for_release(),
+    )
+        .await
+        .expect("pre-armed waiter should retain a release that happens before polling");
+}
+
+#[tokio::test]
+async fn capacity_retry_rearms_when_released_capacity_is_stolen() {
+    let control = control_with_limit(/*max_threads*/ 1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let first_guard = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("first limited turn should be admitted")
+        }
+    };
+    let first_waiter = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::AtCapacity(waiter) => waiter,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::Admitted(_) => {
+            panic!("retry should receive a capacity waiter")
+        }
+    };
+
+    drop(first_guard);
+    let stealing_guard = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("another claimant should be able to steal the released capacity")
+        }
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        first_waiter.wait_for_release(),
+    )
+    .await
+    .expect("the first pre-armed waiter should still wake");
+    let rearmed_waiter = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::AtCapacity(waiter) => waiter,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::Admitted(_) => {
+            panic!("retry must rearm after the released capacity is stolen")
+        }
+    };
+
+    drop(stealing_guard);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        rearmed_waiter.wait_for_release(),
+    )
+    .await
+    .expect("rearmed waiter should observe the thief's release");
 }

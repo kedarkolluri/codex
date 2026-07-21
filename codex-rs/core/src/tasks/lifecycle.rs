@@ -5,15 +5,22 @@ use codex_protocol::protocol::TurnAbortReason;
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::state::turn_lifecycle::TurnGeneration;
 
 impl Session {
     pub(super) async fn emit_turn_start_lifecycle(
         &self,
         turn_context: &TurnContext,
         token_usage_at_turn_start: &TokenUsage,
+        generation: &TurnGeneration,
+        started_contributors: &mut usize,
     ) {
         let collaboration_mode = turn_context.collaboration_mode();
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
+            if generation.cancel_reason().is_some() {
+                break;
+            }
+            *started_contributors += 1;
             contributor
                 .on_turn_start(codex_extension_api::TurnStartInput {
                     turn_id: turn_context.sub_id.as_str(),
@@ -62,6 +69,30 @@ impl Session {
         turn_store: &ExtensionData,
     ) {
         for contributor in self.services.extensions.turn_lifecycle_contributors() {
+            contributor
+                .on_turn_abort(codex_extension_api::TurnAbortInput {
+                    reason: reason.clone(),
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store,
+                })
+                .await;
+        }
+    }
+
+    pub(super) async fn emit_started_turn_abort_lifecycle(
+        &self,
+        reason: TurnAbortReason,
+        turn_store: &ExtensionData,
+        started_contributors: usize,
+    ) {
+        for contributor in self
+            .services
+            .extensions
+            .turn_lifecycle_contributors()
+            .iter()
+            .take(started_contributors)
+        {
             contributor
                 .on_turn_abort(codex_extension_api::TurnAbortInput {
                     reason: reason.clone(),
