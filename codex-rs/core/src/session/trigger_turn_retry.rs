@@ -46,9 +46,7 @@ impl PendingWorkStartRequest {
     }
 
     fn merge(&mut self, mut newer: Self) {
-        if self.ticket == newer.ticket
-            && self.invalidation == AutomaticTicketInvalidation::Retry
-        {
+        if self.ticket == newer.ticket && self.invalidation == AutomaticTicketInvalidation::Retry {
             newer.invalidation = AutomaticTicketInvalidation::Retry;
         }
         *self = newer;
@@ -147,7 +145,10 @@ impl Session {
     ) {
         let claim = {
             let _active_turn = self.active_turn.lock().await;
-            if !self.turn_start_gate.admits_automatic_start(request.ticket()) {
+            if !self
+                .turn_start_gate
+                .admits_automatic_start(request.ticket())
+            {
                 return;
             }
             self.trigger_turn_retry.register_capacity_wait(request)

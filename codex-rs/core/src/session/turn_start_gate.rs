@@ -1,7 +1,7 @@
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use tokio::sync::Mutex;
 use tokio::sync::OwnedMutexGuard;
@@ -50,18 +50,15 @@ impl TurnStartGate {
     }
 
     pub(crate) fn automatic_start_ticket(&self) -> Option<AutomaticTurnStartTicket> {
-        self.is_open().then(|| {
-            AutomaticTurnStartTicket(self.automatic_state.load(Ordering::Acquire))
-        })
+        self.is_open()
+            .then(|| AutomaticTurnStartTicket(self.automatic_state.load(Ordering::Acquire)))
     }
 
     pub(crate) fn admits_automatic_start(&self, ticket: AutomaticTurnStartTicket) -> bool {
         self.is_open() && self.automatic_state.load(Ordering::Acquire) == ticket.0
     }
 
-    pub(crate) fn retry_automatic_starts_after_invalidation(
-        &self,
-    ) -> AutomaticTurnStartTicket {
+    pub(crate) fn retry_automatic_starts_after_invalidation(&self) -> AutomaticTurnStartTicket {
         self.invalidate_automatic_starts(AutomaticStartInvalidation::Retry)
     }
 
@@ -75,19 +72,18 @@ impl TurnStartGate {
     ) -> Option<AutomaticTurnStartTicket> {
         let state = self.automatic_state.load(Ordering::Acquire);
         let expected = Self::next_automatic_state(ticket.0, AutomaticStartInvalidation::Retry);
-        (self.is_open() && state == expected)
-            .then_some(AutomaticTurnStartTicket(state))
+        (self.is_open() && state == expected).then_some(AutomaticTurnStartTicket(state))
     }
 
     fn invalidate_automatic_starts(
         &self,
         invalidation: AutomaticStartInvalidation,
     ) -> AutomaticTurnStartTicket {
-        let previous = self.automatic_state.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |state| Some(Self::next_automatic_state(state, invalidation)),
-        );
+        let previous =
+            self.automatic_state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    Some(Self::next_automatic_state(state, invalidation))
+                });
         let previous = match previous {
             Ok(previous) => previous,
             Err(_) => unreachable!("automatic-start invalidation always returns a successor"),

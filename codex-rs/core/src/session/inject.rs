@@ -73,8 +73,7 @@ impl Session {
 
         {
             let active_turn = self.active_turn.lock().await;
-            if !self.turn_start_gate.admits_automatic_start(ticket)
-                || active_turn.has_active_turn()
+            if !self.turn_start_gate.admits_automatic_start(ticket) || active_turn.has_active_turn()
             {
                 return Err(TryStartTurnIfIdleError::new(
                     TryStartTurnIfIdleRejectionReason::Busy,
@@ -140,12 +139,10 @@ impl Session {
             | TaskStartOutcome::StartInProgress(_)
             | TaskStartOutcome::AtCapacity(_)
             | TaskStartOutcome::Cancelled(_)
-            | TaskStartOutcome::Poisoned => {
-                Err(TryStartTurnIfIdleError::new(
-                    TryStartTurnIfIdleRejectionReason::Busy,
-                    rejected_input,
-                ))
-            }
+            | TaskStartOutcome::Poisoned => Err(TryStartTurnIfIdleError::new(
+                TryStartTurnIfIdleRejectionReason::Busy,
+                rejected_input,
+            )),
         }
     }
 

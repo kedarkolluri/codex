@@ -31,13 +31,12 @@ impl Session {
         let (mut transition, retry_ticket) = {
             let mut active_turn = self.active_turn.lock().await;
             let transition = active_turn.begin_abort(reason.clone());
-            let retry_ticket =
-                if matches!(&transition, SessionTurnAbortTransition::Inactive) {
-                    self.turn_start_gate.suppress_automatic_starts();
-                    None
-                } else {
-                    self.invalidate_automatic_starts_for_abort(&reason)
-                };
+            let retry_ticket = if matches!(&transition, SessionTurnAbortTransition::Inactive) {
+                self.turn_start_gate.suppress_automatic_starts();
+                None
+            } else {
+                self.invalidate_automatic_starts_for_abort(&reason)
+            };
             (transition, retry_ticket)
         };
         let finalizing_turn = loop {
@@ -45,8 +44,7 @@ impl Session {
                 SessionTurnAbortTransition::Starting(generation) => {
                     match generation.wait_finished().await {
                         LifecycleStartOutcome::Committed => {
-                            transition =
-                                self.active_turn.lock().await.begin_abort(reason.clone());
+                            transition = self.active_turn.lock().await.begin_abort(reason.clone());
                         }
                         LifecycleStartOutcome::Cancelled(_) => {
                             if let Some(ticket) = retry_ticket {

@@ -15,9 +15,9 @@ use tokio::time::timeout;
 use super::AutomaticTicketInvalidation;
 use super::PendingWorkStartRequest;
 use super::TriggerTurnRetry;
-use crate::session::turn_start_gate::TurnStartGate;
 use crate::agent::AgentControl;
 use crate::session::tests::make_session_and_context;
+use crate::session::turn_start_gate::TurnStartGate;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -154,11 +154,7 @@ async fn released_capacity_retries_and_commits_trigger_mail() {
     let (mut session, _turn_context) = make_session_and_context().await;
     let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
     session.multi_agent_version = OnceLock::from(MultiAgentVersion::V2);
-    session
-        .state
-        .get_mut()
-        .session_configuration
-        .session_source = source.clone();
+    session.state.get_mut().session_configuration.session_source = source.clone();
     session.services.agent_control =
         AgentControl::default().with_session_id(SessionId::new(), /*max_threads*/ 1);
     let held_capacity = session

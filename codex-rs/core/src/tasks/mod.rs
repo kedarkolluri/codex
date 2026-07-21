@@ -55,14 +55,14 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::models::ContentItem;
 pub(crate) use compact::CompactTask;
+use finalization::PendingFinalization;
+use finalization::PendingFinalizationOutcome;
 pub(crate) use regular::RegularTask;
 pub(crate) use review::ReviewTask;
 pub(crate) use start_transaction::TaskStartOutcome;
 pub(crate) use user_shell::UserShellCommandMode;
 pub(crate) use user_shell::UserShellCommandTask;
 pub(crate) use user_shell::execute_user_shell_command;
-use finalization::PendingFinalization;
-use finalization::PendingFinalizationOutcome;
 
 const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100;
 const TASK_COMPACT_METRIC: &str = "codex.task.compact";
@@ -561,11 +561,9 @@ impl Session {
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }
-        if cleared_active_turn {
-            if let Some(ticket) = automatic_start_ticket {
-                self.maybe_start_turn_for_pending_work_with_ticket(ticket)
-                    .await;
-            }
+        if cleared_active_turn && let Some(ticket) = automatic_start_ticket {
+            self.maybe_start_turn_for_pending_work_with_ticket(ticket)
+                .await;
         }
     }
 

@@ -77,10 +77,7 @@ impl Session {
         })
     }
 
-    async fn drive_pending_work_start_owned(
-        self: Arc<Self>,
-        request: PendingWorkStartRequest,
-    ) {
+    async fn drive_pending_work_start_owned(self: Arc<Self>, request: PendingWorkStartRequest) {
         let (mut sub_id, mut ticket, invalidation) = request.into_parts();
         loop {
             if !self.turn_start_gate.admits_automatic_start(ticket) {
@@ -90,9 +87,8 @@ impl Session {
                 match invalidation {
                     AutomaticTicketInvalidation::Suppress => break,
                     AutomaticTicketInvalidation::Retry => {
-                        let Some(next_ticket) = self
-                            .turn_start_gate
-                            .retry_ticket_after_invalidation(ticket)
+                        let Some(next_ticket) =
+                            self.turn_start_gate.retry_ticket_after_invalidation(ticket)
                         else {
                             break;
                         };

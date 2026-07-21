@@ -92,6 +92,10 @@ async fn wait_until_start_holds_turn_slot(session: &Session) {
     .expect("task start should reach its commit critical section");
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "the held turn-state lock is the deterministic commit barrier under test"
+)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn start_in_commit_section_linearizes_before_shutdown_gate_close() {
     let probe = Arc::new(PausingTurnStart::default());

@@ -5,17 +5,17 @@ use tokio::sync::Mutex;
 use crate::agent::control::AgentExecutionGuard;
 
 #[cfg(test)]
-use codex_protocol::protocol::TurnAbortReason;
-#[cfg(test)]
 use super::ActiveTurn;
 use super::RunningTask;
 use super::TurnState;
+#[cfg(test)]
+use super::turn_lifecycle::TurnFinalization;
 use super::turn_lifecycle::TurnGeneration;
 use super::turn_lifecycle::TurnLifecycleSlot;
 #[cfg(test)]
-use super::turn_lifecycle::TurnFinalization;
-#[cfg(test)]
 use super::turn_lifecycle::TurnStartDriver;
+#[cfg(test)]
+use codex_protocol::protocol::TurnAbortReason;
 
 mod exact;
 

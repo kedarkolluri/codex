@@ -14,14 +14,14 @@ use tokio::time::timeout;
 use super::PendingTaskStart;
 use super::PendingTaskStartOutcome;
 use super::PendingTaskStartRecovery;
-use crate::tasks::RegularTask;
-use crate::tasks::TaskStartOutcome;
 use crate::session::session::Session;
 use crate::session::tests::make_session_and_context;
 use crate::session::turn_context::TurnContext;
 use crate::state::SessionTurnAbortTransition;
 use crate::state::turn_lifecycle::TurnGeneration;
 use crate::state::turn_lifecycle::TurnStartOutcome;
+use crate::tasks::RegularTask;
+use crate::tasks::TaskStartOutcome;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
 

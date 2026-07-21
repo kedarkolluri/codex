@@ -183,19 +183,14 @@ impl Session {
                     .map_or(TaskStartOutcome::Busy, TaskStartOutcome::StartInProgress);
             };
             let automatic_start_ticket_for_finish = match admission {
-                TaskStartAdmission::Unconditional => {
-                    self.turn_start_gate.automatic_start_ticket()
-                }
+                TaskStartAdmission::Unconditional => self.turn_start_gate.automatic_start_ticket(),
                 TaskStartAdmission::AutomaticIdle(ticket)
                 | TaskStartAdmission::AutomaticTrigger(ticket) => Some(ticket),
             };
             (driver, automatic_start_ticket_for_finish)
         };
-        let mut pending_start = PendingTaskStart::new(
-            Arc::clone(self),
-            Arc::clone(&turn_context),
-            driver,
-        );
+        let mut pending_start =
+            PendingTaskStart::new(Arc::clone(self), Arc::clone(&turn_context), driver);
         drop(admission_permit);
         let generation = pending_start.generation();
         let TaskStartInput {
@@ -223,10 +218,10 @@ impl Session {
             .clear_turn(&turn_context.sub_id);
 
         if !self.turn_start_gate.is_open() {
-            self.active_turn.lock().await.cancel_start_exact(
-                &generation,
-                TurnAbortReason::Interrupted,
-            );
+            self.active_turn
+                .lock()
+                .await
+                .cancel_start_exact(&generation, TurnAbortReason::Interrupted);
         }
         if generation.cancel_reason().is_some() {
             return pending_start.compensate().await.into();
@@ -282,7 +277,11 @@ impl Session {
             drop(active_turn);
             return pending_start.compensate().await.into();
         }
-        generation.turn_state().lock().await.token_usage_at_turn_start = token_usage_at_turn_start;
+        generation
+            .turn_state()
+            .lock()
+            .await
+            .token_usage_at_turn_start = token_usage_at_turn_start;
         let prepared_input = self
             .input_queue
             .prepare_starting_turn_input(generation.turn_state().as_ref(), pending_input)

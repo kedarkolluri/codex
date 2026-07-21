@@ -128,10 +128,7 @@ impl SessionTurnSlot {
         {
             if let Some(driver) = self.legacy_start.take() {
                 let generation = driver.generation();
-                if !self
-                    .lifecycle
-                    .cancel_start_exact(&generation, reason.clone())
-                {
+                if !self.lifecycle.cancel_start_exact(&generation, reason) {
                     self.legacy_start = Some(driver);
                     return SessionTurnAbortTransition::Inactive;
                 }

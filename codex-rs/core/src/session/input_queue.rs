@@ -100,8 +100,7 @@ pub(crate) struct PreparedStartingTurnInput<'a> {
 
 impl PreparedStartingTurnInput<'_> {
     pub(crate) fn has_trigger_turn_mailbox_items(&self) -> bool {
-        self.turn_state.pending_input.items
-            [self.original_pending_len + self.explicit_pending_len..]
+        self.turn_state.pending_input.items[self.original_pending_len + self.explicit_pending_len..]
             .iter()
             .any(|input| {
                 matches!(
@@ -295,6 +294,10 @@ impl InputQueue {
     }
 
     /// Prepares explicit and mailbox input for one admitted task start.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "turn-state and mailbox attachment must remain atomic for rollback or commit"
+    )]
     pub(crate) async fn prepare_starting_turn_input<'a>(
         &'a self,
         turn_state: &'a Mutex<TurnState>,
@@ -306,11 +309,10 @@ impl InputQueue {
         let explicit_pending_len = pending_input.len();
         turn_state.pending_input.items.extend(pending_input);
         if turn_state.accepts_mailbox_delivery_for_current_turn() {
-            turn_state.pending_input.items.extend(
-                mailbox
-                    .drain(..)
-                    .map(TurnInput::InterAgentCommunication),
-            );
+            turn_state
+                .pending_input
+                .items
+                .extend(mailbox.drain(..).map(TurnInput::InterAgentCommunication));
         }
         PreparedStartingTurnInput {
             activity_tx: &self.activity_tx,

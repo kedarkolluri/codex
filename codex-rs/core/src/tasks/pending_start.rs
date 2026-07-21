@@ -240,8 +240,8 @@ async fn recover_pending_start(
                 Ok(reason) => PendingTaskStartOutcome::Cancelled(reason),
                 Err(driver) => {
                     let generation = driver.generation();
-                    let cancelled_exact = active_turn
-                        .cancel_start_exact(&generation, TurnAbortReason::Interrupted);
+                    let cancelled_exact =
+                        active_turn.cancel_start_exact(&generation, TurnAbortReason::Interrupted);
                     if cancelled_exact {
                         assert!(
                             active_turn.poison_abandoned_start(driver).is_ok(),

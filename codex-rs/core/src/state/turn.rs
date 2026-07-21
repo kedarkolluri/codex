@@ -81,7 +81,6 @@ impl ActiveTurn {
     pub(super) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
         &self.turn_state
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
