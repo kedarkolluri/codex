@@ -218,6 +218,7 @@ pub(crate) mod session;
 pub(crate) mod step_context;
 pub(crate) mod time_reminder;
 mod token_budget;
+#[allow(dead_code)] // Activated by the atomic task-start stage.
 mod trigger_turn_retry;
 pub(crate) mod turn;
 mod turn_admission_registry;
