@@ -1,6 +1,7 @@
 use super::ParsedWorkflowMeta;
 use super::WORKFLOW_META_MAX_BYTES;
 use super::parse_workflow_meta;
+use crate::WORKFLOW_AGENT_OPTION_MAX_BYTES;
 use crate::WORKFLOW_DESCRIPTION_MAX_BYTES;
 use crate::WORKFLOW_NAME_MAX_BYTES;
 use crate::WORKFLOW_PHASE_TITLE_MAX_BYTES;
@@ -24,6 +25,34 @@ fn parses_string_phases_in_declaration_order() {
             .unwrap()
             .phases,
         Vec::<String>::new()
+    );
+}
+
+#[test]
+fn parses_claude_phase_objects_and_preserves_mixed_order() {
+    let source = r#"export const meta = {
+        name: 'triage',
+        description: 'Triage bugs',
+        phases: [
+            { detail: 'fan out scanners', title: 'Scan' },
+            'Fix',
+            { 'title': 'Prove', model: 'claude-sonnet', },
+            { title: 'Report' },
+        ],
+    }
+    throw new Error('the body is not metadata');"#;
+    assert_eq!(
+        parse_workflow_meta(source),
+        Ok(ParsedWorkflowMeta {
+            name: "triage".to_string(),
+            description: "Triage bugs".to_string(),
+            phases: vec![
+                "Scan".to_string(),
+                "Fix".to_string(),
+                "Prove".to_string(),
+                "Report".to_string(),
+            ],
+        })
     );
 }
 
@@ -126,7 +155,37 @@ fn rejects_invalid_phase_shapes() {
     let cases = [
         ("phases: value", "array"),
         ("phases: [1]", "quoted string"),
+        ("phases: ['valid', 1]", "quoted string"),
+        ("phases: [, 'p']", "quoted string"),
+        ("phases: [buildPhase()]", "quoted string"),
         ("phases: [`template`]", "template strings"),
+        ("phases: [{}]", "title` is required"),
+        ("phases: [{ detail: 'd' }]", "title` is required"),
+        ("phases: [{ title: '  ' }]", "must not be empty"),
+        ("phases: [{ title: value }]", "quoted string"),
+        ("phases: [{ title: 'p', detail: value }]", "quoted string"),
+        (
+            "phases: [{ title: 'p', model: chooseModel() }]",
+            "quoted string",
+        ),
+        (
+            "phases: [{ title: 'a', 'title': 'b' }]",
+            "duplicate `meta.phases[].title`",
+        ),
+        (
+            "phases: [{ title: 'p', detail: 'a', detail: 'b' }]",
+            "duplicate `meta.phases[].detail`",
+        ),
+        (
+            "phases: [{ title: 'p', model: 'a', model: 'b' }]",
+            "duplicate `meta.phases[].model`",
+        ),
+        ("phases: [{ title: 'p', subtitle: 's' }]", "supports only"),
+        ("phases: [{ ...phase }]", "spread"),
+        ("phases: [{ [key]: 'p' }]", "computed"),
+        ("phases: [{ title }]", "require `:`"),
+        ("phases: [{ title() {} }]", "require `:`"),
+        (r#"phases: [{ title: `template` }]"#, "template strings"),
     ];
     for (phases, expected) in cases {
         let source = format!("export const meta = {{ name: 'n', description: 'd', {phases} }};");
@@ -242,7 +301,27 @@ fn enforces_metadata_field_and_collection_bounds() {
     assert!(parse_workflow_meta(&source("n", "d", &phases)).is_err());
     assert!(parse_workflow_meta(&source("n", "d", "['  ']")).is_err());
 
-    let exact_count = format!("[{}]", vec!["'p'"; WORKFLOW_PHASES_MAX_ITEMS].join(","));
+    let phases = format!("[{{ title: '{exact_title}' }}]");
+    assert!(parse_workflow_meta(&source("n", "d", &phases)).is_ok());
+    let phases = format!("[{{ title: '{exact_title}p' }}]");
+    assert!(parse_workflow_meta(&source("n", "d", &phases)).is_err());
+
+    let exact_detail = "d".repeat(WORKFLOW_DESCRIPTION_MAX_BYTES);
+    let phases = format!("[{{ title: 'p', detail: '{exact_detail}' }}]");
+    assert!(parse_workflow_meta(&source("n", "d", &phases)).is_ok());
+    let phases = format!("[{{ title: 'p', detail: '{exact_detail}d' }}]");
+    assert!(parse_workflow_meta(&source("n", "d", &phases)).is_err());
+
+    let exact_model = "m".repeat(WORKFLOW_AGENT_OPTION_MAX_BYTES);
+    let phases = format!("[{{ title: 'p', model: '{exact_model}' }}]");
+    assert!(parse_workflow_meta(&source("n", "d", &phases)).is_ok());
+    let phases = format!("[{{ title: 'p', model: '{exact_model}m' }}]");
+    assert!(parse_workflow_meta(&source("n", "d", &phases)).is_err());
+
+    let exact_count = format!(
+        "[{},{{ title: 'last' }}]",
+        vec!["'p'"; WORKFLOW_PHASES_MAX_ITEMS - 1].join(",")
+    );
     assert_eq!(
         parse_workflow_meta(&source("n", "d", &exact_count))
             .unwrap()
@@ -250,7 +329,10 @@ fn enforces_metadata_field_and_collection_bounds() {
             .len(),
         WORKFLOW_PHASES_MAX_ITEMS
     );
-    let over_count = format!("[{},'p']", vec!["'p'"; WORKFLOW_PHASES_MAX_ITEMS].join(","));
+    let over_count = format!(
+        "[{},{{ title: 'last' }},{{ title: 'over' }}]",
+        vec!["'p'"; WORKFLOW_PHASES_MAX_ITEMS - 1].join(",")
+    );
     assert!(parse_workflow_meta(&source("n", "d", &over_count)).is_err());
 }
 
