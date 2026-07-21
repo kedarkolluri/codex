@@ -129,6 +129,38 @@ async fn exact_context_owns_running_and_finalizing_generation() {
     assert_eq!(lease, "successor capacity");
 }
 
+#[tokio::test]
+async fn legacy_running_replacement_preserves_generation_and_state() {
+    let (session, first_context) = make_session_and_context().await;
+    let first_context = Arc::new(first_context);
+    let second_context = session.new_default_turn().await;
+    let mut slot = TurnLifecycleSlot::<(), TestTask>::default();
+    let driver = slot.start(()).expect("idle slot");
+    let generation = driver.generation();
+    let turn_state = Arc::clone(generation.turn_state());
+    assert!(
+        slot.commit_start(driver, TestTask(first_context, "first"))
+            .is_ok()
+    );
+
+    let Ok(Some(replaced)) =
+        slot.install_running_task_for_legacy(TestTask(Arc::clone(&second_context), "second"))
+    else {
+        panic!("running replacement should return the old task");
+    };
+    assert_eq!(replaced.1, "first");
+    let (running_generation, running_context, task) = slot.running().expect("replacement running");
+    assert!(running_generation.matches(&generation));
+    assert!(Arc::ptr_eq(running_generation.turn_state(), &turn_state));
+    assert!(Arc::ptr_eq(running_context, &second_context));
+    assert_eq!(task.1, "second");
+    let (task, finalization) = slot
+        .begin_finalization(&generation, &second_context)
+        .expect("replacement should finalize under the original generation");
+    assert_eq!(task.1, "second");
+    assert!(slot.complete_finalization(finalization).is_ok());
+}
+
 #[derive(Debug)]
 struct DropLease(Arc<AtomicUsize>);
 

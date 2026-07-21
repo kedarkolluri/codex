@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 use crate::agent::control::AgentExecutionGuard;
 use crate::session::TurnInputQueue;
 use crate::session::turn_context::TurnContext;
+use crate::state::turn_lifecycle::TurnLifecycleTask;
 use crate::tasks::AnySessionTask;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ReviewDecision;
@@ -63,16 +64,18 @@ impl Default for ActiveTurn {
 }
 
 impl ActiveTurn {
+    pub(super) fn from_parts(task: Option<RunningTask>, turn_state: Arc<Mutex<TurnState>>) -> Self {
+        Self { task, turn_state }
+    }
+
+    #[cfg(test)]
     pub(super) fn running_task(&self) -> Option<&RunningTask> {
         self.task.as_ref()
     }
 
+    #[cfg(test)]
     pub(super) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
         &self.turn_state
-    }
-
-    pub(super) fn install_running_task(&mut self, task: RunningTask) {
-        self.task = Some(task);
     }
 
     pub(crate) fn take_running_task(&mut self) -> Option<RunningTask> {
@@ -102,6 +105,12 @@ pub(crate) struct RunningTask {
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
     // Timer recorded when the task drops to capture the full turn duration.
     pub(crate) _timer: Option<codex_otel::Timer>,
+}
+
+impl TurnLifecycleTask for RunningTask {
+    fn turn_context(&self) -> &Arc<TurnContext> {
+        &self.turn_context
+    }
 }
 
 /// Mutable state for a single turn.

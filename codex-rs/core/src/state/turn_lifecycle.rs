@@ -19,6 +19,10 @@ impl TurnGeneration {
         Arc::ptr_eq(&self.token, &other.token)
     }
 
+    pub(crate) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
+        &self.turn_state
+    }
+
     pub(crate) async fn cancelled(&self) -> TurnAbortReason {
         self.start_control.cancellation.cancelled().await;
         let Some(reason) = self.start_control.cancel_reason() else {
@@ -158,6 +162,64 @@ pub(crate) trait TurnLifecycleTask {
     fn turn_context(&self) -> &Arc<TurnContext>;
 }
 impl<L, R> TurnLifecycleSlot<L, R> {
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self.state, TurnLifecycleState::Idle)
+    }
+
+    pub(crate) fn current_generation(&self) -> Option<&TurnGeneration> {
+        match &self.state {
+            TurnLifecycleState::Idle => None,
+            TurnLifecycleState::Starting { generation, .. }
+            | TurnLifecycleState::Poisoned {
+                _generation: generation,
+                ..
+            } => Some(generation),
+            TurnLifecycleState::Running { owner, .. }
+            | TurnLifecycleState::Finalizing { owner, .. } => Some(&owner.generation),
+        }
+    }
+
+    pub(crate) fn running(&self) -> Option<(&TurnGeneration, &Arc<TurnContext>, &R)> {
+        let TurnLifecycleState::Running { owner, task, .. } = &self.state else {
+            return None;
+        };
+        Some((&owner.generation, &owner.turn_context, task))
+    }
+
+    /// Preserves the legacy unchecked task assignment while callers migrate.
+    ///
+    /// A running task is replaced in the same generation, and a taskless
+    /// finalization is reopened as running. The latter invalidates its exact
+    /// finalization authority, matching the legacy state check that prevents
+    /// the old cleanup from clearing the newly installed task.
+    pub(crate) fn install_running_task_for_legacy(&mut self, task: R) -> Result<Option<R>, R>
+    where
+        R: TurnLifecycleTask,
+    {
+        let turn_context = Arc::clone(task.turn_context());
+        if let TurnLifecycleState::Running {
+            owner,
+            task: running_task,
+            ..
+        } = &mut self.state
+        {
+            owner.turn_context = turn_context;
+            return Ok(Some(std::mem::replace(running_task, task)));
+        }
+        if !matches!(self.state, TurnLifecycleState::Finalizing { .. }) {
+            return Err(task);
+        }
+        let TurnLifecycleState::Finalizing {
+            mut owner, lease, ..
+        } = std::mem::replace(&mut self.state, TurnLifecycleState::Idle)
+        else {
+            unreachable!("finalizing state was checked before replacement");
+        };
+        owner.turn_context = turn_context;
+        self.state = TurnLifecycleState::Running { owner, lease, task };
+        Ok(None)
+    }
+
     pub(crate) fn start(&mut self, lease: L) -> Result<TurnStartDriver, L> {
         if !matches!(self.state, TurnLifecycleState::Idle) {
             return Err(lease);
