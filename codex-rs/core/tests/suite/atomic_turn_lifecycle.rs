@@ -36,8 +36,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+const CAPACITY_FIXTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Default)]
 struct PauseFirstTurnStart {
@@ -114,6 +118,28 @@ fn body_contains(request: &wiremock::Request, text: &str) -> bool {
     serde_json::from_slice::<Value>(&request.body).is_ok_and(|body| body.to_string().contains(text))
 }
 
+fn request_starts_trigger_turn(
+    request: &wiremock::Request,
+    trigger_content: &str,
+    quiescence_probe: &str,
+) -> bool {
+    let Ok(body) = serde_json::from_slice::<Value>(&request.body) else {
+        return false;
+    };
+    let Some(input) = body["input"].as_array() else {
+        return false;
+    };
+    let trigger_position = input
+        .iter()
+        .rposition(|item| item.to_string().contains(trigger_content));
+    let quiescence_position = input
+        .iter()
+        .rposition(|item| item.to_string().contains(quiescence_probe));
+    trigger_position.is_some_and(|trigger_position| {
+        quiescence_position.is_none_or(|quiescence_position| trigger_position > quiescence_position)
+    })
+}
+
 async fn spawn_capacity_worker(
     thread_manager: &ThreadManager,
     parent: &CodexThread,
@@ -124,7 +150,7 @@ async fn spawn_capacity_worker(
         .try_start_turn_if_idle(vec![responses::user_message_item(prompt)])
         .await
         .expect("worker spawn turn should start");
-    let worker_id = timeout(TEST_TIMEOUT, created.recv())
+    let worker_id = timeout(CAPACITY_FIXTURE_TIMEOUT, created.recv())
         .await
         .expect("worker thread should be created")
         .expect("thread creation channel should remain open");
@@ -324,6 +350,8 @@ async fn trigger_mail_waits_for_execution_capacity_and_starts_exactly_once() -> 
     const PARENT_OWNER_INPUT: &str = "hold the parent execution lease";
     const CHILD_OWNER_INPUT: &str = "hold the child execution lease";
     const TRIGGER_CONTENT: &str = "run after capacity is released";
+    const CAPACITY_WAIT_PROBE_INPUT: &str = "capacity wait path probe";
+    const CAPACITY_QUIESCENCE_PROBE: &str = "verify the target start lane is quiescent";
 
     let server = start_mock_server().await;
     let first_spawn_args = serde_json::to_string(&json!({
@@ -428,12 +456,16 @@ async fn trigger_mail_waits_for_execution_capacity_and_starts_exactly_once() -> 
         sse_completed("child-owner-response"),
     )
     .await;
-    let trigger_response = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| body_contains(request, TRIGGER_CONTENT),
-        sse_completed("capacity-trigger-response"),
-    )
-    .await;
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .and(|request: &wiremock::Request| {
+            request_starts_trigger_turn(request, TRIGGER_CONTENT, CAPACITY_QUIESCENCE_PROBE)
+        })
+        .respond_with(responses::sse_response(sse_completed(
+            "capacity-trigger-response",
+        )))
+        .mount(&server)
+        .await;
 
     probe.arm();
     let parent_for_start = Arc::clone(&capacity_parent.thread);
@@ -477,20 +509,53 @@ async fn trigger_mail_waits_for_execution_capacity_and_starts_exactly_once() -> 
         .submit(Op::RealtimeConversationListVoices)
         .await?;
     wait_for_submission_barrier(target_worker.as_ref()).await;
-    assert!(trigger_response.requests().is_empty());
+    let capacity_wait_probe = responses::user_message_item(CAPACITY_WAIT_PROBE_INPUT);
+    let rejected = target_worker
+        .try_start_turn_if_idle(vec![capacity_wait_probe.clone()])
+        .await
+        .expect_err("pending trigger mail should reject competing idle work");
+    assert_eq!(
+        rejected.reason(),
+        TryStartTurnIfIdleRejectionReason::PendingTriggerTurn
+    );
+    assert_eq!(rejected.into_input(), vec![capacity_wait_probe]);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .expect("mock server should record requests")
+            .iter()
+            .all(|request| {
+                !request_starts_trigger_turn(request, TRIGGER_CONTENT, CAPACITY_QUIESCENCE_PROBE)
+            })
+    );
 
     probe.release_one();
     wait_for_event(target_worker.as_ref(), |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    let request = trigger_response.single_request();
-    let trigger_messages = request
-        .inputs_of_type("agent_message")
-        .into_iter()
-        .filter(|message| {
-            message.get("author").and_then(Value::as_str) == Some("/root/capacity_sender")
+    let requests = server
+        .received_requests()
+        .await
+        .expect("mock server should record requests");
+    let trigger_requests = requests
+        .iter()
+        .filter(|request| {
+            request_starts_trigger_turn(request, TRIGGER_CONTENT, CAPACITY_QUIESCENCE_PROBE)
         })
+        .collect::<Vec<_>>();
+    assert_eq!(trigger_requests.len(), 1);
+    let trigger_body = serde_json::from_slice::<Value>(&trigger_requests[0].body)?;
+    let trigger_messages = trigger_body["input"]
+        .as_array()
+        .expect("trigger request should contain input")
+        .iter()
+        .filter(|message| {
+            message.get("type").and_then(Value::as_str) == Some("agent_message")
+                && message.get("author").and_then(Value::as_str) == Some("/root/capacity_sender")
+        })
+        .cloned()
         .collect::<Vec<_>>();
     assert_eq!(
         strip_metadata_from_json(Value::Array(trigger_messages)),
@@ -501,6 +566,7 @@ async fn trigger_mail_waits_for_execution_capacity_and_starts_exactly_once() -> 
             "content": [{"type": "input_text", "text": TRIGGER_CONTENT}],
         }])
     );
+    assert!(!trigger_body.to_string().contains(CAPACITY_WAIT_PROBE_INPUT));
 
     probe.release_one();
     tokio::join!(
@@ -523,6 +589,43 @@ async fn trigger_mail_waits_for_execution_capacity_and_starts_exactly_once() -> 
         .expect("child capacity turn should start after release")
         .expect("child capacity task should not panic")
         .expect("child capacity turn should start");
+
+    let quiescence_response = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, CAPACITY_QUIESCENCE_PROBE),
+        sse_completed("capacity-quiescence-response"),
+    )
+    .await;
+    target_worker
+        .try_start_turn_if_idle(vec![responses::user_message_item(
+            CAPACITY_QUIESCENCE_PROBE,
+        )])
+        .await
+        .expect("target should accept idle work after all capacity retries settle");
+    wait_for_event(target_worker.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let quiescence_request = quiescence_response.single_request();
+    assert_eq!(
+        quiescence_request
+            .message_input_texts("user")
+            .last()
+            .map(String::as_str),
+        Some(CAPACITY_QUIESCENCE_PROBE)
+    );
+
+    target_worker.shutdown_and_wait().await?;
+    let trigger_request_count = server
+        .received_requests()
+        .await
+        .expect("mock server should record requests")
+        .iter()
+        .filter(|request| {
+            request_starts_trigger_turn(request, TRIGGER_CONTENT, CAPACITY_QUIESCENCE_PROBE)
+        })
+        .count();
+    assert_eq!(trigger_request_count, 1);
     Ok(())
 }
 
