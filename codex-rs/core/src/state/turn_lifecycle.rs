@@ -13,6 +13,7 @@ pub(crate) struct TurnGeneration {
     token: Arc<()>,
     turn_state: Arc<Mutex<TurnState>>,
     start_control: Arc<TurnStartControl>,
+    lifecycle_finished: CancellationToken,
 }
 impl TurnGeneration {
     fn matches(&self, other: &Self) -> bool {
@@ -21,6 +22,10 @@ impl TurnGeneration {
 
     pub(crate) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
         &self.turn_state
+    }
+
+    pub(crate) fn cancel_reason(&self) -> Option<TurnAbortReason> {
+        self.start_control.cancel_reason()
     }
 
     pub(crate) async fn cancelled(&self) -> TurnAbortReason {
@@ -33,6 +38,14 @@ impl TurnGeneration {
 
     pub(crate) async fn wait_finished(&self) -> TurnStartOutcome {
         self.start_control.wait_finished().await
+    }
+
+    pub(crate) async fn wait_lifecycle_finished(&self) {
+        self.lifecycle_finished.cancelled().await;
+    }
+
+    fn finish_lifecycle(&self) {
+        self.lifecycle_finished.cancel();
     }
 }
 /// Linear authority that alone may commit or compensate a starting turn.
@@ -186,6 +199,13 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         Some((&owner.generation, &owner.turn_context, task))
     }
 
+    pub(crate) fn finalizing_generation(&self) -> Option<&TurnGeneration> {
+        let TurnLifecycleState::Finalizing { owner, .. } = &self.state else {
+            return None;
+        };
+        Some(&owner.generation)
+    }
+
     /// Preserves the legacy unchecked task assignment while callers migrate.
     ///
     /// A running task is replaced in the same generation, and a taskless
@@ -228,6 +248,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             token: Arc::new(()),
             turn_state: Arc::new(Mutex::new(TurnState::default())),
             start_control: Arc::new(TurnStartControl::new()),
+            lifecycle_finished: CancellationToken::new(),
         };
         self.state = TurnLifecycleState::Starting {
             generation: generation.clone(),
@@ -236,12 +257,49 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         Ok(TurnStartDriver { generation })
     }
 
+    pub(crate) fn replace_start_lease(
+        &mut self,
+        driver: &TurnStartDriver,
+        lease: L,
+    ) -> Result<L, L> {
+        let TurnLifecycleState::Starting {
+            generation,
+            lease: active_lease,
+        } = &mut self.state
+        else {
+            return Err(lease);
+        };
+        if !generation.matches(&driver.generation) {
+            return Err(lease);
+        }
+        Ok(std::mem::replace(active_lease, lease))
+    }
+
     pub(crate) fn cancel_start(&mut self, reason: TurnAbortReason) -> Option<TurnGeneration> {
         let TurnLifecycleState::Starting { generation, .. } = &mut self.state else {
             return None;
         };
         generation.start_control.request_cancel(reason);
         Some(generation.clone())
+    }
+
+    pub(crate) fn cancel_start_exact(
+        &mut self,
+        generation: &TurnGeneration,
+        reason: TurnAbortReason,
+    ) -> bool {
+        let TurnLifecycleState::Starting {
+            generation: active_generation,
+            ..
+        } = &mut self.state
+        else {
+            return false;
+        };
+        if !active_generation.matches(generation) {
+            return false;
+        }
+        active_generation.start_control.request_cancel(reason);
+        true
     }
 
     pub(crate) fn complete_cancelled_start(
@@ -271,6 +329,7 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             .generation
             .start_control
             .finish(TurnStartOutcome::Cancelled(reason.clone()));
+        driver.generation.finish_lifecycle();
         Ok(reason)
     }
 
@@ -336,12 +395,14 @@ impl<L, R> TurnLifecycleSlot<L, R> {
             unreachable!("starting state was authenticated before replacement");
         };
         let start_control = Arc::clone(&generation.start_control);
+        let lifecycle_generation = generation.clone();
         self.state = TurnLifecycleState::Poisoned {
             _generation: generation,
             _turn_context: None,
             _lease: lease,
         };
         start_control.finish(TurnStartOutcome::Poisoned(reason));
+        lifecycle_generation.finish_lifecycle();
         true
     }
 
@@ -380,12 +441,13 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         if !self.authenticate_finalization(&finalization) {
             return Err(finalization);
         }
-        let TurnLifecycleState::Finalizing { lease, .. } =
+        let TurnLifecycleState::Finalizing { owner, lease, .. } =
             std::mem::replace(&mut self.state, TurnLifecycleState::Idle)
         else {
             unreachable!("finalizing state was authenticated before replacement");
         };
         drop(lease);
+        owner.generation.finish_lifecycle();
         Ok(())
     }
 
@@ -422,11 +484,13 @@ impl<L, R> TurnLifecycleSlot<L, R> {
         else {
             unreachable!("finalizing state was authenticated before replacement");
         };
+        let lifecycle_generation = owner.generation.clone();
         self.state = TurnLifecycleState::Poisoned {
             _generation: owner.generation,
             _turn_context: Some(owner.turn_context),
             _lease: lease,
         };
+        lifecycle_generation.finish_lifecycle();
     }
 
     fn authenticate_finalization(&self, finalization: &TurnFinalization) -> bool {
