@@ -3,10 +3,17 @@ use super::TurnStartGate;
 #[test]
 fn close_is_permanent() {
     let gate = TurnStartGate::default();
+    let ticket = gate.automatic_start_ticket().expect("gate open");
     assert!(gate.is_open());
 
     gate.close();
     assert!(!gate.is_open());
+    assert_eq!(gate.automatic_start_ticket(), None);
+    assert!(!gate.admits_automatic_start(ticket));
+    assert_eq!(gate.retry_ticket_after_invalidation(ticket), None);
+
+    let retry = gate.retry_automatic_starts_after_invalidation();
+    assert!(!gate.admits_automatic_start(retry));
 
     gate.close();
     assert!(!gate.is_open());
