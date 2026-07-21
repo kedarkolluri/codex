@@ -4520,6 +4520,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-workflow-model"
+version = "0.0.0"
+dependencies = [
+ "codex-code-mode-protocol",
+ "codex-protocol",
+ "pretty_assertions",
+]
+
+[[package]]
 name = "color-eyre"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

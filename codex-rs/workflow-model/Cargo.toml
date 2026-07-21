@@ -1,0 +1,20 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-workflow-model"
+version.workspace = true
+
+[lib]
+doctest = false
+name = "codex_workflow_model"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-code-mode-protocol = { workspace = true }
+codex-protocol = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
