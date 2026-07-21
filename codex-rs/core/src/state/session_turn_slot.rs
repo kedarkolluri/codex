@@ -3,6 +3,8 @@ use std::sync::Arc;
 use codex_protocol::protocol::TurnAbortReason;
 use tokio::sync::Mutex;
 
+use crate::agent::control::AgentExecutionGuard;
+
 use super::ActiveTurn;
 use super::RunningTask;
 use super::TurnState;
@@ -11,14 +13,25 @@ use super::turn_lifecycle::TurnGeneration;
 use super::turn_lifecycle::TurnLifecycleSlot;
 use super::turn_lifecycle::TurnStartDriver;
 
+#[allow(dead_code)] // Activated by the next stacked atomic-start change.
+mod exact;
+
+#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
+pub(crate) use exact::SessionTurnAbortTransition;
+#[allow(unused_imports)] // Activated by the next stacked atomic-start change.
+pub(crate) use exact::SessionTurnFinalization;
+
+type SessionLifecycle = TurnLifecycleSlot<Option<AgentExecutionGuard>, RunningTask>;
+
 /// Session-owned compatibility adapter over the exact turn lifecycle slot.
 ///
 /// The stored linear authorities preserve the legacy two-phase start and
 /// finish APIs until their callers move to exact lifecycle transactions.
 #[derive(Default)]
 pub(crate) struct SessionTurnSlot {
-    lifecycle: TurnLifecycleSlot<(), RunningTask>,
+    lifecycle: SessionLifecycle,
     legacy_start: Option<TurnStartDriver>,
+    legacy_running: bool,
     legacy_finalization: Option<LegacyFinalization>,
 }
 
@@ -71,23 +84,21 @@ impl SessionTurnSlot {
         if self.lifecycle.running().is_some() {
             return None;
         }
-        if self.lifecycle.is_idle() {
-            let driver = self.lifecycle.start(()).ok()?;
-            self.legacy_start = Some(driver);
+        if self.legacy_start.is_some() || self.legacy_finalization.is_some() {
+            return self.current_turn_state();
         }
+        if !self.lifecycle.is_idle() {
+            return None;
+        }
+        let driver = self.lifecycle.start(/*lease*/ None).ok()?;
+        self.legacy_start = Some(driver);
         self.current_turn_state()
     }
 
     /// Legacy first get-or-insert and debug-only running-task check.
     pub(crate) fn reserve_taskless_for_legacy_start(&mut self) -> &Arc<Mutex<TurnState>> {
-        if self.lifecycle.is_idle() {
-            let Some(_) = self.reserve_taskless() else {
-                unreachable!("idle lifecycle slot must accept a taskless reservation");
-            };
-        }
-        debug_assert!(self.lifecycle.running().is_none());
-        let Some(turn_state) = self.current_turn_state() else {
-            unreachable!("legacy start must retain an active turn state");
+        let Some(turn_state) = self.reserve_taskless() else {
+            unreachable!("legacy start must not overlap an exact lifecycle owner");
         };
         turn_state
     }
@@ -96,26 +107,36 @@ impl SessionTurnSlot {
     pub(crate) fn install_running_task_for_legacy_start(&mut self, task: RunningTask) {
         debug_assert!(self.lifecycle.running().is_none());
         if let Some(driver) = self.legacy_start.take() {
-            if let Err((driver, _task)) = self.lifecycle.commit_start(driver, task) {
-                self.legacy_start = Some(driver);
-                debug_assert!(false, "legacy task install must commit its reservation");
+            match self.lifecycle.commit_start(driver, task) {
+                Ok(()) => self.legacy_running = true,
+                Err((driver, _task)) => {
+                    self.legacy_start = Some(driver);
+                    debug_assert!(false, "legacy task install must commit its reservation");
+                }
             }
             return;
         }
 
         if self.lifecycle.is_idle() {
-            let Ok(driver) = self.lifecycle.start(()) else {
+            let Ok(driver) = self.lifecycle.start(/*lease*/ None) else {
                 unreachable!("idle lifecycle slot must accept a task start");
             };
             if let Err((_driver, _task)) = self.lifecycle.commit_start(driver, task) {
                 unreachable!("fresh legacy task start must commit");
             }
+            self.legacy_running = true;
             return;
         }
 
+        if !self.legacy_running && self.legacy_finalization.is_none() {
+            return;
+        }
         let finalization = self.legacy_finalization.take();
         match self.lifecycle.install_running_task_for_legacy(task) {
-            Ok(replaced_task) => drop((replaced_task, finalization)),
+            Ok(replaced_task) => {
+                self.legacy_running = true;
+                drop((replaced_task, finalization));
+            }
             Err(_task) => self.legacy_finalization = finalization,
         }
     }
@@ -164,7 +185,7 @@ impl SessionTurnSlot {
     pub(crate) fn take_running_task_for_legacy_finish(
         &mut self,
     ) -> Option<(RunningTask, Arc<Mutex<TurnState>>)> {
-        if self.legacy_finalization.is_some() {
+        if !self.legacy_running || self.legacy_finalization.is_some() {
             return None;
         }
         let (generation, turn_context, _task) = self.lifecycle.running()?;
@@ -174,6 +195,7 @@ impl SessionTurnSlot {
         let (task, authority) = self
             .lifecycle
             .begin_finalization(&generation, &turn_context)?;
+        self.legacy_running = false;
         self.legacy_finalization = Some(LegacyFinalization {
             authority,
             turn_state: Arc::clone(&turn_state),
@@ -198,6 +220,9 @@ impl SessionTurnSlot {
     }
 
     fn take_running_for_legacy_removal(&mut self) -> Option<(RunningTask, Arc<Mutex<TurnState>>)> {
+        if !self.legacy_running {
+            return None;
+        }
         let (generation, turn_context, _task) = self.lifecycle.running()?;
         let generation = generation.clone();
         let turn_context = Arc::clone(turn_context);
@@ -205,6 +230,7 @@ impl SessionTurnSlot {
         let (task, authority) = self
             .lifecycle
             .begin_finalization(&generation, &turn_context)?;
+        self.legacy_running = false;
         let Ok(()) = self.lifecycle.complete_finalization(authority) else {
             unreachable!("fresh legacy removal authority must be exact");
         };
@@ -256,3 +282,7 @@ impl SessionTurnSlot {
 #[cfg(test)]
 #[path = "session_turn_slot_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_turn_slot/exact_tests.rs"]
+mod exact_tests;
