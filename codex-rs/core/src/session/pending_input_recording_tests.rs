@@ -1,7 +1,9 @@
 use super::*;
 use crate::session::input_queue::PendingInputClaim;
 use crate::session::input_queue::PendingInputRecordingResult;
+use crate::state::TurnState;
 use pretty_assertions::assert_eq;
+use tokio::sync::Mutex;
 
 fn response_item(text: &str) -> ResponseItem {
     ResponseItem::Message {
@@ -13,6 +15,16 @@ fn response_item(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+async fn active_turn_state(session: &Session) -> Arc<Mutex<TurnState>> {
+    let active = session.active_turn.lock().await;
+    Arc::clone(
+        &active
+            .as_ref()
+            .expect("test task should own the active turn")
+            .turn_state,
+    )
 }
 
 #[tokio::test]
@@ -237,6 +249,285 @@ async fn pending_input_claim_failure_retains_exact_turn_ownership() {
         .await
     else {
         panic!("an exact claimant should rejoin the sticky failed recording");
+    };
+    assert_eq!(
+        retained.claimed_input().as_ref(),
+        &[TurnInput::ResponseItem(failed)]
+    );
+    assert_eq!(retained.wait().await, PendingInputRecordingResult::Failed);
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn finalizing_claim_drains_local_residuals_without_consuming_next_turn_mail() {
+    let (session, turn_context, _events_rx) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let turn_state = active_turn_state(&session).await;
+    let local_one = response_item("finalizing local input one");
+    let local_two = response_item("finalizing local input two");
+    let mail = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "next-turn mailbox input".to_string(),
+        /*trigger_turn*/ false,
+    );
+    session
+        .input_queue
+        .defer_mailbox_delivery_to_next_turn(&session.active_turn, &turn_context.sub_id)
+        .await;
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            turn_state.as_ref(),
+            vec![TurnInput::ResponseItem(local_one.clone())],
+        )
+        .await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(mail.clone())
+        .await;
+
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_turn(&session.active_turn, &turn_context)
+            .await,
+        PendingInputClaim::Empty
+    ));
+    let other_turn = session
+        .new_default_turn_with_sub_id(turn_context.sub_id.clone())
+        .await;
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_finalizing_turn(&session.active_turn, &other_turn)
+            .await,
+        PendingInputClaim::Inactive
+    ));
+    let PendingInputClaim::Acquired(claim) = session
+        .input_queue
+        .claim_pending_input_for_finalizing_turn(&session.active_turn, &turn_context)
+        .await
+    else {
+        panic!("the exact finalizing turn should claim its local input");
+    };
+    let recording = claim.recording();
+    let (items, completion) = claim.into_parts();
+    assert_eq!(
+        items.as_ref(),
+        &[TurnInput::ResponseItem(local_one.clone())]
+    );
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            turn_state.as_ref(),
+            vec![TurnInput::ResponseItem(local_two.clone())],
+        )
+        .await;
+    let PendingInputClaim::Recording(joined) = session
+        .input_queue
+        .claim_pending_input_for_turn(&session.active_turn, &turn_context)
+        .await
+    else {
+        panic!("a current-turn claimant should join the installed finalizing recording");
+    };
+    assert_eq!(joined.claimed_input(), Arc::clone(&items));
+    let should_stop = false;
+    completion.complete(should_stop).await;
+    let completed = PendingInputRecordingResult::Completed { should_stop };
+    assert_eq!(recording.wait().await, completed);
+    assert_eq!(joined.wait().await, completed);
+
+    let PendingInputClaim::Acquired(claim) = session
+        .input_queue
+        .claim_pending_input_for_finalizing_turn(&session.active_turn, &turn_context)
+        .await
+    else {
+        panic!("input appended during recording should become the next finalizing claim");
+    };
+    let (items, completion) = claim.into_parts();
+    assert_eq!(items.as_ref(), &[TurnInput::ResponseItem(local_two)]);
+    completion.complete(should_stop).await;
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_finalizing_turn(&session.active_turn, &turn_context)
+            .await,
+        PendingInputClaim::Empty
+    ));
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+
+    session
+        .input_queue
+        .accept_mailbox_delivery_for_current_turn(&session.active_turn, &turn_context.sub_id)
+        .await;
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_finalizing_turn(&session.active_turn, &turn_context)
+            .await,
+        PendingInputClaim::Empty
+    ));
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+    let PendingInputClaim::Acquired(claim) = session
+        .input_queue
+        .claim_pending_input_for_turn(&session.active_turn, &turn_context)
+        .await
+    else {
+        panic!("reopened current-turn delivery should claim the retained mailbox input");
+    };
+    let (items, completion) = claim.into_parts();
+    assert_eq!(items.as_ref(), &[TurnInput::InterAgentCommunication(mail)]);
+    completion.complete(should_stop).await;
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+}
+
+#[tokio::test]
+async fn displaced_claim_is_exact_local_only_and_sticky() {
+    let (session, turn_context, _events_rx) = make_session_and_context_with_rx().await;
+    session
+        .spawn_task(
+            Arc::clone(&turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let turn_state = active_turn_state(&session).await;
+    let local_one = response_item("displaced local input one");
+    let local_two = response_item("displaced local input two");
+    let failed = response_item("displaced sticky failure input");
+    let mail = InterAgentCommunication::new(
+        AgentPath::try_from("/root/worker").expect("worker path should parse"),
+        AgentPath::root(),
+        Vec::new(),
+        "successor-owned mailbox input".to_string(),
+        /*trigger_turn*/ false,
+    );
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            turn_state.as_ref(),
+            vec![TurnInput::ResponseItem(local_one.clone())],
+        )
+        .await;
+    session
+        .input_queue
+        .enqueue_mailbox_communication(mail)
+        .await;
+
+    let PendingInputClaim::Acquired(claim) = session
+        .input_queue
+        .claim_pending_input_for_displaced_turn(&turn_state, &turn_context)
+        .await
+    else {
+        panic!("the displaced turn should claim its local input");
+    };
+    let recording = claim.recording();
+    let (items, completion) = claim.into_parts();
+    assert_eq!(
+        items.as_ref(),
+        &[TurnInput::ResponseItem(local_one.clone())]
+    );
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            turn_state.as_ref(),
+            vec![TurnInput::ResponseItem(local_two.clone())],
+        )
+        .await;
+    let other_turn = session
+        .new_default_turn_with_sub_id(turn_context.sub_id.clone())
+        .await;
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_displaced_turn(&turn_state, &other_turn)
+            .await,
+        PendingInputClaim::Inactive
+    ));
+    let PendingInputClaim::Recording(joined) = session
+        .input_queue
+        .claim_pending_input_for_displaced_turn(&turn_state, &turn_context)
+        .await
+    else {
+        panic!("the exact displaced turn should join its installed recording");
+    };
+    assert_eq!(joined.claimed_input(), Arc::clone(&items));
+    let should_stop = false;
+    completion.complete(should_stop).await;
+    let completed = PendingInputRecordingResult::Completed { should_stop };
+    assert_eq!(recording.wait().await, completed);
+    assert_eq!(joined.wait().await, completed);
+
+    let PendingInputClaim::Acquired(claim) = session
+        .input_queue
+        .claim_pending_input_for_displaced_turn(&turn_state, &turn_context)
+        .await
+    else {
+        panic!("post-claim displaced input should become the next claim");
+    };
+    let (items, completion) = claim.into_parts();
+    assert_eq!(items.as_ref(), &[TurnInput::ResponseItem(local_two)]);
+    completion.complete(should_stop).await;
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_displaced_turn(&turn_state, &turn_context)
+            .await,
+        PendingInputClaim::Empty
+    ));
+    assert!(session.input_queue.has_pending_mailbox_items().await);
+
+    session
+        .input_queue
+        .extend_pending_input_for_turn_state(
+            turn_state.as_ref(),
+            vec![TurnInput::ResponseItem(failed.clone())],
+        )
+        .await;
+    let PendingInputClaim::Acquired(claim) = session
+        .input_queue
+        .claim_pending_input_for_displaced_turn(&turn_state, &turn_context)
+        .await
+    else {
+        panic!("the displaced turn should acquire its failure batch");
+    };
+    let failed_recording = claim.recording();
+    let (items, completion) = claim.into_parts();
+    assert_eq!(items.as_ref(), &[TurnInput::ResponseItem(failed.clone())]);
+    drop(completion);
+    assert_eq!(
+        failed_recording.wait().await,
+        PendingInputRecordingResult::Failed
+    );
+    assert!(matches!(
+        session
+            .input_queue
+            .claim_pending_input_for_displaced_turn(&turn_state, &other_turn)
+            .await,
+        PendingInputClaim::Inactive
+    ));
+    let PendingInputClaim::Recording(retained) = session
+        .input_queue
+        .claim_pending_input_for_displaced_turn(&turn_state, &turn_context)
+        .await
+    else {
+        panic!("the exact displaced turn should rejoin its sticky failed recording");
     };
     assert_eq!(
         retained.claimed_input().as_ref(),
