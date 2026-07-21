@@ -4,7 +4,7 @@ mod service;
 mod session;
 mod session_turn_slot;
 mod turn;
-#[allow(dead_code)] // Activated by the next stacked task-lifecycle wiring change.
+#[allow(dead_code)] // Abandonment APIs are activated by the atomic-start stage.
 pub(crate) mod turn_lifecycle;
 
 pub(crate) use additional_context::AdditionalContextStore;
