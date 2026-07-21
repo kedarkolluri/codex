@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(test)]
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -28,6 +29,7 @@ use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::TokenUsage;
 
 /// Metadata about the currently running turn.
+#[cfg(test)]
 pub(crate) struct ActiveTurn {
     task: Option<RunningTask>,
     turn_state: Arc<Mutex<TurnState>>,
@@ -54,6 +56,7 @@ pub(crate) enum MailboxDeliveryPhase {
     NextTurn,
 }
 
+#[cfg(test)]
 impl Default for ActiveTurn {
     fn default() -> Self {
         Self {
@@ -63,27 +66,18 @@ impl Default for ActiveTurn {
     }
 }
 
+#[cfg(test)]
 impl ActiveTurn {
     pub(super) fn from_parts(task: Option<RunningTask>, turn_state: Arc<Mutex<TurnState>>) -> Self {
         Self { task, turn_state }
     }
 
-    #[cfg(test)]
     pub(super) fn running_task(&self) -> Option<&RunningTask> {
         self.task.as_ref()
     }
 
-    #[cfg(test)]
     pub(super) fn turn_state(&self) -> &Arc<Mutex<TurnState>> {
         &self.turn_state
-    }
-
-    pub(crate) fn take_running_task(&mut self) -> Option<RunningTask> {
-        self.task.take()
-    }
-
-    pub(crate) fn into_turn_state(self) -> Arc<Mutex<TurnState>> {
-        self.turn_state
     }
 }
 

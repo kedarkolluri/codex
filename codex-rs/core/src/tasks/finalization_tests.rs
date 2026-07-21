@@ -27,6 +27,7 @@ use crate::tasks::AnySessionTask;
 use crate::tasks::RegularTask;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+const EXPECT_PENDING_TIMEOUT: Duration = Duration::from_millis(50);
 
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     let waker = noop_waker();
@@ -104,6 +105,28 @@ async fn ordinary_completion_releases_the_exact_slot() {
     )
     .await;
     assert!(session.active_turn.lock().await.can_begin_fresh_start());
+}
+
+#[tokio::test]
+async fn abort_waits_for_an_existing_finalization_owner() {
+    let (session, generation, pending) = begin_pending_finalization().await;
+    let mut abort = tokio::spawn({
+        let session = Arc::clone(&session);
+        async move {
+            session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    assert!(timeout(EXPECT_PENDING_TIMEOUT, &mut abort).await.is_err());
+
+    assert_eq!(
+        pending.complete().await,
+        PendingFinalizationOutcome::Completed
+    );
+    timeout(TEST_TIMEOUT, abort)
+        .await
+        .expect("abort should observe finalization completion")
+        .expect("abort task should not panic");
+    wait_for_lifecycle(&generation, "finalization should finish lifecycle").await;
 }
 
 #[tokio::test]

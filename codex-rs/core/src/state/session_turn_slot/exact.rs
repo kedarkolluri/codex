@@ -122,13 +122,25 @@ impl SessionTurnSlot {
         self.lifecycle.commit_start(driver, task)
     }
     pub(crate) fn begin_abort(&mut self, reason: TurnAbortReason) -> SessionTurnAbortTransition {
-        if self.legacy_start.is_none()
-            && let Some(generation) = self.lifecycle.cancel_start(reason)
-        {
+        if let Some(driver) = self.legacy_start.take() {
+            let generation = driver.generation();
+            if !self.lifecycle.cancel_start_exact(&generation, reason) {
+                self.legacy_start = Some(driver);
+                return SessionTurnAbortTransition::Inactive;
+            }
+            match self.lifecycle.complete_cancelled_start(driver) {
+                Ok(_) => return SessionTurnAbortTransition::Starting(generation),
+                Err(driver) => {
+                    self.legacy_start = Some(driver);
+                    return SessionTurnAbortTransition::Inactive;
+                }
+            }
+        }
+        if let Some(generation) = self.lifecycle.cancel_start(reason) {
             return SessionTurnAbortTransition::Starting(generation);
         }
         if let Some((generation, turn_context)) = self.running_identity()
-            && let Some(turn) = self.begin_finalization(&generation, &turn_context)
+            && let Some(turn) = self.begin_running_finalization(&generation, &turn_context)
         {
             return SessionTurnAbortTransition::Running(turn);
         }
@@ -147,10 +159,28 @@ impl SessionTurnSlot {
         if self.legacy_running {
             return None;
         }
+        self.begin_running_finalization(generation, turn_context)
+    }
+    pub(crate) fn begin_running_finalization_for_context(
+        &mut self,
+        turn_context: &Arc<TurnContext>,
+    ) -> Option<FinalizingTurn> {
+        let (generation, running_context) = self.running_identity()?;
+        if !Arc::ptr_eq(&running_context, turn_context) {
+            return None;
+        }
+        self.begin_running_finalization(&generation, &running_context)
+    }
+    fn begin_running_finalization(
+        &mut self,
+        generation: &TurnGeneration,
+        turn_context: &Arc<TurnContext>,
+    ) -> Option<FinalizingTurn> {
         let turn_state = Arc::clone(generation.turn_state());
         let (task, finalization) = self
             .lifecycle
             .begin_finalization(generation, turn_context)?;
+        self.legacy_running = false;
         Some(FinalizingTurn {
             task,
             completion: SessionTurnFinalization {
@@ -167,7 +197,7 @@ impl SessionTurnSlot {
         if turn_context.sub_id != turn_id {
             return None;
         }
-        self.begin_finalization(&generation, &turn_context)
+        self.begin_running_finalization(&generation, &turn_context)
     }
     pub(crate) fn complete_finalization(
         &mut self,

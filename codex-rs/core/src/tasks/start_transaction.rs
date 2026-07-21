@@ -145,6 +145,6 @@ impl Session {
             _agent_execution_guard: agent_execution_guard,
             _timer: timer,
         };
-        active.install_running_task_for_legacy_start(running_task);
+        active.install_running_task_for_legacy_start(&turn_state, running_task);
     }
 }
