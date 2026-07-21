@@ -9,20 +9,52 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use tokio::sync::watch;
 
-#[derive(Default)]
 pub(super) struct AgentExecutionLimiter {
     active: AtomicUsize,
     max_threads: OnceLock<usize>,
+    release_tx: watch::Sender<u64>,
 }
 
 pub(crate) struct AgentExecutionGuard {
     limiter: Arc<AgentExecutionLimiter>,
 }
 
+/// Atomic execution-capacity admission result for a prospective turn.
+#[allow(dead_code)] // Activated by the next stacked task-start reservation change.
+pub(crate) enum AgentExecutionAdmission {
+    Unrestricted,
+    Admitted(AgentExecutionGuard),
+    AtCapacity(AgentExecutionCapacityWaiter),
+}
+
+/// Pre-subscribed notification for retrying a failed capacity admission.
+#[allow(dead_code)] // Activated by the next stacked task-start reservation change.
+pub(crate) struct AgentExecutionCapacityWaiter {
+    max_threads: usize,
+    release_rx: watch::Receiver<u64>,
+}
+
+#[allow(dead_code)] // Activated by the next stacked task-start reservation change.
+impl AgentExecutionCapacityWaiter {
+    pub(crate) fn into_limit_error(self) -> CodexErr {
+        CodexErr::AgentLimitReached {
+            max_threads: self.max_threads,
+        }
+    }
+
+    pub(crate) async fn wait_for_release(mut self) {
+        let _ = self.release_rx.changed().await;
+    }
+}
+
 impl Drop for AgentExecutionGuard {
     fn drop(&mut self) {
-        self.limiter.active.fetch_sub(1, Ordering::AcqRel);
+        self.limiter.active.fetch_sub(/*val*/ 1, Ordering::AcqRel);
+        self.limiter
+            .release_tx
+            .send_modify(|release| *release = release.wrapping_add(/*rhs*/ 1));
     }
 }
 
@@ -81,6 +113,30 @@ impl AgentControl {
             .then(|| Arc::clone(&self.agent_execution_limiter).guard())
     }
 
+    /// Atomically admits a limited turn or returns a pre-subscribed release waiter.
+    #[allow(dead_code)] // Activated by the next stacked task-start reservation change.
+    pub(crate) fn execution_admission(
+        &self,
+        multi_agent_version: MultiAgentVersion,
+        session_source: &SessionSource,
+    ) -> AgentExecutionAdmission {
+        if !is_execution_limited(multi_agent_version, session_source) {
+            return AgentExecutionAdmission::Unrestricted;
+        }
+        let max_threads = self.agent_execution_limiter.max_threads();
+        // Subscribe before the atomic admission attempt. If the capacity owner
+        // drops after the failed CAS but before the caller polls the waiter,
+        // the receiver still observes that release.
+        let release_rx = self.agent_execution_limiter.release_tx.subscribe();
+        match Arc::clone(&self.agent_execution_limiter).try_guard() {
+            Some(guard) => AgentExecutionAdmission::Admitted(guard),
+            None => AgentExecutionAdmission::AtCapacity(AgentExecutionCapacityWaiter {
+                max_threads,
+                release_rx,
+            }),
+        }
+    }
+
     // Used by the next stacked task-start reservation change.
     #[allow(dead_code)]
     pub(crate) fn try_execution_guard(
@@ -96,6 +152,17 @@ impl AgentControl {
             .try_guard()
             .map(Some)
             .ok_or(CodexErr::AgentLimitReached { max_threads })
+    }
+}
+
+impl Default for AgentExecutionLimiter {
+    fn default() -> Self {
+        let (release_tx, _) = watch::channel(/*init*/ 0);
+        Self {
+            active: AtomicUsize::new(/*v*/ 0),
+            max_threads: OnceLock::new(),
+            release_tx,
+        }
     }
 }
 

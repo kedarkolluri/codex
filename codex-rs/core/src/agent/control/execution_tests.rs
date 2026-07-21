@@ -1,3 +1,4 @@
+use super::AgentExecutionAdmission;
 use crate::agent::AgentControl;
 use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::MultiAgentVersion;
@@ -59,6 +60,17 @@ fn execution_guards_ignore_root_and_v1_turns() {
             )
             .is_none()
     );
+    assert!(matches!(
+        control.execution_admission(MultiAgentVersion::V2, &SessionSource::Cli),
+        AgentExecutionAdmission::Unrestricted
+    ));
+    assert!(matches!(
+        control.execution_admission(
+            MultiAgentVersion::V1,
+            &SessionSource::SubAgent(SubAgentSource::Other("worker".to_string())),
+        ),
+        AgentExecutionAdmission::Unrestricted
+    ));
 }
 
 #[test]
@@ -104,4 +116,82 @@ fn execution_guard_capacity_reservation_is_atomic() {
             .expect("capacity should be released after both contenders exit")
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn capacity_waiter_observes_release_before_first_poll() {
+    let control = control_with_limit(/*max_threads*/ 1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let guard = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("first limited turn should be admitted")
+        }
+    };
+    let waiter = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::AtCapacity(waiter) => waiter,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::Admitted(_) => {
+            panic!("second limited turn should wait")
+        }
+    };
+
+    drop(guard);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        waiter.wait_for_release(),
+    )
+    .await
+    .expect("pre-subscribed waiter should retain a release that happens before polling");
+}
+
+#[tokio::test]
+async fn capacity_retry_rearms_after_released_capacity_is_stolen() {
+    let control = control_with_limit(/*max_threads*/ 1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let first_guard = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("first limited turn should be admitted")
+        }
+    };
+    let first_waiter = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::AtCapacity(waiter) => waiter,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::Admitted(_) => {
+            panic!("retry should receive a capacity waiter")
+        }
+    };
+
+    drop(first_guard);
+    let stealing_guard = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::Admitted(guard) => guard,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::AtCapacity(_) => {
+            panic!("another claimant should be able to steal the released capacity")
+        }
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        first_waiter.wait_for_release(),
+    )
+    .await
+    .expect("the first pre-subscribed waiter should still wake");
+    let rearmed_waiter = match control.execution_admission(MultiAgentVersion::V2, &source) {
+        AgentExecutionAdmission::AtCapacity(waiter) => waiter,
+        AgentExecutionAdmission::Unrestricted | AgentExecutionAdmission::Admitted(_) => {
+            panic!("retry must rearm after the released capacity is stolen")
+        }
+    };
+    assert!(
+        !rearmed_waiter
+            .release_rx
+            .has_changed()
+            .expect("the release channel should remain open")
+    );
+
+    drop(stealing_guard);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(/*secs*/ 1),
+        rearmed_waiter.wait_for_release(),
+    )
+    .await
+    .expect("rearmed waiter should observe the thief's release");
 }
