@@ -218,6 +218,7 @@ pub(crate) mod session;
 pub(crate) mod step_context;
 pub(crate) mod time_reminder;
 mod token_budget;
+mod trigger_turn_retry;
 pub(crate) mod turn;
 mod turn_admission_registry;
 pub(crate) mod turn_context;
