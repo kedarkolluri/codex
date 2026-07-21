@@ -210,7 +210,12 @@ async fn run_codex_thread_interactive_respects_pre_cancelled_spawn() {
 async fn handle_request_permissions_uses_tool_call_id_for_round_trip() {
     let (parent_session, mut parent_ctx, rx_events) =
         crate::session::tests::make_session_and_context_with_rx().await;
-    *parent_session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+    parent_session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("parent session should be idle");
     let parent_ctx_mut = Arc::get_mut(&mut parent_ctx).expect("single turn context ref");
     let TurnEnvironmentState::Ready(environment) = &mut parent_ctx_mut.environments.environments[0]
     else {

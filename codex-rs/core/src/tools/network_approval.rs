@@ -488,9 +488,8 @@ impl NetworkApprovalService {
     ) -> Option<Arc<crate::session::turn_context::TurnContext>> {
         let active_turn = session.active_turn.lock().await;
         active_turn
-            .as_ref()
-            .and_then(|turn| turn.task.as_ref())
-            .map(|task| Arc::clone(&task.turn_context))
+            .running_turn()
+            .map(|turn| Arc::clone(&turn.task().turn_context))
     }
 
     fn format_network_target(protocol: &str, host: &str, port: u16) -> String {

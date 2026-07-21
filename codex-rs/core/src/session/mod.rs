@@ -2040,18 +2040,17 @@ impl Session {
 
     pub(crate) async fn turn_context_for_sub_id(&self, sub_id: &str) -> Option<Arc<TurnContext>> {
         let active = self.active_turn.lock().await;
-        active
-            .as_ref()
-            .and_then(|turn| turn.task.as_ref())
-            .filter(|task| task.turn_context.sub_id == sub_id)
-            .map(|task| Arc::clone(&task.turn_context))
+        let running_turn = active.running_turn()?;
+        let task = running_turn.task();
+        (task.turn_context.sub_id == sub_id).then(|| Arc::clone(&task.turn_context))
     }
 
     async fn active_turn_context_and_cancellation_token(
         &self,
     ) -> Option<(Arc<TurnContext>, CancellationToken)> {
         let active = self.active_turn.lock().await;
-        let task = active.as_ref()?.task.as_ref()?;
+        let running_turn = active.running_turn()?;
+        let task = running_turn.task();
         Some((
             Arc::clone(&task.turn_context),
             task.cancellation_token.child_token(),
@@ -2190,10 +2189,10 @@ impl Session {
         // Add the tx_approve callback to the map before sending the request.
         let (tx_approve, rx_approve) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_approval(effective_approval_id.clone(), tx_approve)
                 }
                 None => None,
@@ -2261,10 +2260,10 @@ impl Session {
         let (tx_approve, rx_approve) = oneshot::channel();
         let approval_id = call_id.clone();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_approval(approval_id.clone(), tx_approve)
                 }
                 None => None,
@@ -2337,7 +2336,7 @@ impl Session {
         if crate::guardian::routes_approval_to_guardian(turn_context.as_ref()) {
             let originating_turn_state = {
                 let active = self.active_turn.lock().await;
-                active.as_ref().map(|active| Arc::clone(&active.turn_state))
+                active.current_turn_state().map(Arc::clone)
             };
             let review_id = crate::guardian::new_guardian_review_id();
             let session = Arc::clone(self);
@@ -2414,10 +2413,10 @@ impl Session {
         let _elicitation = self.services.elicitations.register();
         let (tx_response, rx_response) = oneshot::channel();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_request_permissions(
                         call_id.clone(),
                         PendingRequestPermissions {
@@ -2447,9 +2446,9 @@ impl Session {
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
-                let mut active = self.active_turn.lock().await;
-                if let Some(at) = active.as_mut() {
-                    let mut ts = at.turn_state.lock().await;
+                let active = self.active_turn.lock().await;
+                if let Some(turn_state) = active.current_turn_state() {
+                    let mut ts = turn_state.lock().await;
                     let _ = ts.remove_pending_request_permissions(&call_id);
                 }
                 None
@@ -2507,10 +2506,10 @@ impl Session {
         let (tx_response, rx_response) = oneshot::channel();
         let event_id = sub_id.clone();
         let prev_entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.insert_pending_user_input(sub_id, tx_response)
                 }
                 None => None,
@@ -2543,10 +2542,10 @@ impl Session {
         response: RequestUserInputResponse,
     ) {
         let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.remove_pending_user_input(sub_id)
                 }
                 None => None,
@@ -2572,12 +2571,12 @@ impl Session {
         response: RequestPermissionsResponse,
     ) {
         let (entry, originating_turn_state) = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     let entry = ts.remove_pending_request_permissions(call_id);
-                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(&at.turn_state));
+                    let originating_turn_state = entry.as_ref().map(|_| Arc::clone(turn_state));
                     (entry, originating_turn_state)
                 }
                 None => (None, None),
@@ -2688,8 +2687,8 @@ impl Session {
         environment_id: &str,
     ) -> Option<AdditionalPermissionProfile> {
         let active = self.active_turn.lock().await;
-        let active = active.as_ref()?;
-        let ts = active.turn_state.lock().await;
+        let turn_state = active.current_turn_state()?;
+        let ts = turn_state.lock().await;
         ts.granted_permissions(environment_id)
     }
 
@@ -2699,10 +2698,10 @@ impl Session {
     )]
     pub(crate) async fn strict_auto_review_enabled_for_turn(&self) -> bool {
         let active = self.active_turn.lock().await;
-        let Some(active) = active.as_ref() else {
+        let Some(turn_state) = active.current_turn_state() else {
             return false;
         };
-        let ts = active.turn_state.lock().await;
+        let ts = turn_state.lock().await;
         ts.strict_auto_review_enabled()
     }
 
@@ -2720,10 +2719,10 @@ impl Session {
     )]
     pub async fn notify_dynamic_tool_response(&self, call_id: &str, response: DynamicToolResponse) {
         let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.remove_pending_dynamic_tool(call_id)
                 }
                 None => None,
@@ -2745,10 +2744,10 @@ impl Session {
     )]
     pub async fn notify_approval(&self, approval_id: &str, decision: ReviewDecision) {
         let entry = {
-            let mut active = self.active_turn.lock().await;
-            match active.as_mut() {
-                Some(at) => {
-                    let mut ts = at.turn_state.lock().await;
+            let active = self.active_turn.lock().await;
+            match active.current_turn_state() {
+                Some(turn_state) => {
+                    let mut ts = turn_state.lock().await;
                     ts.remove_pending_approval(approval_id)
                 }
                 None => None,
@@ -3837,14 +3836,11 @@ impl Session {
         client_user_message_id: Option<String>,
         responsesapi_client_metadata: Option<HashMap<String, String>>,
     ) -> Result<String, SteerInputError> {
-        let mut active = self.active_turn.lock().await;
-        let Some(active_turn) = active.as_mut() else {
+        let active = self.active_turn.lock().await;
+        let Some(running_turn) = active.running_turn() else {
             return Err(SteerInputError::NoActiveTurn(input));
         };
-
-        let Some(active_task) = active_turn.task.as_ref() else {
-            return Err(SteerInputError::NoActiveTurn(input));
-        };
+        let active_task = running_turn.task();
         let active_turn_id = &active_task.turn_context.sub_id;
 
         if let Some(expected_turn_id) = expected_turn_id
@@ -3897,7 +3893,7 @@ impl Session {
         });
         self.input_queue
             .extend_pending_input_and_accept_mailbox_delivery_for_turn_state(
-                active_turn.turn_state.as_ref(),
+                running_turn.turn_state().as_ref(),
                 pending_input,
             )
             .await;
@@ -3917,7 +3913,7 @@ impl Session {
 
     pub async fn interrupt_task(self: &Arc<Self>) {
         info!("interrupt received: abort current task, if any");
-        let had_active_turn = self.active_turn.lock().await.is_some();
+        let had_active_turn = self.active_turn.lock().await.has_active_turn();
         self.abort_all_tasks(TurnAbortReason::Interrupted).await;
         if !had_active_turn {
             self.cancel_mcp_startup().await;

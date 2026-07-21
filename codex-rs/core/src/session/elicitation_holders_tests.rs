@@ -11,7 +11,6 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use super::tests::make_session_and_context_with_rx;
-use crate::state::ActiveTurn;
 
 async fn wait_until_held(pause_state: &mut watch::Receiver<bool>) {
     pause_state
@@ -30,7 +29,12 @@ async fn wait_until_released(pause_state: &mut watch::Receiver<bool>) {
 #[tokio::test]
 async fn command_approval_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let mut pause_state = session.subscribe_elicitation_pause_state();
     #[allow(deprecated)]
     let cwd = turn_context.cwd.clone();
@@ -69,7 +73,12 @@ async fn command_approval_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn patch_approval_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let mut pause_state = session.subscribe_elicitation_pause_state();
 
     let request = tokio::spawn({
@@ -100,7 +109,12 @@ async fn patch_approval_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn permission_request_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let mut pause_state = session.subscribe_elicitation_pause_state();
 
     let request = tokio::spawn({
@@ -147,7 +161,12 @@ async fn permission_request_holds_an_elicitation_until_response() {
 #[tokio::test]
 async fn request_user_input_holds_an_elicitation_until_response() {
     let (session, turn_context, events) = make_session_and_context_with_rx().await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let mut pause_state = session.subscribe_elicitation_pause_state();
 
     let request = tokio::spawn({

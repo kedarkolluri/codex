@@ -226,7 +226,7 @@ async fn is_unloadable(thread: &CodexThread) -> bool {
     matches!(
         thread.agent_status().await,
         AgentStatus::Completed(_) | AgentStatus::Errored(_) | AgentStatus::Interrupted
-    ) && thread.session.active_turn.lock().await.is_none()
+    ) && thread.session.active_turn.lock().await.is_idle()
         && !thread.session.input_queue.has_pending_mailbox_items().await
 }
 

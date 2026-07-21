@@ -180,10 +180,10 @@ async fn request_dynamic_tool(
     let (tx_response, rx_response) = oneshot::channel();
     let event_id = call_id.clone();
     let prev_entry = {
-        let mut active = session.active_turn.lock().await;
-        match active.as_mut() {
-            Some(at) => {
-                let mut ts = at.turn_state.lock().await;
+        let active = session.active_turn.lock().await;
+        match active.current_turn_state() {
+            Some(turn_state) => {
+                let mut ts = turn_state.lock().await;
                 ts.insert_pending_dynamic_tool(call_id.clone(), tx_response)
             }
             None => None,

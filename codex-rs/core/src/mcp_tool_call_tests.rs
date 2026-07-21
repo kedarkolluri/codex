@@ -6,7 +6,6 @@ use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnEnvironment;
-use crate::state::ActiveTurn;
 use crate::test_support::models_manager_with_provider;
 use crate::tools::hook_names::HookToolName;
 use crate::turn_metadata::McpTurnMetadataContext;
@@ -1614,7 +1613,12 @@ async fn codex_apps_auth_elicitation_granular_mcp_disabled_returns_original_resu
 async fn codex_apps_auth_elicitation_enabled_by_default_requests_elicitation() {
     let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
     let manager = host_owned_codex_apps_manager(&session, &turn_context).await;
-    *session.active_turn.lock().await = Some(ActiveTurn::default());
+    session
+        .active_turn
+        .lock()
+        .await
+        .reserve_taskless()
+        .expect("session should be idle");
     let result = codex_apps_auth_failure_result();
     let metadata = codex_apps_auth_failure_metadata();
 
@@ -2937,7 +2941,9 @@ async fn prompt_mode_waits_for_approval_when_annotations_do_not_require_approval
     let (session, turn_context, _rx_event) = make_session_and_context_with_rx().await;
     {
         let mut active_turn = session.active_turn.lock().await;
-        *active_turn = Some(ActiveTurn::default());
+        active_turn
+            .reserve_taskless()
+            .expect("session should be idle");
     }
     let invocation = McpInvocation {
         server: "custom_server".to_string(),
