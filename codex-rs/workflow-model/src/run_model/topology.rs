@@ -119,6 +119,8 @@ impl WorkflowRunModel {
         self.validate_parent(node_id, node.parent_node_id(), phase_index)?;
         let phase_position =
             usize::try_from(phase_index).map_err(|_| WorkflowModelError::PhaseIndexOverflow)?;
+        let aggregate_update =
+            self.prepare_aggregate_update(phase_index, |aggregate| aggregate.add_node(&node))?;
 
         if let Some(parent_node_id) = node.parent_node_id() {
             let parent = self.topology.get_mut(&parent_node_id).ok_or(
@@ -137,6 +139,7 @@ impl WorkflowRunModel {
         }
         self.topology.insert(node_id, node);
         self.next_topology_id = next_topology_id;
+        self.commit_aggregate_update(aggregate_update);
         Ok(())
     }
 
