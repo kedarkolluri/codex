@@ -5499,6 +5499,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
         turn_start_gate: super::turn_start_gate::TurnStartGate::default(),
+        trigger_turn_retry: super::trigger_turn_retry::TriggerTurnRetry::default(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
@@ -7816,6 +7817,7 @@ where
         active_turn: Mutex::new(SessionTurnSlot::default()),
         input_queue: super::input_queue::InputQueue::new(),
         turn_start_gate: super::turn_start_gate::TurnStartGate::default(),
+        trigger_turn_retry: super::trigger_turn_retry::TriggerTurnRetry::default(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         turn_admissions: Arc::new(super::turn_admission_registry::TurnAdmissionRegistry::default()),
         services,
@@ -9903,8 +9905,13 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
         .current_generation()
         .cloned()
         .expect("spawned task should own a lifecycle generation");
-    sess.on_task_finished(generation, Arc::clone(&tc), /*task_result*/ Ok(None))
-        .await;
+    sess.on_task_finished(
+        generation,
+        /*automatic_start_ticket*/ None,
+        Arc::clone(&tc),
+        /*task_result*/ Ok(None),
+    )
+    .await;
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {

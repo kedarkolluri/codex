@@ -1,5 +1,6 @@
 use super::event_observer::EventObserverTap;
 use super::input_queue::InputQueue;
+use super::trigger_turn_retry::TriggerTurnRetry;
 use super::turn_admission_registry::TurnAdmissionRegistry;
 use super::turn_start_gate::TurnStartGate;
 use super::*;
@@ -48,8 +49,8 @@ pub(crate) struct Session {
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<SessionTurnSlot>,
     pub(crate) input_queue: InputQueue,
-    #[allow(dead_code)] // Activated by the atomic task-start stage.
     pub(crate) turn_start_gate: TurnStartGate,
+    pub(super) trigger_turn_retry: TriggerTurnRetry,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(super) turn_admissions: Arc<TurnAdmissionRegistry>,
     pub(crate) services: SessionServices,
@@ -1178,6 +1179,7 @@ impl Session {
                 active_turn: Mutex::new(SessionTurnSlot::default()),
                 input_queue: InputQueue::new(),
                 turn_start_gate: TurnStartGate::default(),
+                trigger_turn_retry: TriggerTurnRetry::default(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 turn_admissions: Arc::new(TurnAdmissionRegistry::default()),
                 services,

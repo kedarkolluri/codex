@@ -24,6 +24,7 @@ use super::pending_start::PendingTaskStart;
 use super::pending_start::PendingTaskStartOutcome;
 use crate::agent::control::AgentExecutionAdmission;
 use crate::agent::control::AgentExecutionCapacityWaiter;
+use crate::session::AutomaticTurnStartTicket;
 use crate::session::TurnInput;
 use crate::session::TurnStartAdmissionPermit;
 use crate::session::session::Session;
@@ -35,11 +36,34 @@ use crate::state::turn_lifecycle::TurnGeneration;
 pub(crate) enum TaskStartOutcome {
     Started,
     Busy,
-    #[allow(dead_code)] // The generation is consumed by automatic-start retry activation.
     StartInProgress(TurnGeneration),
     AtCapacity(AgentExecutionCapacityWaiter),
     Cancelled(TurnAbortReason),
     Poisoned,
+}
+
+#[derive(Clone, Copy)]
+enum TaskStartAdmission {
+    Unconditional,
+    AutomaticTrigger(AutomaticTurnStartTicket),
+}
+
+impl TaskStartAdmission {
+    fn is_open(self, session: &Session) -> bool {
+        match self {
+            Self::Unconditional => session.turn_start_gate.is_open(),
+            Self::AutomaticTrigger(ticket) => {
+                session.turn_start_gate.admits_automatic_start(ticket)
+            }
+        }
+    }
+
+    fn ticket_for_finish(self, session: &Session) -> Option<AutomaticTurnStartTicket> {
+        match self {
+            Self::Unconditional => session.turn_start_gate.automatic_start_ticket(),
+            Self::AutomaticTrigger(ticket) => Some(ticket),
+        }
+    }
 }
 
 impl From<PendingTaskStartOutcome> for TaskStartOutcome {
@@ -52,10 +76,6 @@ impl From<PendingTaskStartOutcome> for TaskStartOutcome {
 }
 
 impl Session {
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "mailbox attachment and task commit must remain atomic under the turn slot lock"
-    )]
     pub(super) async fn start_task_with_admission_permit<T: SessionTask>(
         self: &Arc<Self>,
         turn_context: Arc<TurnContext>,
@@ -63,15 +83,59 @@ impl Session {
         task: T,
         admission_permit: TurnStartAdmissionPermit,
     ) -> TaskStartOutcome {
-        let driver = {
+        self.start_task_inner(
+            turn_context,
+            input,
+            task,
+            TaskStartAdmission::Unconditional,
+            admission_permit,
+        )
+        .await
+    }
+
+    pub(super) async fn start_automatic_trigger_task<T: SessionTask>(
+        self: &Arc<Self>,
+        ticket: AutomaticTurnStartTicket,
+        turn_context: Arc<TurnContext>,
+        task: T,
+        admission_permit: TurnStartAdmissionPermit,
+    ) -> TaskStartOutcome {
+        self.start_task_inner(
+            turn_context,
+            Vec::new(),
+            task,
+            TaskStartAdmission::AutomaticTrigger(ticket),
+            admission_permit,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "mailbox attachment and task commit must remain atomic under the turn slot lock"
+    )]
+    async fn start_task_inner<T: SessionTask>(
+        self: &Arc<Self>,
+        turn_context: Arc<TurnContext>,
+        input: Vec<TurnInput>,
+        task: T,
+        admission: TaskStartAdmission,
+        admission_permit: TurnStartAdmissionPermit,
+    ) -> TaskStartOutcome {
+        let (driver, automatic_start_ticket_for_finish) = {
             let mut active_turn = self.active_turn.lock().await;
             if !active_turn.can_begin_fresh_start() {
                 return active_turn
                     .starting_generation()
                     .map_or(TaskStartOutcome::Busy, TaskStartOutcome::StartInProgress);
             }
-            if !self.turn_start_gate.is_open() {
+            if !admission.is_open(self) {
                 return TaskStartOutcome::Cancelled(TurnAbortReason::Interrupted);
+            }
+            if matches!(admission, TaskStartAdmission::AutomaticTrigger(_))
+                && !self.input_queue.has_trigger_turn_mailbox_items().await
+            {
+                return TaskStartOutcome::Busy;
             }
             let lease = match self.services.agent_control.execution_admission(
                 turn_context.multi_agent_version,
@@ -88,7 +152,7 @@ impl Session {
                     .starting_generation()
                     .map_or(TaskStartOutcome::Busy, TaskStartOutcome::StartInProgress);
             };
-            driver
+            (driver, admission.ticket_for_finish(self))
         };
         let mut pending_start =
             PendingTaskStart::new(Arc::clone(self), Arc::clone(&turn_context), driver);
@@ -114,7 +178,7 @@ impl Session {
             .await
             .clear_turn(&turn_context.sub_id);
 
-        if !self.turn_start_gate.is_open() {
+        if !admission.is_open(self) {
             self.active_turn
                 .lock()
                 .await
@@ -167,7 +231,7 @@ impl Session {
         let generation_for_finish = generation.clone();
 
         let mut active_turn = self.active_turn.lock().await;
-        if !self.turn_start_gate.is_open() {
+        if !admission.is_open(self) {
             active_turn.cancel_start_exact(&generation, TurnAbortReason::Interrupted);
         }
         if generation.cancel_reason().is_some() {
@@ -217,6 +281,7 @@ impl Session {
                     // Finish uniformly from the spawn site so all tasks share the same lifecycle.
                     sess.on_task_finished(
                         generation_for_finish,
+                        automatic_start_ticket_for_finish,
                         Arc::clone(&ctx_for_finish),
                         task_result,
                     )
@@ -293,7 +358,7 @@ impl Session {
         expected_turn_state: Arc<Mutex<TurnState>>,
         admission_permit: TurnStartAdmissionPermit,
     ) {
-        let generation = {
+        let (generation, automatic_start_ticket_for_finish) = {
             let active = self.active_turn.lock().await;
             if !active.can_begin_reserved_start(&expected_turn_state) {
                 return;
@@ -305,7 +370,7 @@ impl Session {
                 .prepare_starting_turn_input(expected_turn_state.as_ref(), Vec::new())
                 .await
                 .commit();
-            generation
+            (generation, self.turn_start_gate.automatic_start_ticket())
         };
         drop(admission_permit);
 
@@ -399,8 +464,13 @@ impl Session {
                 }
                 if !task_cancellation_token.is_cancelled() {
                     // Finish uniformly from the spawn site so all tasks share the same lifecycle.
-                    sess.on_task_finished(generation, Arc::clone(&ctx_for_finish), task_result)
-                        .await;
+                    sess.on_task_finished(
+                        generation,
+                        automatic_start_ticket_for_finish,
+                        Arc::clone(&ctx_for_finish),
+                        task_result,
+                    )
+                    .await;
                 }
                 done_clone.notify_waiters();
             }

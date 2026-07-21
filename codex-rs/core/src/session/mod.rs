@@ -218,16 +218,14 @@ pub(crate) mod session;
 pub(crate) mod step_context;
 pub(crate) mod time_reminder;
 mod token_budget;
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 mod trigger_turn_retry;
+pub(crate) use trigger_turn_retry::AutomaticTicketInvalidation;
+pub(crate) use trigger_turn_retry::PendingWorkStartRequest;
 pub(crate) mod turn;
 mod turn_admission_registry;
 pub(crate) mod turn_context;
-#[allow(dead_code)] // Activated by the atomic task-start stage.
 mod turn_start_gate;
-#[allow(unused_imports)] // Activated by the atomic task-start stage.
 pub(crate) use turn_start_gate::AutomaticTurnStartTicket;
-#[allow(unused_imports)] // Activated by the atomic task-start stage.
 pub(crate) use turn_start_gate::TurnStartAdmissionPermit;
 mod world_state;
 use self::code_mode_warning::unsupported_code_mode_warning;

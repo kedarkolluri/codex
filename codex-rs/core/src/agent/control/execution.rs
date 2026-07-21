@@ -22,7 +22,6 @@ pub(crate) struct AgentExecutionGuard {
 }
 
 /// Atomic execution-capacity admission result for a prospective turn.
-#[allow(dead_code)] // Activated by the next stacked task-start reservation change.
 pub(crate) enum AgentExecutionAdmission {
     Unrestricted,
     Admitted(AgentExecutionGuard),
@@ -30,13 +29,11 @@ pub(crate) enum AgentExecutionAdmission {
 }
 
 /// Pre-subscribed notification for retrying a failed capacity admission.
-#[allow(dead_code)] // Activated by the next stacked task-start reservation change.
 pub(crate) struct AgentExecutionCapacityWaiter {
     max_threads: usize,
     release_rx: watch::Receiver<u64>,
 }
 
-#[allow(dead_code)] // Activated by the next stacked task-start reservation change.
 impl AgentExecutionCapacityWaiter {
     pub(crate) fn into_limit_error(self) -> CodexErr {
         CodexErr::AgentLimitReached {
@@ -114,7 +111,6 @@ impl AgentControl {
     }
 
     /// Atomically admits a limited turn or returns a pre-subscribed release waiter.
-    #[allow(dead_code)] // Activated by the next stacked task-start reservation change.
     pub(crate) fn execution_admission(
         &self,
         multi_agent_version: MultiAgentVersion,

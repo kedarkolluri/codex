@@ -1,6 +1,9 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
+use crate::agent::control::AgentExecutionCapacityWaiter;
+
+use super::session::Session;
 use super::turn_start_gate::AutomaticTurnStartTicket;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,6 +131,41 @@ impl Drop for TriggerTurnCapacityClaim {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *capacity = CapacityRetryState::Idle;
+    }
+}
+
+impl Session {
+    /// Waits for one execution lease release, then retries the newest
+    /// authenticated trigger-turn request. Concurrent capacity failures share
+    /// one waiter without replacing its ticket with fresh authority.
+    pub(crate) async fn schedule_trigger_turn_retry(
+        self: &Arc<Self>,
+        waiter: AgentExecutionCapacityWaiter,
+        request: PendingWorkStartRequest,
+    ) {
+        let claim = {
+            let _active_turn = self.active_turn.lock().await;
+            if !self
+                .turn_start_gate
+                .admits_automatic_start(request.ticket())
+            {
+                return;
+            }
+            self.trigger_turn_retry.register_capacity_wait(request)
+        };
+        let Some(claim) = claim else {
+            return;
+        };
+
+        let session = Arc::downgrade(self);
+        self.services.runtime_handle.spawn(async move {
+            waiter.wait_for_release().await;
+            let request = claim.take_request();
+            let Some(session) = session.upgrade() else {
+                return;
+            };
+            session.drive_pending_work_start(request).await;
+        });
     }
 }
 
