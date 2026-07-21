@@ -17,12 +17,6 @@ enum PendingWorkStartAttempt {
 }
 
 impl Session {
-    /// Temporary bridge for legacy idle-start call sites. Slice 8 removes this
-    /// wrapper when those call sites join exact automatic admission.
-    pub(crate) fn maybe_start_turn_for_pending_work(self: &Arc<Self>) -> BoxFuture<'static, ()> {
-        self.maybe_start_turn_for_pending_work_with_sub_id(uuid::Uuid::new_v4().to_string())
-    }
-
     pub(super) fn maybe_start_turn_for_pending_work_with_ticket(
         self: &Arc<Self>,
         ticket: crate::session::AutomaticTurnStartTicket,
@@ -164,6 +158,7 @@ impl Session {
             TaskStartOutcome::Started | TaskStartOutcome::Busy | TaskStartOutcome::Poisoned => {
                 PendingWorkStartAttempt::Finished
             }
+            TaskStartOutcome::PendingTriggerTurn => PendingWorkStartAttempt::Retry,
             TaskStartOutcome::Cancelled(_) => {
                 if self.turn_start_gate.is_open()
                     && !self.turn_start_gate.admits_automatic_start(ticket)

@@ -10082,6 +10082,74 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
 }
 
 #[tokio::test]
+async fn inject_if_running_rejects_a_starting_turn_without_losing_input() {
+    let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
+    let driver = {
+        let mut active_turn = sess.active_turn.lock().await;
+        let Ok(driver) = active_turn.begin_fresh_start(/*execution_guard*/ None) else {
+            panic!("idle session should accept an exact start");
+        };
+        driver
+    };
+    let generation = driver.generation();
+    let item = user_message("not yet running");
+    let returned = sess
+        .inject_if_running(vec![item.clone()])
+        .await
+        .expect_err("starting turns must not accept steer input");
+    assert_eq!(vec![item], returned);
+    assert_eq!(
+        Vec::<TurnInput>::new(),
+        sess.input_queue.get_pending_input(&sess.active_turn).await
+    );
+    let mut active_turn = sess.active_turn.lock().await;
+    assert!(active_turn.cancel_start_exact(&generation, TurnAbortReason::Replaced));
+    let Ok(reason) = active_turn.complete_cancelled_start(driver) else {
+        panic!("exact starting turn should cancel cleanly");
+    };
+    assert_eq!(TurnAbortReason::Replaced, reason);
+}
+
+#[tokio::test]
+async fn inject_if_running_rejects_a_finalizing_turn_without_losing_input() {
+    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    let (task, completion) = sess
+        .active_turn
+        .lock()
+        .await
+        .begin_running_finalization_for_context(&tc)
+        .expect("running turn should begin exact finalization")
+        .into_parts();
+    drop(task);
+    let items = vec![user_message("already finalizing")];
+    let returned = sess
+        .inject_if_running(items.clone())
+        .await
+        .expect_err("finalizing turns must not accept steer input");
+    assert_eq!(items, returned);
+    let pending = sess
+        .input_queue
+        .take_pending_input_for_turn_state(completion.turn_state().as_ref())
+        .await;
+    assert_eq!(Vec::<TurnInput>::new(), pending);
+    let completed = sess
+        .active_turn
+        .lock()
+        .await
+        .complete_finalization(completion);
+    assert!(completed.is_ok());
+}
+
+#[tokio::test]
 async fn try_start_turn_if_idle_rejects_active_turn_without_injecting() {
     let (sess, tc, _rx) = make_session_and_context_with_rx().await;
     sess.spawn_task(
@@ -10136,7 +10204,7 @@ async fn try_start_turn_if_idle_rejects_plan_mode_without_injecting() {
 }
 
 #[tokio::test]
-async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting() {
+async fn try_start_turn_if_idle_rejects_idle_input_and_schedules_pending_trigger_turn() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     sess.input_queue
         .enqueue_mailbox_communication(InterAgentCommunication::new(
@@ -10159,8 +10227,10 @@ async fn try_start_turn_if_idle_rejects_pending_trigger_turn_without_injecting()
         err.reason()
     );
     assert_eq!(vec![item], err.into_input());
-    assert!(sess.active_turn.lock().await.is_idle());
-    assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
+    assert!(sess.active_turn.lock().await.has_active_turn());
+    assert!(!sess.input_queue.has_trigger_turn_mailbox_items().await);
+
+    sess.abort_all_tasks(TurnAbortReason::Replaced).await;
 }
 
 #[tokio::test]

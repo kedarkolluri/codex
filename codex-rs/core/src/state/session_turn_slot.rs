@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+#[cfg(test)]
 use codex_protocol::protocol::TurnAbortReason;
 use tokio::sync::Mutex;
 
@@ -33,6 +34,7 @@ pub(crate) struct SessionTurnSlot {
     legacy_finalization: Option<LegacyFinalization>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct LegacyFinalization {
     authority: TurnFinalization,
     turn_state: Arc<Mutex<TurnState>>,
@@ -83,7 +85,8 @@ impl SessionTurnSlot {
         })
     }
 
-    /// Legacy taskless reservation; removed by the next lifecycle activation.
+    /// Test-only legacy taskless reservation.
+    #[cfg(test)]
     pub(crate) fn reserve_taskless(&mut self) -> Option<&Arc<Mutex<TurnState>>> {
         if self.lifecycle.running().is_some() {
             return None;
@@ -108,7 +111,8 @@ impl SessionTurnSlot {
         turn_state
     }
 
-    /// Legacy second get-or-insert and running-task assignment.
+    /// Test-only legacy second get-or-insert and running-task assignment.
+    #[cfg(test)]
     pub(crate) fn install_running_task_for_legacy_start(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -193,7 +197,8 @@ impl SessionTurnSlot {
         Some((task, turn_state))
     }
 
-    /// Exact taskless cleanup; removed by the next lifecycle activation.
+    /// Test-only exact taskless cleanup.
+    #[cfg(test)]
     pub(crate) fn clear_taskless_exact_state(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
@@ -229,6 +234,7 @@ impl SessionTurnSlot {
         Some((task, turn_state))
     }
 
+    #[cfg(test)]
     fn clear_taskless_exact_state_inner(
         &mut self,
         expected_turn_state: &Arc<Mutex<TurnState>>,
