@@ -105,6 +105,8 @@ pub struct Capability(NonEmptyString);
 
 /// Enables the version-one Saved-workflow output wire contract.
 pub const SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY: &str = "saved_workflow_output_v1";
+/// Enables client-assigned version-one Saved-workflow cell identities.
+pub const SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY: &str = "saved_workflow_cell_identity_v1";
 
 impl Capability {
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidIdentifier> {

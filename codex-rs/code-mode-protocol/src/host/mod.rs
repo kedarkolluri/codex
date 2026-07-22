@@ -14,6 +14,7 @@ mod error;
 mod message;
 mod payload;
 mod types;
+mod workflow_cell_id;
 
 pub use codec::EncodedFrame;
 pub use codec::FramedReader;
@@ -30,10 +31,12 @@ pub use message::HostRequest;
 pub use message::HostResponse;
 pub use message::HostToClient;
 pub use message::WireResult;
+pub use payload::DecodedWireExecuteRequest;
 pub use payload::InvalidWireCellId;
 pub use payload::WIRE_CELL_ID_MAX_BYTES;
 pub use payload::WireCellId;
 pub use payload::WireContentItem;
+pub use payload::WireExecuteCellIdentity;
 pub use payload::WireExecuteOutputPolicy;
 pub use payload::WireExecuteRequest;
 pub use payload::WireExecuteRequestConversionError;
@@ -53,9 +56,12 @@ pub use types::InvalidIdentifier;
 pub use types::InvalidSupportedProtocolVersions;
 pub use types::ProtocolVersion;
 pub use types::RequestId;
+pub use types::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
 pub use types::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 pub use types::SessionId;
 pub use types::SupportedProtocolVersions;
+pub use workflow_cell_id::InvalidWireWorkflowCellId;
+pub use workflow_cell_id::WireWorkflowCellId;
 
 #[cfg(test)]
 #[path = "host_tests.rs"]
