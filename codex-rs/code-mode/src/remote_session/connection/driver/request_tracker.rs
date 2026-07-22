@@ -183,7 +183,10 @@ impl RequestTracker {
             let _ = initial.response_tx.send(Err(reason));
         }
         for wait in self.deferred_waits.drain(..) {
-            let _ = wait.response_tx.send(Err(reason.to_string()));
+            let reason = wait
+                .output_admission
+                .visible_connection_failure(reason.to_string());
+            let _ = wait.response_tx.send(Err(reason));
         }
     }
 }

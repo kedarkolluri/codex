@@ -2,6 +2,7 @@ use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::StartedCell;
+use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::EncodedFrame;
@@ -49,13 +50,15 @@ impl ConnectionDriver {
             if !self.start_wait(
                 wait.session,
                 wait.request,
+                wait.output_admission,
                 wait.caller_cancellation,
                 wait.response_tx,
             ) {
                 for wait in deferred {
-                    let _ = wait
-                        .response_tx
-                        .send(Err("code-mode host connection closed".to_string()));
+                    let reason = wait
+                        .output_admission
+                        .visible_connection_failure("code-mode host connection closed".to_string());
+                    let _ = wait.response_tx.send(Err(reason));
                 }
                 return false;
             }
@@ -139,28 +142,33 @@ impl ConnectionDriver {
                     // The host owns a checked, never-reused ID sequence. Retain only live
                     // IDs so client memory scales with concurrency, not session lifetime.
                     let remote_cell_id = cell_id.clone();
-                    let public_id = match self.sessions.admit_cell(&session, cell_id) {
-                        Ok(public_id) => public_id,
-                        Err(CellAdmissionError::MissingSession) => {
-                            let (reason, admission) = output_admission
-                                .admit_error("code-mode session closed during execute".to_string());
-                            return self.deliver_admitted(response_tx, Err(reason), admission);
-                        }
-                        Err(CellAdmissionError::DuplicateCell) => {
-                            let reason = format!(
-                                "code-mode host reused live cell {} in session {}",
-                                remote_cell_id.as_str(),
-                                session.id
-                            );
-                            return self.fail_admitted(response_tx, reason, &output_admission);
-                        }
-                    };
+                    let public_id =
+                        match self
+                            .sessions
+                            .admit_cell(&session, cell_id, output_admission.clone())
+                        {
+                            Ok(public_id) => public_id,
+                            Err(CellAdmissionError::MissingSession) => {
+                                let (reason, admission) = output_admission.admit_error(
+                                    "code-mode session closed during execute".to_string(),
+                                );
+                                return self.deliver_admitted(response_tx, Err(reason), admission);
+                            }
+                            Err(CellAdmissionError::DuplicateCell) => {
+                                let reason = format!(
+                                    "code-mode host reused live cell {} in session {}",
+                                    remote_cell_id.as_str(),
+                                    session.id
+                                );
+                                return self.fail_admitted(response_tx, reason, &output_admission);
+                            }
+                        };
                     self.requests.insert_initial_response(
                         id,
                         InitialResponse {
                             generation: session.generation,
                             cell_id: remote_cell_id.clone(),
-                            output_admission,
+                            output_admission: output_admission.clone(),
                             response_tx: initial_response_tx,
                         },
                     );
@@ -196,10 +204,11 @@ impl ConnectionDriver {
             PendingRequest::Wait {
                 session,
                 cell_id,
-                cancellation: _,
+                output_admission,
                 response_tx,
+                ..
             } => {
-                let result = match result {
+                let (response, admission) = match result {
                     Ok(HostResponse::WaitCompleted { outcome }) => {
                         if wait_outcome_cell_id(&outcome) != &cell_id {
                             let reason = format!(
@@ -207,21 +216,29 @@ impl ConnectionDriver {
                                 wait_outcome_cell_id(&outcome).as_str(),
                                 cell_id.as_str()
                             );
-                            let _ = response_tx.send(Err(reason.clone()));
-                            self.fail(reason);
-                            return false;
+                            return self.fail_admitted(response_tx, reason, &output_admission);
                         }
-                        Ok(public_wait_outcome(session.generation, outcome.into()))
+                        let mut outcome: WaitOutcome = outcome.into();
+                        let response = match &mut outcome {
+                            WaitOutcome::LiveCell(response)
+                            | WaitOutcome::MissingCell(response) => response,
+                        };
+                        let admission = output_admission.admit_response(response);
+                        (
+                            Ok(public_wait_outcome(session.generation, outcome)),
+                            admission,
+                        )
                     }
                     Ok(_) => {
                         let reason = "code-mode host returned an invalid cell response".to_string();
-                        let _ = response_tx.send(Err(reason.clone()));
-                        self.fail(reason);
-                        return false;
+                        return self.fail_admitted(response_tx, reason, &output_admission);
                     }
-                    Err(err) => Err(err),
+                    Err(err) => {
+                        let (err, admission) = output_admission.admit_error(err);
+                        (Err(err), admission)
+                    }
                 };
-                let _ = response_tx.send(result);
+                return self.deliver_admitted(response_tx, response, admission);
             }
             PendingRequest::Terminate {
                 session,

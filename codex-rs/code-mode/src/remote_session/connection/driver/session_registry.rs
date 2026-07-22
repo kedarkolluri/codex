@@ -8,6 +8,7 @@ use codex_code_mode_protocol::host::WireCellId;
 
 use super::cell_ids::public_cell_id;
 use super::cleanup::SessionCleanup;
+use super::output_admission::RemoteOutputAdmission;
 use super::types::RemoteSession;
 
 pub(super) struct CellOwner {
@@ -32,12 +33,17 @@ pub(super) enum CellAdmissionError {
     DuplicateCell,
 }
 
+struct LiveCell {
+    public_id: CellId,
+    output_admission: RemoteOutputAdmission,
+}
+
 struct SessionRecord {
     remote: RemoteSession,
     delegate: Arc<dyn CodeModeSessionDelegate>,
     cleanup: SessionCleanup,
     phase: SessionPhase,
-    cells: HashMap<WireCellId, CellId>,
+    cells: HashMap<WireCellId, LiveCell>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -127,6 +133,7 @@ impl SessionRegistry {
         &mut self,
         session: &RemoteSession,
         cell_id: WireCellId,
+        output_admission: RemoteOutputAdmission,
     ) -> Result<CellId, CellAdmissionError> {
         let Some(record) = self.records.get_mut(&session.id) else {
             return Err(CellAdmissionError::MissingSession);
@@ -135,8 +142,30 @@ impl SessionRegistry {
             return Err(CellAdmissionError::DuplicateCell);
         }
         let public_id = public_cell_id(session.generation, &cell_id);
-        record.cells.insert(cell_id, public_id.clone());
+        record.cells.insert(
+            cell_id,
+            LiveCell {
+                public_id: public_id.clone(),
+                output_admission,
+            },
+        );
         Ok(public_id)
+    }
+
+    pub(super) fn cell_output(
+        &self,
+        session: &RemoteSession,
+        cell_id: &WireCellId,
+    ) -> Result<Option<RemoteOutputAdmission>, String> {
+        self.require_ready(session)?;
+        let record = self
+            .records
+            .get(&session.id)
+            .ok_or_else(|| format!("unknown code-mode session {}", session.id))?;
+        Ok(record
+            .cells
+            .get(cell_id)
+            .map(|cell| cell.output_admission.clone()))
     }
 
     pub(super) fn delegate_target(
@@ -148,12 +177,16 @@ impl SessionRegistry {
             .records
             .get(session_id)
             .ok_or_else(|| format!("code-mode host delegated for unknown session {session_id}"))?;
-        let public_id = session.cells.get(cell_id).cloned().ok_or_else(|| {
-            format!(
-                "code-mode host delegated for unknown cell {} in session {session_id}",
-                cell_id.as_str()
-            )
-        })?;
+        let public_id = session
+            .cells
+            .get(cell_id)
+            .map(|cell| cell.public_id.clone())
+            .ok_or_else(|| {
+                format!(
+                    "code-mode host delegated for unknown cell {} in session {session_id}",
+                    cell_id.as_str()
+                )
+            })?;
         Ok(DelegateTarget {
             session_id: session_id.clone(),
             cell_id: public_id,
@@ -172,13 +205,13 @@ impl SessionRegistry {
                 cell_id.as_str()
             )
         })?;
-        let public_id = session
+        let cell = session
             .cells
             .remove(cell_id)
             .ok_or_else(|| format!("code-mode host closed unknown cell in session {session_id}"))?;
         Ok(CellOwner {
             session_id: session_id.clone(),
-            cell_id: public_id,
+            cell_id: cell.public_id,
             delegate: Arc::clone(&session.delegate),
         })
     }
@@ -190,9 +223,9 @@ impl SessionRegistry {
         session
             .cells
             .into_values()
-            .map(|cell_id| CellOwner {
+            .map(|cell| CellOwner {
                 session_id: session_id.clone(),
-                cell_id,
+                cell_id: cell.public_id,
                 delegate: Arc::clone(&session.delegate),
             })
             .collect()
@@ -206,9 +239,9 @@ impl SessionRegistry {
                 let cells = session
                     .cells
                     .into_values()
-                    .map(|cell_id| CellOwner {
+                    .map(|cell| CellOwner {
                         session_id: session_id.clone(),
-                        cell_id,
+                        cell_id: cell.public_id,
                         delegate: Arc::clone(&session.delegate),
                     })
                     .collect();

@@ -11,8 +11,11 @@ use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::WORKFLOW_OUTPUT_ITEM_MAX_BYTES;
 use codex_code_mode_protocol::WORKFLOW_OUTPUT_MAX_BYTES;
+use codex_code_mode_protocol::WaitOutcome;
+use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
+use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::InvalidWireCellId;
@@ -47,9 +50,18 @@ use super::ConnectionDriver;
 use super::validate_host_cell_ids;
 
 fn direct_driver() -> (ConnectionDriver, Arc<AtomicBool>) {
+    let (driver, alive, _outgoing_rx) = direct_driver_with_outgoing();
+    (driver, alive)
+}
+
+fn direct_driver_with_outgoing() -> (
+    ConnectionDriver,
+    Arc<AtomicBool>,
+    mpsc::Receiver<EncodedFrame>,
+) {
     let (_command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 1);
     let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 1);
-    let (outgoing_tx, _outgoing_rx) = mpsc::channel(/*max_capacity*/ 1);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 8);
     let alive = Arc::new(AtomicBool::new(true));
     let cancellation = CancellationToken::new();
     let (driver, _execute_claim_tx) = ConnectionDriver::new(
@@ -63,23 +75,53 @@ fn direct_driver() -> (ConnectionDriver, Arc<AtomicBool>) {
             cancellation,
         },
     );
-    (driver, alive)
+    (driver, alive, outgoing_rx)
+}
+
+fn ready_session(driver: &mut ConnectionDriver) -> RemoteSession {
+    let session = RemoteSession {
+        id: SessionId::new("session").expect("session ID"),
+        generation: 1,
+    };
+    driver.sessions.insert_ready(
+        session.clone(),
+        Arc::new(NoopCodeModeSessionDelegate),
+        SessionCleanup::new(),
+    );
+    session
 }
 
 fn saved_admission() -> RemoteOutputAdmission {
     RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow)
 }
 
+fn full_wire_items() -> Vec<WireContentItem> {
+    (0..WORKFLOW_OUTPUT_MAX_BYTES / WORKFLOW_OUTPUT_ITEM_MAX_BYTES)
+        .map(|_| WireContentItem::InputText {
+            text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 2),
+        })
+        .collect()
+}
+
+fn yielded_wait_response(request_id: i64, content_items: Vec<WireContentItem>) -> HostToClient {
+    HostToClient::Response {
+        id: RequestId::new(request_id),
+        result: WireResult::Ok {
+            value: HostResponse::WaitCompleted {
+                outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                    cell_id: WireCellId::try_new("cell").expect("cell ID"),
+                    content_items,
+                }),
+            },
+        },
+    }
+}
+
 fn full_saved_admission() -> RemoteOutputAdmission {
     let admission = saved_admission();
     let mut response = RuntimeResponse::Yielded {
         cell_id: CellId::new("full".to_string()),
-        content_items: (0..WORKFLOW_OUTPUT_MAX_BYTES / WORKFLOW_OUTPUT_ITEM_MAX_BYTES)
-            .map(|_| WireContentItem::InputText {
-                text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 2),
-            })
-            .map(Into::into)
-            .collect(),
+        content_items: full_wire_items().into_iter().map(Into::into).collect(),
     };
     assert_eq!(
         admission.admit_response(&mut response),
@@ -130,6 +172,49 @@ fn insert_initial(
             response_tx,
         },
     );
+    response_rx
+}
+
+fn insert_wait(
+    driver: &mut ConnectionDriver,
+    request_id: RequestId,
+    output_admission: RemoteOutputAdmission,
+) -> oneshot::Receiver<Result<WaitOutcome, String>> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let event_tx = driver.event_tx.clone();
+    driver.requests.insert_pending(
+        request_id,
+        PendingRequest::Wait {
+            session: RemoteSession {
+                id: SessionId::new("session").expect("session ID"),
+                generation: 1,
+            },
+            cell_id: WireCellId::try_new("cell").expect("cell ID"),
+            output_admission,
+            cancellation: CancellableRequest::new(CancellationToken::new()),
+            response_tx,
+        },
+        &event_tx,
+    );
+    response_rx
+}
+
+fn queue_wait(
+    driver: &mut ConnectionDriver,
+    session: RemoteSession,
+    cell_id: CellId,
+    caller_cancellation: CancellationToken,
+) -> oneshot::Receiver<Result<WaitOutcome, String>> {
+    let (response_tx, response_rx) = oneshot::channel();
+    assert!(driver.handle_command(DriverCommand::Wait {
+        session,
+        request: WaitRequest {
+            cell_id,
+            yield_time_ms: 1,
+        },
+        caller_cancellation,
+        response_tx,
+    }));
     response_rx
 }
 
@@ -423,4 +508,213 @@ async fn execution_failed_saved_initial_response_is_delivered_before_connection_
         driver.failure.lock().expect("failure lock").as_deref(),
         Some(SAVED_WORKFLOW_EXECUTION_FAILED)
     );
+}
+
+#[tokio::test]
+async fn wait_errors_and_invalid_responses_use_the_selected_output_policy() {
+    let cases = [
+        (
+            saved_admission(),
+            "private saved wait failure",
+            SAVED_WORKFLOW_EXECUTION_FAILED,
+            true,
+        ),
+        (
+            RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
+            "ordinary wait failure",
+            "ordinary wait failure",
+            true,
+        ),
+        (
+            full_saved_admission(),
+            "",
+            SAVED_WORKFLOW_OUTPUT_REJECTED,
+            false,
+        ),
+    ];
+    for (output_admission, message, expected, keep_running) in cases {
+        let (mut driver, alive) = direct_driver();
+        let request_id = RequestId::new(/*value*/ 1);
+        let response_rx = insert_wait(&mut driver, request_id, output_admission);
+        assert_eq!(
+            driver.handle_host_message(HostToClient::Response {
+                id: request_id,
+                result: WireResult::Err {
+                    message: message.to_string(),
+                },
+            }),
+            keep_running
+        );
+        assert_eq!(
+            response_rx.await.expect("wait response"),
+            Err(expected.to_string())
+        );
+        assert_eq!(alive.load(Ordering::Acquire), keep_running);
+    }
+
+    let (mut driver, alive) = direct_driver();
+    let request_id = RequestId::new(/*value*/ 1);
+    let response_rx = insert_wait(&mut driver, request_id, saved_admission());
+    assert!(!driver.handle_host_message(HostToClient::Response {
+        id: request_id,
+        result: WireResult::Ok {
+            value: HostResponse::SessionClosed {
+                session_id: SessionId::new("session").expect("session ID"),
+            },
+        },
+    }));
+    assert_eq!(
+        response_rx.await.expect("invalid saved wait response"),
+        Err(SAVED_WORKFLOW_EXECUTION_FAILED.to_string())
+    );
+    assert!(!alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn saved_initial_and_wait_share_one_remote_output_ledger() {
+    let (mut driver, alive, mut outgoing_rx) = direct_driver_with_outgoing();
+    let session = ready_session(&mut driver);
+    let cell_id = WireCellId::try_new("cell").expect("cell ID");
+    let execute_id = driver.requests.allocate_id().expect("execute request ID");
+    let execute_rx = insert_execute(&mut driver, execute_id, saved_admission());
+    assert!(driver.handle_host_message(HostToClient::Response {
+        id: execute_id,
+        result: WireResult::Ok {
+            value: HostResponse::ExecutionStarted {
+                cell_id: cell_id.clone(),
+            },
+        },
+    }));
+    let started = execute_rx
+        .await
+        .expect("execute response")
+        .expect("started cell")
+        .started;
+    let public_id = started.cell_id.clone();
+
+    let initial = WireRuntimeResponse::Yielded {
+        cell_id: cell_id.clone(),
+        content_items: full_wire_items(),
+    };
+    let expected_initial: RuntimeResponse = initial.clone().into();
+    assert!(driver.handle_host_message(HostToClient::InitialResponse {
+        id: execute_id,
+        result: WireResult::Ok { value: initial },
+    }));
+    assert_eq!(started.initial_response().await, Ok(expected_initial));
+
+    let wait_rx = queue_wait(&mut driver, session, public_id, CancellationToken::new());
+    outgoing_rx.recv().await.expect("wait frame");
+    assert!(!driver.handle_host_message(yielded_wait_response(
+        /*request_id*/ 2,
+        vec![WireContentItem::InputText {
+            text: String::new(),
+        }],
+    )));
+    assert_eq!(
+        wait_rx.await.expect("wait response"),
+        Ok(WaitOutcome::LiveCell(RuntimeResponse::Result {
+            cell_id: CellId::new("cell".to_string()),
+            content_items: Vec::new(),
+            error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
+        }))
+    );
+    assert!(!alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn saved_deferred_wait_keeps_remote_output_ledger() {
+    let (mut driver, alive, mut outgoing_rx) = direct_driver_with_outgoing();
+    let session = ready_session(&mut driver);
+    let cell_id = WireCellId::try_new("cell").expect("cell ID");
+    let execute_id = driver.requests.allocate_id().expect("execute request ID");
+    let execute_rx = insert_execute(&mut driver, execute_id, full_saved_admission());
+    assert!(driver.handle_host_message(HostToClient::Response {
+        id: execute_id,
+        result: WireResult::Ok {
+            value: HostResponse::ExecutionStarted { cell_id },
+        },
+    }));
+    let started = execute_rx
+        .await
+        .expect("execute response")
+        .expect("started cell")
+        .started;
+
+    let first_cancellation = CancellationToken::new();
+    first_cancellation.cancel();
+    let wait_rx = queue_wait(
+        &mut driver,
+        session.clone(),
+        started.cell_id.clone(),
+        first_cancellation,
+    );
+    outgoing_rx.recv().await.expect("first wait frame");
+
+    let second_cancellation = CancellationToken::new();
+    let second_rx = queue_wait(
+        &mut driver,
+        session.clone(),
+        started.cell_id.clone(),
+        second_cancellation.clone(),
+    );
+    assert!(matches!(
+        outgoing_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    assert!(driver.handle_host_message(yielded_wait_response(/*request_id*/ 2, Vec::new(),)));
+    assert!(driver.flush_deferred_waits());
+    outgoing_rx.recv().await.expect("deferred wait frame");
+    assert_eq!(
+        wait_rx.await.expect("first wait response"),
+        Ok(WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            cell_id: CellId::new("cell".to_string()),
+            content_items: Vec::new(),
+        }))
+    );
+
+    let pending_rx = queue_wait(
+        &mut driver,
+        session.clone(),
+        started.cell_id.clone(),
+        CancellationToken::new(),
+    );
+    outgoing_rx.recv().await.expect("parallel wait frame");
+    second_cancellation.cancel();
+    let deferred_rx = queue_wait(
+        &mut driver,
+        session,
+        started.cell_id.clone(),
+        CancellationToken::new(),
+    );
+    assert!(matches!(
+        outgoing_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(!driver.handle_host_message(yielded_wait_response(
+        /*request_id*/ 3,
+        vec![WireContentItem::InputText {
+            text: String::new(),
+        }],
+    )));
+    assert_eq!(
+        second_rx.await.expect("second wait response"),
+        Ok(WaitOutcome::LiveCell(RuntimeResponse::Result {
+            cell_id: CellId::new("cell".to_string()),
+            content_items: Vec::new(),
+            error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
+        }))
+    );
+    for response_rx in [pending_rx, deferred_rx] {
+        assert_eq!(
+            response_rx.await.expect("wait failure"),
+            Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+        );
+    }
+    assert_eq!(
+        started.initial_response().await,
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert!(!alive.load(Ordering::Acquire));
 }

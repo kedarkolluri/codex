@@ -914,7 +914,10 @@ async fn mismatched_wait_response_fails_connection() {
         .await
         .expect("wait response");
 
-    assert!(response_rx.await.expect("wait reply").is_err());
+    assert_eq!(
+        response_rx.await.expect("wait reply"),
+        Err("code-mode host returned cell 2 for request targeting 1".to_string())
+    );
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
