@@ -1,12 +1,21 @@
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::task::Context;
+use std::task::Poll;
 
 use bytes::Bytes;
 use codex_file_system as fs;
+use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
+use futures::Stream;
 use futures::stream;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
+use tokio::sync::Notify;
 
 use super::WorkflowSourceLoadError;
 use super::WorkflowSourceSnapshot;
@@ -34,74 +43,74 @@ fn workflow(path: PathUri) -> WorkflowMetadata {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FileSystemCall {
-    Metadata,
-    Canonicalize,
-    Read,
-}
-
-const FULL_VALIDATION: [FileSystemCall; 5] = [
-    FileSystemCall::Metadata,
-    FileSystemCall::Canonicalize,
-    FileSystemCall::Read,
-    FileSystemCall::Metadata,
-    FileSystemCall::Canonicalize,
-];
-const READ_STARTED: [FileSystemCall; 3] = [
-    FileSystemCall::Metadata,
-    FileSystemCall::Canonicalize,
-    FileSystemCall::Read,
-];
-
-#[derive(Clone)]
-struct FileState {
-    metadata: fs::FileMetadata,
-    canonical: PathUri,
-}
-
-fn file_state(path: &PathUri, size: u64) -> FileState {
-    FileState {
-        metadata: fs::FileMetadata {
-            is_directory: false,
-            is_file: true,
-            is_symlink: false,
-            size,
-            created_at_ms: 1,
-            modified_at_ms: 1,
-        },
-        canonical: path.clone(),
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedReadCall {
+    path: PathUri,
+    options: fs::VerifiedFileReadOptions,
 }
 
 struct SyntheticFileSystem {
-    states: [FileState; 2],
-    stream_open_error: Option<io::ErrorKind>,
+    capture_size: u64,
+    capture_open_error: Option<io::ErrorKind>,
     stream: Vec<Result<Bytes, io::ErrorKind>>,
-    calls: Mutex<Vec<FileSystemCall>>,
+    stream_drop_probe: Option<Arc<AtomicBool>>,
+    pending_stream_probe: Option<Arc<PendingStreamProbe>>,
+    calls: Mutex<Vec<VerifiedReadCall>>,
+}
+
+struct DropProbe(Arc<AtomicBool>);
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+struct PendingStreamProbe {
+    polled: Notify,
+    dropped: AtomicBool,
+}
+
+struct PendingStream {
+    probe: Arc<PendingStreamProbe>,
+}
+
+impl Stream for PendingStream {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.probe.polled.notify_one();
+        Poll::Pending
+    }
+}
+
+impl Drop for PendingStream {
+    fn drop(&mut self) {
+        self.probe.dropped.store(true, Ordering::SeqCst);
+    }
 }
 
 impl SyntheticFileSystem {
-    fn new(path: &PathUri, source: impl Into<Bytes>) -> Self {
+    fn new(source: impl Into<Bytes>) -> Self {
         let source = source.into();
-        let state = file_state(path, source.len() as u64);
         Self {
-            states: [state.clone(), state],
-            stream_open_error: None,
+            capture_size: source.len() as u64,
+            capture_open_error: None,
             stream: vec![Ok(source)],
+            stream_drop_probe: None,
+            pending_stream_probe: None,
             calls: Mutex::new(Vec::new()),
         }
     }
 
-    fn record(&self, call: FileSystemCall) -> usize {
-        let mut calls = self.calls.lock().unwrap();
-        let index = calls.iter().filter(|candidate| **candidate == call).count();
-        assert!(index < 2, "unexpected repeated {call:?} call");
-        calls.push(call);
-        index
+    fn record(&self, path: PathUri, options: fs::VerifiedFileReadOptions) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(VerifiedReadCall { path, options });
     }
 
-    fn calls(&self) -> Vec<FileSystemCall> {
+    fn calls(&self) -> Vec<VerifiedReadCall> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -110,13 +119,9 @@ impl fs::ExecutorFileSystem for SyntheticFileSystem {
     fn canonicalize<'a>(
         &'a self,
         _path: &'a PathUri,
-        sandbox: Option<&'a fs::FileSystemSandboxContext>,
+        _sandbox: Option<&'a fs::FileSystemSandboxContext>,
     ) -> fs::ExecutorFileSystemFuture<'a, PathUri> {
-        Box::pin(async move {
-            assert!(sandbox.is_none());
-            let index = self.record(FileSystemCall::Canonicalize);
-            Ok(self.states[index].canonical.clone())
-        })
+        panic!("verified source capture must not canonicalize separately")
     }
 
     fn read_file<'a>(
@@ -124,26 +129,56 @@ impl fs::ExecutorFileSystem for SyntheticFileSystem {
         _path: &'a PathUri,
         _sandbox: Option<&'a fs::FileSystemSandboxContext>,
     ) -> fs::ExecutorFileSystemFuture<'a, Vec<u8>> {
-        panic!("source snapshot must use bounded streaming reads")
+        panic!("verified source capture must not use ordinary reads")
     }
 
     fn read_file_stream<'a>(
         &'a self,
         _path: &'a PathUri,
-        sandbox: Option<&'a fs::FileSystemSandboxContext>,
+        _sandbox: Option<&'a fs::FileSystemSandboxContext>,
     ) -> fs::ExecutorFileSystemFuture<'a, fs::FileSystemReadStream> {
+        panic!("verified source capture must not use ordinary streaming reads")
+    }
+
+    fn read_file_verified<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: fs::VerifiedFileReadOptions,
+        sandbox: Option<&'a fs::FileSystemSandboxContext>,
+    ) -> fs::ExecutorFileSystemFuture<'a, fs::VerifiedFileRead> {
         Box::pin(async move {
             assert!(sandbox.is_none());
-            self.record(FileSystemCall::Read);
-            if let Some(kind) = self.stream_open_error {
+            self.record(path.clone(), options);
+            if let Some(kind) = self.capture_open_error {
                 return Err(io::Error::new(kind, "source-secret"));
             }
-            let chunks = self
-                .stream
-                .clone()
-                .into_iter()
-                .map(|chunk| chunk.map_err(|kind| io::Error::new(kind, "source-secret")));
-            Ok(fs::FileSystemReadStream::new(stream::iter(chunks)))
+            if let Some(probe) = &self.pending_stream_probe {
+                return Ok(fs::VerifiedFileRead {
+                    size: self.capture_size,
+                    stream: fs::FileSystemReadStream::new(PendingStream {
+                        probe: Arc::clone(probe),
+                    }),
+                });
+            }
+            let chunks = self.stream.clone().into_iter();
+            let drop_probe = self
+                .stream_drop_probe
+                .as_ref()
+                .map(|probe| DropProbe(Arc::clone(probe)));
+            let stream = stream::unfold(
+                (chunks, drop_probe),
+                |(mut chunks, drop_probe)| async move {
+                    let chunk = chunks.next()?;
+                    Some((
+                        chunk.map_err(|kind| io::Error::new(kind, "source-secret")),
+                        (chunks, drop_probe),
+                    ))
+                },
+            );
+            Ok(fs::VerifiedFileRead {
+                size: self.capture_size,
+                stream: fs::FileSystemReadStream::new(stream),
+            })
         })
     }
 
@@ -168,13 +203,9 @@ impl fs::ExecutorFileSystem for SyntheticFileSystem {
     fn get_metadata<'a>(
         &'a self,
         _path: &'a PathUri,
-        sandbox: Option<&'a fs::FileSystemSandboxContext>,
+        _sandbox: Option<&'a fs::FileSystemSandboxContext>,
     ) -> fs::ExecutorFileSystemFuture<'a, fs::FileMetadata> {
-        Box::pin(async move {
-            assert!(sandbox.is_none());
-            let index = self.record(FileSystemCall::Metadata);
-            Ok(self.states[index].metadata.clone())
-        })
+        panic!("verified source capture must not inspect metadata separately")
     }
 
     fn read_directory<'a>(
@@ -230,44 +261,21 @@ fn assert_load_error(error: WorkflowSourceLoadError, path: &PathUri, message: &s
     );
 }
 
-fn rejected_states(path: &PathUri, size: u64) -> Vec<(&'static str, FileState, String, bool)> {
-    let initial = file_state(path, size);
-    let mut symlink = initial.clone();
-    symlink.metadata.is_symlink = true;
-    let mut non_file = initial.clone();
-    non_file.metadata.is_file = false;
-    non_file.metadata.is_directory = true;
-    let mut oversized = initial.clone();
-    oversized.metadata.size = WORKFLOW_SOURCE_MAX_BYTES as u64 + 1;
-    let mut canonical = initial;
-    let outside = PathUri::parse("file:///outside/review.js").unwrap();
-    canonical.canonical = outside.clone();
-    vec![
-        (
-            "symlink",
-            symlink,
-            "workflow source is a symlink".to_string(),
-            false,
-        ),
-        (
-            "non-file",
-            non_file,
-            "workflow source is not a regular file".to_string(),
-            false,
-        ),
-        (
-            "oversize",
-            oversized,
-            format!("workflow source exceeds the {WORKFLOW_SOURCE_MAX_BYTES}-byte limit"),
-            false,
-        ),
-        (
-            "canonical",
-            canonical,
-            format!("workflow source now resolves to {outside}"),
-            true,
-        ),
-    ]
+fn verified_read_call(path: &PathUri) -> VerifiedReadCall {
+    VerifiedReadCall {
+        path: path.clone(),
+        options: fs::VerifiedFileReadOptions {
+            max_bytes: WORKFLOW_SOURCE_MAX_BYTES as u64,
+        },
+    }
+}
+
+fn remote_native_path() -> PathUri {
+    let path = match PathConvention::native() {
+        PathConvention::Posix => "file:///C:/remote/workflows/review.js",
+        PathConvention::Windows => "file:///remote/workflows/review.js",
+    };
+    PathUri::parse(path).unwrap()
 }
 
 #[tokio::test]
@@ -276,8 +284,8 @@ async fn executor_snapshot_uses_winning_authority_and_accepts_exact_limit() {
     let source_a = workflow_source("authority-a");
     let mut source_b = workflow_source("authority-b");
     source_b.push_str(&" ".repeat(WORKFLOW_SOURCE_MAX_BYTES - source_b.len()));
-    let file_system_a = Arc::new(SyntheticFileSystem::new(&path, source_a));
-    let file_system_b = Arc::new(SyntheticFileSystem::new(&path, source_b.clone()));
+    let file_system_a = Arc::new(SyntheticFileSystem::new(source_a));
+    let file_system_b = Arc::new(SyntheticFileSystem::new(source_b.clone()));
     let entry = workflow(path.clone());
     let authority_b = authority(&path, file_system_b.clone());
     let authority_a = authority(&path, file_system_a.clone());
@@ -304,19 +312,44 @@ async fn executor_snapshot_uses_winning_authority_and_accepts_exact_limit() {
         }
     );
     assert_eq!(file_system_a.calls(), []);
-    assert_eq!(file_system_b.calls(), FULL_VALIDATION);
+    assert_eq!(file_system_b.calls(), [verified_read_call(&path)]);
 }
 
 #[tokio::test]
-async fn executor_snapshot_rejects_invalid_stream_shapes() {
+async fn executor_snapshot_keeps_host_convertible_path_on_retained_authority() {
+    let temp_dir = TempDir::new().unwrap();
+    let native_path = temp_dir.path().join("review.js");
+    let host_source = workflow_source("host-bytes-must-not-win");
+    std::fs::write(&native_path, host_source).unwrap();
+    let path = PathUri::from_host_native_path(std::fs::canonicalize(native_path).unwrap()).unwrap();
+    assert!(path.to_abs_path().is_ok());
+
+    let executor_source = workflow_source("executor-bytes");
+    let file_system = Arc::new(SyntheticFileSystem::new(executor_source.clone()));
+    let entry = workflow(path.clone());
+    let registry = executor_registry(Arc::clone(&file_system), &path);
+
+    assert_eq!(
+        registry
+            .source_snapshot_by_name("review")
+            .await
+            .unwrap()
+            .unwrap(),
+        WorkflowSourceSnapshot {
+            metadata: entry,
+            source: Arc::from(executor_source),
+        }
+    );
+    assert_eq!(file_system.calls(), [verified_read_call(&path)]);
+}
+
+#[tokio::test]
+async fn executor_snapshot_rejects_invalid_verified_stream_shapes() {
     let path = PathUri::parse("file:///remote/workflows/review.js").unwrap();
-    let mut oversized = SyntheticFileSystem::new(&path, Bytes::new());
-    oversized.stream = vec![
-        Ok(Bytes::from(vec![b' '; WORKFLOW_SOURCE_MAX_BYTES])),
-        Ok(Bytes::from_static(b"x")),
-    ];
-    let oversized = Arc::new(oversized);
-    let error = executor_registry(Arc::clone(&oversized), &path)
+    let mut declared_oversized = SyntheticFileSystem::new(Bytes::new());
+    declared_oversized.capture_size = WORKFLOW_SOURCE_MAX_BYTES as u64 + 1;
+    let declared_oversized = Arc::new(declared_oversized);
+    let error = executor_registry(Arc::clone(&declared_oversized), &path)
         .source_snapshot_by_name("review")
         .await
         .unwrap_err();
@@ -325,42 +358,77 @@ async fn executor_snapshot_rejects_invalid_stream_shapes() {
         &path,
         &format!("workflow source exceeds the {WORKFLOW_SOURCE_MAX_BYTES}-byte limit"),
     );
-    assert_eq!(oversized.calls(), READ_STARTED);
+    assert_eq!(declared_oversized.calls(), [verified_read_call(&path)]);
 
-    let mut empty = SyntheticFileSystem::new(&path, Bytes::new());
+    let mut streamed_oversized = SyntheticFileSystem::new(Bytes::new());
+    streamed_oversized.capture_size = WORKFLOW_SOURCE_MAX_BYTES as u64;
+    streamed_oversized.stream = vec![
+        Ok(Bytes::from(vec![b' '; WORKFLOW_SOURCE_MAX_BYTES])),
+        Ok(Bytes::from_static(b"x")),
+    ];
+    let streamed_oversized = Arc::new(streamed_oversized);
+    let error = executor_registry(Arc::clone(&streamed_oversized), &path)
+        .source_snapshot_by_name("review")
+        .await
+        .unwrap_err();
+    assert_load_error(
+        error,
+        &path,
+        &format!("workflow source exceeds the {WORKFLOW_SOURCE_MAX_BYTES}-byte limit"),
+    );
+    assert_eq!(streamed_oversized.calls(), [verified_read_call(&path)]);
+
+    let mut empty = SyntheticFileSystem::new(Bytes::new());
     empty.stream = vec![Ok(Bytes::new())];
     let empty = Arc::new(empty);
     let error = executor_registry(Arc::clone(&empty), &path)
         .source_snapshot_by_name("review")
         .await
         .unwrap_err();
-    assert_load_error(error, &path, "source stream returned an empty chunk");
-    assert_eq!(empty.calls(), READ_STARTED);
+    assert_load_error(
+        error,
+        &path,
+        "verified source stream returned an empty chunk",
+    );
+    assert_eq!(empty.calls(), [verified_read_call(&path)]);
 
     let source = workflow_source("length-mismatch");
-    let mismatches = [source[..source.len() - 1].to_string(), format!("{source}x")];
-    for stream in mismatches {
-        let mut file_system = SyntheticFileSystem::new(&path, source.clone());
+    let mismatches = [
+        (source.len() as u64, source[..source.len() - 1].to_string()),
+        (source.len() as u64 - 1, source.clone()),
+    ];
+    for (capture_size, stream) in mismatches {
+        let mut file_system = SyntheticFileSystem::new(Bytes::new());
+        file_system.capture_size = capture_size;
         file_system.stream = vec![Ok(Bytes::from(stream))];
         let file_system = Arc::new(file_system);
         let error = executor_registry(Arc::clone(&file_system), &path)
             .source_snapshot_by_name("review")
             .await
             .unwrap_err();
-        assert_load_error(error, &path, "workflow source changed while being read");
-        assert_eq!(file_system.calls(), FULL_VALIDATION);
+        assert_load_error(
+            error,
+            &path,
+            "verified source stream did not match its declared size",
+        );
+        assert_eq!(file_system.calls(), [verified_read_call(&path)]);
     }
 }
 
 #[tokio::test]
-async fn executor_snapshot_rejects_stream_io_failures_without_post_validation() {
+async fn executor_snapshot_rejects_verified_io_failures_without_legacy_fallback() {
     let path = PathUri::parse("file:///remote/workflows/review.js").unwrap();
     let source = workflow_source("io-error");
     let cases = [
         (
             Some(io::ErrorKind::PermissionDenied),
             vec![Ok(Bytes::from(source.clone()))],
-            "failed to read source (PermissionDenied)",
+            "failed to capture source (PermissionDenied)",
+        ),
+        (
+            Some(io::ErrorKind::Unsupported),
+            vec![Ok(Bytes::from(source.clone()))],
+            "failed to capture source (Unsupported)",
         ),
         (
             None,
@@ -368,12 +436,12 @@ async fn executor_snapshot_rejects_stream_io_failures_without_post_validation() 
                 Ok(Bytes::from_static(b"partial")),
                 Err(io::ErrorKind::ConnectionReset),
             ],
-            "failed to read source (ConnectionReset)",
+            "failed to read captured source (ConnectionReset)",
         ),
     ];
-    for (stream_open_error, stream, message) in cases {
-        let mut file_system = SyntheticFileSystem::new(&path, source.clone());
-        file_system.stream_open_error = stream_open_error;
+    for (capture_open_error, stream, message) in cases {
+        let mut file_system = SyntheticFileSystem::new(source.clone());
+        file_system.capture_open_error = capture_open_error;
         file_system.stream = stream;
         let file_system = Arc::new(file_system);
         let error = executor_registry(Arc::clone(&file_system), &path)
@@ -381,71 +449,69 @@ async fn executor_snapshot_rejects_stream_io_failures_without_post_validation() 
             .await
             .unwrap_err();
         assert_load_error(error, &path, message);
-        assert_eq!(file_system.calls(), READ_STARTED);
+        assert_eq!(file_system.calls(), [verified_read_call(&path)]);
     }
 }
 
 #[tokio::test]
-async fn executor_snapshot_rejects_each_invalid_initial_state_before_reading() {
-    let path = PathUri::parse("file:///remote/workflows/review.js").unwrap();
-    let source = Bytes::from(workflow_source("stable"));
-    for (name, state, message, reaches_canonicalize) in rejected_states(&path, source.len() as u64)
-    {
-        let mut file_system = SyntheticFileSystem::new(&path, source.clone());
-        file_system.states[0] = state;
-        let file_system = Arc::new(file_system);
-        let error = executor_registry(Arc::clone(&file_system), &path)
+async fn executor_snapshot_keeps_remote_native_paths_on_retained_authority() {
+    let path = remote_native_path();
+    assert!(path.to_abs_path().is_err());
+    let source = workflow_source("remote-native");
+    let file_system = Arc::new(SyntheticFileSystem::new(source.clone()));
+    let entry = workflow(path.clone());
+    let registry = executor_registry(Arc::clone(&file_system), &path);
+
+    assert_eq!(
+        registry
             .source_snapshot_by_name("review")
             .await
-            .unwrap_err();
-        assert_load_error(error, &path, &message);
-        let call_count = if reaches_canonicalize { 2 } else { 1 };
-        assert_eq!(file_system.calls(), READ_STARTED[..call_count], "{name}");
-    }
+            .unwrap()
+            .unwrap(),
+        WorkflowSourceSnapshot {
+            metadata: entry,
+            source: Arc::from(source),
+        }
+    );
+    assert_eq!(file_system.calls(), [verified_read_call(&path)]);
 }
 
 #[tokio::test]
-async fn executor_snapshot_rejects_each_observed_post_read_drift() {
+async fn executor_snapshot_drops_verified_stream_after_early_rejection() {
     let path = PathUri::parse("file:///remote/workflows/review.js").unwrap();
-    let source = Bytes::from(workflow_source("stable"));
-    let initial = file_state(&path, source.len() as u64);
-    let mut modified = initial.clone();
-    modified.metadata.modified_at_ms += 1;
-    let mut created = initial.clone();
-    created.metadata.created_at_ms += 1;
-    let mut resized = initial;
-    resized.metadata.size += 1;
-    let mut extended = source.to_vec();
-    extended.push(b'x');
-    let metadata_cases = [
-        ("modified", modified, source.clone()),
-        ("created", created, source.clone()),
-        ("size", resized, Bytes::from(extended)),
-    ];
-    for (name, after, stream) in metadata_cases {
-        let mut file_system = SyntheticFileSystem::new(&path, source.clone());
-        file_system.states[1] = after;
-        file_system.stream = vec![Ok(stream)];
-        let file_system = Arc::new(file_system);
-        let error = executor_registry(Arc::clone(&file_system), &path)
-            .source_snapshot_by_name("review")
-            .await
-            .unwrap_err();
-        assert_load_error(error, &path, "workflow source changed while being read");
-        assert_eq!(file_system.calls(), FULL_VALIDATION, "{name}");
-    }
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut file_system = SyntheticFileSystem::new(Bytes::new());
+    file_system.stream = vec![Ok(Bytes::new())];
+    file_system.stream_drop_probe = Some(Arc::clone(&dropped));
+    let file_system = Arc::new(file_system);
 
-    for (name, after, message, reaches_canonicalize) in rejected_states(&path, source.len() as u64)
-    {
-        let mut file_system = SyntheticFileSystem::new(&path, source.clone());
-        file_system.states[1] = after;
-        let file_system = Arc::new(file_system);
-        let error = executor_registry(Arc::clone(&file_system), &path)
-            .source_snapshot_by_name("review")
-            .await
-            .unwrap_err();
-        assert_load_error(error, &path, &message);
-        let call_count = if reaches_canonicalize { 5 } else { 4 };
-        assert_eq!(file_system.calls(), FULL_VALIDATION[..call_count], "{name}");
-    }
+    executor_registry(Arc::clone(&file_system), &path)
+        .source_snapshot_by_name("review")
+        .await
+        .unwrap_err();
+
+    assert!(dropped.load(Ordering::SeqCst));
+    assert_eq!(file_system.calls(), [verified_read_call(&path)]);
+}
+
+#[tokio::test]
+async fn cancelling_executor_snapshot_drops_pending_verified_stream() {
+    let path = PathUri::parse("file:///remote/workflows/review.js").unwrap();
+    let probe = Arc::new(PendingStreamProbe {
+        polled: Notify::new(),
+        dropped: AtomicBool::new(false),
+    });
+    let mut file_system = SyntheticFileSystem::new(Bytes::new());
+    file_system.capture_size = 1;
+    file_system.pending_stream_probe = Some(Arc::clone(&probe));
+    let file_system = Arc::new(file_system);
+    let registry = executor_registry(Arc::clone(&file_system), &path);
+
+    let task = tokio::spawn(async move { registry.source_snapshot_by_name("review").await });
+    probe.polled.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+
+    assert!(probe.dropped.load(Ordering::SeqCst));
+    assert_eq!(file_system.calls(), [verified_read_call(&path)]);
 }
