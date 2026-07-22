@@ -10,6 +10,7 @@ use crate::CopyOptions;
 use crate::CreateDirectoryOptions;
 use crate::ExecServerRuntimePaths;
 use crate::ExecutorFileSystem;
+use crate::FileSystemSandboxContext;
 use crate::RemoveOptions;
 use crate::file_read::FileReadHandleManager;
 use crate::local_file_system::LocalFileSystem;
@@ -27,6 +28,8 @@ use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsGetMetadataResponse;
 use crate::protocol::FsOpenParams;
 use crate::protocol::FsOpenResponse;
+use crate::protocol::FsOpenVerifiedParams;
+use crate::protocol::FsOpenVerifiedResponse;
 use crate::protocol::FsReadBlockParams;
 use crate::protocol::FsReadBlockResponse;
 use crate::protocol::FsReadDirectoryEntry;
@@ -43,6 +46,9 @@ use crate::protocol::FsWriteFileResponse;
 use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 use crate::rpc::not_found;
+use crate::rpc::unsupported_operation;
+use crate::verified_file_capture;
+use crate::verified_file_capture::MAX_VERIFIED_FILE_CAPTURE_BYTES;
 
 const MAX_FILE_READ_HANDLE_ID_BYTES: usize = 32;
 // Each read-directory entry needs four JSON values. Keep same-version
@@ -92,6 +98,37 @@ impl FileSystemHandler {
             .await
             .map_err(map_fs_error)?;
         Ok(FsOpenResponse { handle_id })
+    }
+
+    pub(crate) async fn open_verified(
+        &self,
+        params: FsOpenVerifiedParams,
+    ) -> Result<FsOpenVerifiedResponse, JSONRPCErrorError> {
+        validate_file_read_handle_id(&params.handle_id)?;
+        if params
+            .sandbox
+            .as_ref()
+            .is_some_and(FileSystemSandboxContext::should_run_in_sandbox)
+        {
+            return Err(unsupported_operation(
+                "verified file reads do not support platform sandboxing".to_string(),
+            ));
+        }
+        let max_bytes = params.max_bytes.min(MAX_VERIFIED_FILE_CAPTURE_BYTES);
+        let reservation = self
+            .file_reads
+            .reserve_snapshot(max_bytes)
+            .map_err(map_fs_error)?;
+        let bytes = verified_file_capture::capture(&params.path, max_bytes)
+            .await
+            .map_err(map_fs_error)?;
+        let size = bytes.len() as u64;
+        let handle_id = self
+            .file_reads
+            .open_snapshot(params.handle_id, bytes, reservation)
+            .await
+            .map_err(map_fs_error)?;
+        Ok(FsOpenVerifiedResponse { handle_id, size })
     }
 
     pub(crate) async fn read_block(
@@ -280,6 +317,7 @@ fn validate_file_read_handle_id(handle_id: &str) -> Result<(), JSONRPCErrorError
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
+        io::ErrorKind::Unsupported => unsupported_operation(err.to_string()),
         io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
             invalid_request(err.to_string())
         }

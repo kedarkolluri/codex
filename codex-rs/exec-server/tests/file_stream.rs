@@ -8,9 +8,11 @@ use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::FsCloseParams;
 use codex_exec_server::FsOpenParams;
+use codex_exec_server::FsOpenVerifiedParams;
 use codex_exec_server::FsReadBlockParams;
 use codex_exec_server::FsReadBlockResponse;
 use codex_exec_server::RemoteExecServerConnectArgs;
+use codex_exec_server::VerifiedFileReadOptions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::permissions::FileSystemAccessMode;
 use codex_protocol::permissions::FileSystemPath;
@@ -78,6 +80,90 @@ async fn completed_streams_release_handle_capacity() -> Result<()> {
         assert_eq!(chunks, vec![bytes::Bytes::from_static(b"repeated")]);
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_stream_serves_only_the_pre_response_snapshot() -> Result<()> {
+    let server = exec_server().await?;
+    let file_system = connect_file_system(server.websocket_url())?;
+    let tmp = TempDir::new()?;
+    let path = tmp.path().join("verified.bin");
+    std::fs::write(&path, b"trusted")?;
+    let path = std::fs::canonicalize(path)?;
+    let capture = file_system
+        .read_file_verified(
+            &PathUri::from_host_native_path(&path)?,
+            VerifiedFileReadOptions { max_bytes: 7 },
+            /*sandbox*/ None,
+        )
+        .await?;
+    assert_eq!(capture.size, 7);
+
+    std::fs::write(&path, b"hostile")?;
+    assert_eq!(
+        capture.stream.try_collect::<Vec<_>>().await?,
+        vec![bytes::Bytes::from_static(b"trusted")]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_stream_rejects_platform_sandbox() -> Result<()> {
+    let server = exec_server().await?;
+    let file_system = connect_file_system(server.websocket_url())?;
+    let tmp = TempDir::new()?;
+    let path = tmp.path().join("sandboxed.txt");
+    std::fs::write(&path, "sandboxed")?;
+
+    let error = file_system
+        .read_file_verified(
+            &PathUri::from_host_native_path(&path)?,
+            VerifiedFileReadOptions { max_bytes: 9 },
+            Some(&read_only_sandbox(tmp.path().to_path_buf())),
+        )
+        .await
+        .err()
+        .expect("sandboxed verified read should be rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    assert_eq!(
+        error.to_string(),
+        "verified file reads do not support platform sandboxing"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn verified_open_server_rejects_platform_sandbox() -> Result<()> {
+    let server = exec_server().await?;
+    let client = ExecServerClient::connect_websocket(RemoteExecServerConnectArgs::new(
+        server.websocket_url().to_string(),
+        "verified-file-sandbox-test".to_string(),
+    ))
+    .await?;
+    let tmp = TempDir::new()?;
+    let path = tmp.path().join("sandboxed-server.txt");
+    std::fs::write(&path, "sandboxed")?;
+
+    let error = client
+        .fs_open_verified(FsOpenVerifiedParams {
+            handle_id: Uuid::new_v4().simple().to_string(),
+            path: PathUri::from_host_native_path(path)?,
+            max_bytes: 9,
+            sandbox: Some(read_only_sandbox(tmp.path().to_path_buf())),
+        })
+        .await
+        .expect_err("server should reject sandboxed verified read");
+    let ExecServerError::Server { code, message } = error else {
+        anyhow::bail!("expected server error, got {error:?}");
+    };
+    assert_eq!(
+        (code, message),
+        (
+            -32005,
+            "verified file reads do not support platform sandboxing".to_string(),
+        )
+    );
     Ok(())
 }
 
@@ -301,9 +387,9 @@ async fn open_enforces_the_per_connection_limit_and_close_releases_capacity() ->
     let tmp = TempDir::new()?;
     let path = tmp.path().join("limited.bin");
     std::fs::write(&path, b"limited")?;
-    let path = PathUri::from_host_native_path(path)?;
+    let path = PathUri::from_host_native_path(std::fs::canonicalize(path)?)?;
     let mut handles = Vec::with_capacity(OPEN_FILE_LIMIT);
-    for _ in 0..OPEN_FILE_LIMIT {
+    for _ in 0..OPEN_FILE_LIMIT - 1 {
         let open = client
             .fs_open(FsOpenParams {
                 handle_id: Uuid::new_v4().simple().to_string(),
@@ -313,6 +399,15 @@ async fn open_enforces_the_per_connection_limit_and_close_releases_capacity() ->
             .await?;
         handles.push(open.handle_id);
     }
+    let verified = client
+        .fs_open_verified(FsOpenVerifiedParams {
+            handle_id: Uuid::new_v4().simple().to_string(),
+            path: path.clone(),
+            max_bytes: 7,
+            sandbox: None,
+        })
+        .await?;
+    handles.push(verified.handle_id);
 
     let error = client
         .fs_open(FsOpenParams {
