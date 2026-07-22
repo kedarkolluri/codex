@@ -123,7 +123,7 @@ fn every_workflow_event_round_trips_with_full_payload_equality() -> Result<()> {
             node_id: 4,
             attempt: 2,
             last_attempt_reason: Some(WorkflowAgentAttemptReason::UserSkip),
-            token_usage: token_usage(21),
+            token_usage: token_usage(/*total_tokens*/ 21),
             tool_call_count: 2,
             duration_ms: 500,
         },
@@ -137,7 +137,7 @@ fn every_workflow_event_round_trips_with_full_payload_equality() -> Result<()> {
             attempt: 5,
             last_attempt_reason: Some(WorkflowAgentAttemptReason::RetryLimitReached),
             status: AgentStatus::Errored("model disconnected".to_string()),
-            token_usage: token_usage(34),
+            token_usage: token_usage(/*total_tokens*/ 34),
             tool_call_count: 3,
             duration_ms: 900,
             returned_null: true,
@@ -332,7 +332,7 @@ fn omitted_additive_fields_decode_to_legacy_defaults() -> Result<()> {
         "event": "agent_updated",
         "run_id": "run-legacy",
         "node_id": 1,
-        "token_usage": token_usage(10),
+        "token_usage": token_usage(/*total_tokens*/ 10),
         "tool_call_count": 2
     });
     let EventMsg::Workflow(WorkflowEvent::AgentUpdated(actual)) =
@@ -347,7 +347,7 @@ fn omitted_additive_fields_decode_to_legacy_defaults() -> Result<()> {
             node_id: 1,
             attempt: 0,
             last_attempt_reason: None,
-            token_usage: token_usage(10),
+            token_usage: token_usage(/*total_tokens*/ 10),
             tool_call_count: 2,
             duration_ms: 0,
         }
@@ -359,7 +359,7 @@ fn omitted_additive_fields_decode_to_legacy_defaults() -> Result<()> {
         "run_id": "run-legacy",
         "node_id": 1,
         "status": "shutdown",
-        "token_usage": token_usage(10),
+        "token_usage": token_usage(/*total_tokens*/ 10),
         "tool_call_count": 2,
         "returned_null": false
     });
@@ -376,7 +376,7 @@ fn omitted_additive_fields_decode_to_legacy_defaults() -> Result<()> {
             attempt: 0,
             last_attempt_reason: None,
             status: AgentStatus::Shutdown,
-            token_usage: token_usage(10),
+            token_usage: token_usage(/*total_tokens*/ 10),
             tool_call_count: 2,
             duration_ms: 0,
             returned_null: false,
