@@ -25,6 +25,7 @@ use super::SupportedProtocolVersions;
 use super::WireCellId;
 use super::WireContentItem;
 use super::WireExecuteRequest;
+use super::WireExecuteRequestConversionError;
 use super::WireImageDetail;
 use super::WireNestedToolCall;
 use super::WireResult;
@@ -34,6 +35,7 @@ use super::WireToolKind;
 use super::WireToolName;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use crate::ExecuteOutputPolicy;
 use crate::ExecuteRequest;
 
 fn session_id() -> SessionId {
@@ -604,13 +606,43 @@ fn execute_request_integer_bounds_are_enforced() {
         max_output_tokens: Some(usize::try_from(i32::MAX).expect("i32::MAX fits usize") + 1),
         ..domain_request
     };
-    assert!(WireExecuteRequest::try_from(too_large).is_err());
+    assert!(matches!(
+        WireExecuteRequest::try_from(too_large),
+        Err(WireExecuteRequestConversionError::MaxOutputTokensOutOfRange(_))
+    ));
 
     let negative = WireExecuteRequest {
         max_output_tokens: Some(-1),
         ..wire_request
     };
     assert!(ExecuteRequest::try_from(negative).is_err());
+}
+
+#[test]
+fn execute_output_policy_defaults_to_ordinary_for_older_requests() {
+    let older_request = json!({
+        "tool_call_id": "call-1",
+        "enabled_tools": [],
+        "source": "text('hello');",
+        "yield_time_ms": null,
+        "max_output_tokens": null,
+    });
+    let domain_request = serde_json::from_value::<ExecuteRequest>(older_request)
+        .expect("older domain execute request");
+    assert_eq!(domain_request.output_policy, ExecuteOutputPolicy::Ordinary);
+}
+
+#[test]
+fn saved_output_policy_cannot_silently_degrade_during_wire_conversion() {
+    let domain_request = ExecuteRequest {
+        output_policy: ExecuteOutputPolicy::SavedWorkflow,
+        ..ExecuteRequest::try_from(execute_request()).expect("domain request")
+    };
+
+    assert!(matches!(
+        WireExecuteRequest::try_from(domain_request),
+        Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+    ));
 }
 
 #[test]

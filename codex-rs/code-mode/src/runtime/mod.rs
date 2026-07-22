@@ -13,6 +13,7 @@ use std::sync::mpsc as std_mpsc;
 use std::thread;
 
 use codex_code_mode_protocol::EnabledToolMetadata;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::enabled_tool_metadata;
 use serde_json::Value as JsonValue;
@@ -57,6 +58,7 @@ pub(crate) fn spawn_runtime(
         tool_call_id: request.tool_call_id,
         enabled_tools,
         source: request.source,
+        output_policy: request.output_policy,
         stored_values,
     };
 
@@ -98,6 +100,7 @@ struct RuntimeConfig {
     tool_call_id: String,
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
+    output_policy: ExecuteOutputPolicy,
     stored_values: HashMap<String, JsonValue>,
 }
 
@@ -141,6 +144,7 @@ fn run_runtime(
         tool_call_id: config.tool_call_id,
         runtime_command_tx,
         exit_requested: false,
+        output_policy: config.output_policy,
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
@@ -279,6 +283,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
 
+    use super::ExecuteOutputPolicy;
     use super::ExecuteRequest;
     use super::PendingRuntimeMode;
     use super::RuntimeCommand;
@@ -293,6 +298,7 @@ mod tests {
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: source.to_string(),
+            output_policy: ExecuteOutputPolicy::Ordinary,
             yield_time_ms: Some(1),
             max_output_tokens: None,
         }

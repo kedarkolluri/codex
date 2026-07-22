@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::mpsc as std_mpsc;
 
 use codex_code_mode_protocol::EnabledToolMetadata;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
 
@@ -21,4 +22,5 @@ pub(crate) struct RuntimeState {
     pub(super) tool_call_id: String,
     pub(super) runtime_command_tx: std_mpsc::Sender<RuntimeCommand>,
     pub(super) exit_requested: bool,
+    pub(super) output_policy: ExecuteOutputPolicy,
 }

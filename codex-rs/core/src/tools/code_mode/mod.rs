@@ -440,6 +440,7 @@ mod tests {
                 tool_call_id: "call-1".to_string(),
                 enabled_tools: Vec::new(),
                 source: "text('fallback')".to_string(),
+                output_policy: codex_code_mode::ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: None,
                 max_output_tokens: None,
             })

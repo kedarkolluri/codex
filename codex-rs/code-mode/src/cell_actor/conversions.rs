@@ -1,4 +1,5 @@
 use codex_code_mode_protocol::CodeModeToolKind;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
@@ -8,6 +9,7 @@ use codex_protocol::ToolName;
 use crate::session_runtime::CreateCellRequest as CellRequest;
 use crate::session_runtime::ImageDetail as CellImageDetail;
 use crate::session_runtime::OutputItem as CellOutputItem;
+use crate::session_runtime::OutputPolicy as CellOutputPolicy;
 use crate::session_runtime::ToolKind as CellToolKind;
 
 pub(super) fn runtime_request(request: CellRequest) -> ExecuteRequest {
@@ -32,6 +34,10 @@ pub(super) fn runtime_request(request: CellRequest) -> ExecuteRequest {
             })
             .collect(),
         source: request.source,
+        output_policy: match request.output_policy {
+            CellOutputPolicy::Ordinary => ExecuteOutputPolicy::Ordinary,
+            CellOutputPolicy::SavedWorkflow => ExecuteOutputPolicy::SavedWorkflow,
+        },
         yield_time_ms: None,
         max_output_tokens: None,
     }

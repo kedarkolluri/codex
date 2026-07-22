@@ -284,10 +284,11 @@ pub(super) fn notify_callback(
         return;
     }
     if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::Notify {
+        let event = RuntimeEvent::Notify {
             call_id: state.tool_call_id.clone(),
             text,
-        });
+        };
+        let _ = state.event_tx.send(event);
     }
     retval.set(v8::undefined(scope).into());
 }

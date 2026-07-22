@@ -8,8 +8,10 @@ use std::time::Duration;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeNestedToolCall;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::NotificationFuture;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::DelegateRequest;
@@ -125,6 +127,7 @@ impl DriverHarness {
                     tool_call_id: format!("call-{request_id}"),
                     enabled_tools: Vec::new(),
                     source: "await new Promise(() => {})".to_string(),
+                    output_policy: ExecuteOutputPolicy::Ordinary,
                     yield_time_ms: Some(1),
                     max_output_tokens: None,
                 },
@@ -328,6 +331,53 @@ async fn next_held_delegate_event(
 }
 
 #[tokio::test]
+async fn saved_workflow_policy_sends_no_frame_and_connection_remains_usable() {
+    let mut harness = DriverHarness::start();
+    let session = remote_session();
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    let (execute_tx, execute_rx) = oneshot::channel();
+    harness
+        .command_tx
+        .send(DriverCommand::Execute {
+            session: session.clone(),
+            request: ExecuteRequest {
+                tool_call_id: "call-saved".to_string(),
+                enabled_tools: Vec::new(),
+                source: "text('saved')".to_string(),
+                output_policy: ExecuteOutputPolicy::SavedWorkflow,
+                yield_time_ms: None,
+                max_output_tokens: None,
+            },
+            caller_cancellation: CancellationToken::new(),
+            response_tx: execute_tx,
+        })
+        .await
+        .expect("saved execute command");
+
+    assert_eq!(
+        execute_rx
+            .await
+            .expect("saved execute reply")
+            .err()
+            .expect("saved execute should be rejected"),
+        SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE
+    );
+    assert!(matches!(
+        harness.outgoing_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(harness.alive.load(Ordering::Acquire));
+
+    let started = harness
+        .start_cell(session, /*request_id*/ 2, "ordinary-cell")
+        .await;
+    assert_eq!(started.cell_id, CellId::new("ordinary-cell".to_string()));
+    assert!(harness.alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
 async fn dropped_open_waiter_shuts_down_committed_session() {
     let mut harness = DriverHarness::start();
     let session = remote_session();
@@ -385,6 +435,7 @@ async fn dropped_open_waiter_shuts_down_committed_session() {
                 tool_call_id: "call-1".to_string(),
                 enabled_tools: Vec::new(),
                 source: "text('ok')".to_string(),
+                output_policy: ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: None,
                 max_output_tokens: None,
             },
@@ -1074,6 +1125,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
                 tool_call_id: "call-1".to_string(),
                 enabled_tools: Vec::new(),
                 source: "await new Promise(() => {})".to_string(),
+                output_policy: ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
             },
@@ -1169,6 +1221,7 @@ async fn delivered_but_unclaimed_execute_is_terminated_when_the_caller_is_cancel
                 tool_call_id: "call-1".to_string(),
                 enabled_tools: Vec::new(),
                 source: "await new Promise(() => {})".to_string(),
+                output_policy: ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
             },
@@ -1323,6 +1376,7 @@ async fn connection_failure_closes_every_live_cell_once() {
                 tool_call_id: "call-1".to_string(),
                 enabled_tools: Vec::new(),
                 source: "await new Promise(() => {})".to_string(),
+                output_policy: ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
             },
@@ -1491,6 +1545,7 @@ async fn dropped_shutdown_waiter_does_not_abort_remote_cleanup() {
                 tool_call_id: "call-2".to_string(),
                 enabled_tools: Vec::new(),
                 source: "text('unreachable')".to_string(),
+                output_policy: ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: None,
                 max_output_tokens: None,
             },

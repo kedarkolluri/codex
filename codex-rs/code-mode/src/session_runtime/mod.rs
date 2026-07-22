@@ -20,6 +20,7 @@ pub(crate) use self::types::ImageDetail;
 pub(crate) use self::types::NestedToolCall;
 pub(crate) use self::types::ObserveMode;
 pub(crate) use self::types::OutputItem;
+pub(crate) use self::types::OutputPolicy;
 pub(crate) use self::types::SessionRuntimeDelegate;
 pub(crate) use self::types::ToolDefinition;
 pub(crate) use self::types::ToolKind;
@@ -159,10 +160,15 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
     ) -> Result<RuntimeEventFuture, Error> {
-        let stored_values = self.inner.stored_values.lock().await.clone();
+        let output_policy = request.output_policy;
+        let stored_values = match output_policy {
+            OutputPolicy::Ordinary => self.inner.stored_values.lock().await.clone(),
+            OutputPolicy::SavedWorkflow => HashMap::new(),
+        };
         let host = Arc::new(RuntimeCellHost {
             cell_id: cell_id.clone(),
             inner: Arc::clone(&self.inner),
+            output_policy,
         });
         let mut cells = self.inner.cells.lock().await;
         if self.inner.shutdown_token.is_cancelled() {
@@ -235,6 +241,7 @@ impl PendingEvent {
 struct RuntimeCellHost<D: SessionRuntimeDelegate> {
     cell_id: CellId,
     inner: Arc<Inner<D>>,
+    output_policy: OutputPolicy,
 }
 
 impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
@@ -277,6 +284,9 @@ impl<D: SessionRuntimeDelegate> CellHost for RuntimeCellHost<D> {
         pending_initial_yield_items: Option<Vec<OutputItem>>,
         cell_state: Arc<CellState>,
     ) -> CompletionCommit {
+        if self.output_policy == OutputPolicy::SavedWorkflow {
+            return cell_state.commit_completion(event, pending_initial_yield_items, || {});
+        }
         let cancellation_token = cell_state.cancellation_token();
         let mut stored_values = tokio::select! {
             biased;

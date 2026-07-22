@@ -15,6 +15,7 @@ async fn code_mode_runs_with_jit_disabled() {
             tool_call_id: "call_1".to_string(),
             enabled_tools: Vec::new(),
             source: "21 * 2;".to_string(),
+            output_policy: codex_code_mode::ExecuteOutputPolicy::Ordinary,
             yield_time_ms: None,
             max_output_tokens: None,
         })
