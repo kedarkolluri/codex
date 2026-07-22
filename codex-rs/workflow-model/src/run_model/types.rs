@@ -3,6 +3,7 @@ use std::fmt;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::WorkflowRunTerminalReason;
 
 /// Lifecycle of the workflow run represented by the workflow projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +64,23 @@ impl WorkflowAggregate {
 
     pub fn duration_ms(&self) -> u64 {
         self.duration_ms
+    }
+}
+
+/// Terminal weighted-token budget reported by the workflow runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkflowBudgetSummary {
+    pub(super) spent: i64,
+    pub(super) total: Option<i64>,
+}
+
+impl WorkflowBudgetSummary {
+    pub fn spent(&self) -> i64 {
+        self.spent
+    }
+
+    pub fn total(&self) -> Option<i64> {
+        self.total
     }
 }
 
@@ -232,6 +250,17 @@ pub enum WorkflowModelError {
     AggregateUnderflow {
         field: &'static str,
     },
+    ActiveTopologyAtRunEnd {
+        node_id: u64,
+    },
+    TerminalReasonMismatch {
+        status: AgentStatus,
+        terminal_reason: WorkflowRunTerminalReason,
+    },
+    NegativeBudget {
+        spent: i64,
+        total: Option<i64>,
+    },
     NonTerminalStatus {
         node_id: Option<u64>,
         status: AgentStatus,
@@ -324,6 +353,21 @@ impl fmt::Display for WorkflowModelError {
             Self::TooManyDeclaredPhases { maximum, actual } => write!(
                 formatter,
                 "workflow declares {actual} phases; maximum is {maximum}"
+            ),
+            Self::ActiveTopologyAtRunEnd { node_id } => write!(
+                formatter,
+                "workflow run cannot end while topology node {node_id} is active"
+            ),
+            Self::TerminalReasonMismatch {
+                status,
+                terminal_reason,
+            } => write!(
+                formatter,
+                "workflow terminal status {status:?} does not match reason {terminal_reason:?}"
+            ),
+            Self::NegativeBudget { spent, total } => write!(
+                formatter,
+                "workflow terminal budget must be nonnegative; spent is {spent}, total is {total:?}"
             ),
             Self::ActiveTopologyAtPhaseBoundary { .. }
             | Self::UnexpectedTopologyId { .. }

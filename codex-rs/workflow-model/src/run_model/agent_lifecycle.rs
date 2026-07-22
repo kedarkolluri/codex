@@ -126,11 +126,24 @@ impl WorkflowRunModel {
     }
 }
 
-fn validate_terminal_status(
+pub(super) fn validate_terminal_status(
     node_id: Option<u64>,
     status: &AgentStatus,
 ) -> Result<(), WorkflowModelError> {
     match status {
+        AgentStatus::Completed(Some(message)) | AgentStatus::Errored(message)
+            if message.len() > WORKFLOW_STATUS_MESSAGE_MAX_BYTES =>
+        {
+            Err(WorkflowModelError::TextTooLong {
+                field: if node_id.is_some() {
+                    "agent status message"
+                } else {
+                    "run status message"
+                },
+                maximum_bytes: WORKFLOW_STATUS_MESSAGE_MAX_BYTES,
+                actual_bytes: message.len(),
+            })
+        }
         AgentStatus::PendingInit | AgentStatus::Running => {
             Err(WorkflowModelError::NonTerminalStatus {
                 node_id,

@@ -17,6 +17,7 @@ mod agent_lifecycle;
 mod agent_topology;
 mod aggregate;
 mod phase_lifecycle;
+mod run_terminal;
 mod topology;
 mod topology_types;
 mod types;
@@ -26,6 +27,7 @@ pub use topology_types::WorkflowGroup;
 pub use topology_types::WorkflowNodeState;
 pub use topology_types::WorkflowTopologyNode;
 pub use types::WorkflowAggregate;
+pub use types::WorkflowBudgetSummary;
 pub use types::WorkflowModelError;
 pub use types::WorkflowPhase;
 pub use types::WorkflowPhaseState;
@@ -34,12 +36,13 @@ pub use types::WorkflowRunState;
 const IMPLICIT_ROOT_PHASE_TITLE: &str = "root";
 const WORKFLOW_RUN_ID_MAX_BYTES: usize = 256;
 const WORKFLOW_ARGS_DIGEST_MAX_BYTES: usize = 256;
+const WORKFLOW_STATUS_MESSAGE_MAX_BYTES: usize = 4 * 1024;
 
 /// Renderer-neutral state derived from one workflow run's ordered progress events.
 ///
-/// Construct the initial deterministic state from the run's `RunBegin` event. Later Stage 05
-/// slices add transactional reduction of the remaining workflow event family behind a private
-/// fail-closed seam.
+/// Construct the initial deterministic state from the run's `RunBegin` event, then feed every
+/// later event to [`Self::apply`] in observation order. Invalid events are rejected
+/// transactionally without changing the prior model.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowRunModel {
     run_id: String,
@@ -49,6 +52,7 @@ pub struct WorkflowRunModel {
     state: WorkflowRunState,
     status: AgentStatus,
     terminal_reason: Option<WorkflowRunTerminalReason>,
+    budget: Option<WorkflowBudgetSummary>,
     phases: Vec<WorkflowPhase>,
     topology: BTreeMap<u64, WorkflowTopologyNode>,
     aggregate: WorkflowAggregate,
@@ -56,12 +60,6 @@ pub struct WorkflowRunModel {
     next_phase_index: u64,
     next_topology_id: u64,
     log_event_count: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReductionDisposition {
-    Applied,
-    Unhandled,
 }
 
 impl WorkflowRunModel {
@@ -101,6 +99,10 @@ impl WorkflowRunModel {
         self.terminal_reason
     }
 
+    pub fn budget(&self) -> Option<WorkflowBudgetSummary> {
+        self.budget
+    }
+
     pub fn phases(&self) -> &[WorkflowPhase] {
         &self.phases
     }
@@ -114,13 +116,8 @@ impl WorkflowRunModel {
         &self.aggregate
     }
 
-    /// Staging seam for the ordered reducer. Stage 05d makes the reducer public only after every
-    /// current `WorkflowEvent` variant has a fail-closed implementation.
-    #[allow(dead_code)]
-    fn reduce_event(
-        &mut self,
-        event: &WorkflowEvent,
-    ) -> Result<ReductionDisposition, WorkflowModelError> {
+    /// Applies one subsequent event without changing the model if validation fails.
+    pub fn apply(&mut self, event: &WorkflowEvent) -> Result<(), WorkflowModelError> {
         if matches!(event, WorkflowEvent::RunBegin(_)) {
             return Err(WorkflowModelError::DuplicateRunBegin);
         }
@@ -149,44 +146,17 @@ impl WorkflowRunModel {
         }
 
         match event {
-            WorkflowEvent::PhaseBegin(event) => {
-                self.reduce_phase_begin(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::PhaseEnd(event) => {
-                self.reduce_phase_end(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::Log(event) => {
-                self.reduce_log(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::GroupBegin(event) => {
-                self.reduce_group_begin(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::GroupEnd(event) => {
-                self.reduce_group_end(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::AgentBegin(event) => {
-                self.reduce_agent_begin(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::AgentBound(event) => {
-                self.reduce_agent_bound(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::AgentUpdated(event) => {
-                self.reduce_agent_updated(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
-            WorkflowEvent::AgentEnd(event) => {
-                self.reduce_agent_end(event)?;
-                Ok(ReductionDisposition::Applied)
-            }
+            WorkflowEvent::RunEnd(event) => self.reduce_run_end(event),
+            WorkflowEvent::PhaseBegin(event) => self.reduce_phase_begin(event),
+            WorkflowEvent::PhaseEnd(event) => self.reduce_phase_end(event),
+            WorkflowEvent::GroupBegin(event) => self.reduce_group_begin(event),
+            WorkflowEvent::GroupEnd(event) => self.reduce_group_end(event),
+            WorkflowEvent::AgentBegin(event) => self.reduce_agent_begin(event),
+            WorkflowEvent::AgentBound(event) => self.reduce_agent_bound(event),
+            WorkflowEvent::AgentUpdated(event) => self.reduce_agent_updated(event),
+            WorkflowEvent::AgentEnd(event) => self.reduce_agent_end(event),
+            WorkflowEvent::Log(event) => self.reduce_log(event),
             WorkflowEvent::RunBegin(_) => unreachable!("run begin rejected above"),
-            WorkflowEvent::RunEnd(_) => Ok(ReductionDisposition::Unhandled),
         }
     }
 
@@ -254,6 +224,7 @@ impl WorkflowRunModel {
             state: WorkflowRunState::Running,
             status: AgentStatus::Running,
             terminal_reason: None,
+            budget: None,
             phases,
             topology: BTreeMap::new(),
             aggregate: WorkflowAggregate::default(),
@@ -306,3 +277,7 @@ mod agent_lifecycle_tests;
 #[cfg(test)]
 #[path = "run_model_aggregate_tests.rs"]
 mod aggregate_tests;
+
+#[cfg(test)]
+#[path = "run_model_terminal_tests.rs"]
+mod terminal_tests;

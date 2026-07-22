@@ -4,6 +4,7 @@ mod run_model;
 
 pub use run_model::WorkflowAgent;
 pub use run_model::WorkflowAggregate;
+pub use run_model::WorkflowBudgetSummary;
 pub use run_model::WorkflowGroup;
 pub use run_model::WorkflowModelError;
 pub use run_model::WorkflowNodeState;

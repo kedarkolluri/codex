@@ -4,8 +4,6 @@ use codex_protocol::protocol::WorkflowLogEvent;
 use codex_protocol::protocol::WorkflowPhaseBeginEvent;
 use codex_protocol::protocol::WorkflowPhaseEndEvent;
 use codex_protocol::protocol::WorkflowRunBeginEvent;
-use codex_protocol::protocol::WorkflowRunEndEvent;
-use codex_protocol::protocol::WorkflowRunTerminalReason;
 use pretty_assertions::assert_eq;
 
 use super::*;
@@ -45,23 +43,13 @@ fn log_event(message: &str) -> WorkflowEvent {
     })
 }
 
-fn run_end() -> WorkflowEvent {
-    WorkflowEvent::RunEnd(WorkflowRunEndEvent {
-        run_id: RUN_ID.to_string(),
-        status: AgentStatus::Completed(None),
-        terminal_reason: Some(WorkflowRunTerminalReason::Completed),
-        spent: 0,
-        total: None,
-    })
-}
-
 fn project(events: &[WorkflowEvent]) -> Result<WorkflowRunModel, WorkflowModelError> {
     let Some((begin, remaining)) = events.split_first() else {
         return Err(WorkflowModelError::ExpectedRunBegin);
     };
     let mut model = WorkflowRunModel::from_event(begin)?;
     for event in remaining {
-        assert_eq!(model.reduce_event(event)?, ReductionDisposition::Applied);
+        model.apply(event)?;
     }
     Ok(model)
 }
@@ -72,7 +60,7 @@ fn assert_rejected_unchanged(
     expected: WorkflowModelError,
 ) {
     let before = model.clone();
-    assert_eq!(model.reduce_event(event), Err(expected));
+    assert_eq!(model.apply(event), Err(expected));
     assert_eq!(*model, before);
 }
 
@@ -100,6 +88,7 @@ fn declared_and_dynamic_phases_reduce_deterministically() {
             state: WorkflowRunState::Running,
             status: AgentStatus::Running,
             terminal_reason: None,
+            budget: None,
             phases: vec![
                 phase(
                     /*index*/ 0,
@@ -134,16 +123,16 @@ fn first_explicit_phase_replaces_the_implicit_root() {
     );
 
     assert_eq!(
-        model.reduce_event(&phase_begin(/*phase_index*/ 0, "discover")),
-        Ok(ReductionDisposition::Applied)
+        model.apply(&phase_begin(/*phase_index*/ 0, "discover")),
+        Ok(())
     );
     assert_eq!(
-        model.reduce_event(&phase_end(/*phase_index*/ 0, "discover")),
-        Ok(ReductionDisposition::Applied)
+        model.apply(&phase_end(/*phase_index*/ 0, "discover")),
+        Ok(())
     );
     assert_eq!(
-        model.reduce_event(&phase_begin(/*phase_index*/ 1, "summarize")),
-        Ok(ReductionDisposition::Applied)
+        model.apply(&phase_begin(/*phase_index*/ 1, "summarize")),
+        Ok(())
     );
 
     assert_eq!(
@@ -156,6 +145,7 @@ fn first_explicit_phase_replaces_the_implicit_root() {
             state: WorkflowRunState::Running,
             status: AgentStatus::Running,
             terminal_reason: None,
+            budget: None,
             phases: vec![
                 phase(
                     /*index*/ 0,
@@ -206,10 +196,7 @@ fn invalid_phase_ordering_is_transactional() {
             actual: "wrong".to_string(),
         },
     );
-    assert_eq!(
-        model.reduce_event(&phase_begin(/*phase_index*/ 0, "plan")),
-        Ok(ReductionDisposition::Applied)
-    );
+    assert_eq!(model.apply(&phase_begin(/*phase_index*/ 0, "plan")), Ok(()));
     assert_rejected_unchanged(
         &mut model,
         &phase_begin(/*phase_index*/ 1, "execute"),
@@ -229,10 +216,7 @@ fn invalid_phase_ordering_is_transactional() {
             actual: "wrong".to_string(),
         },
     );
-    assert_eq!(
-        model.reduce_event(&phase_end(/*phase_index*/ 0, "plan")),
-        Ok(ReductionDisposition::Applied)
-    );
+    assert_eq!(model.apply(&phase_end(/*phase_index*/ 0, "plan")), Ok(()));
     assert_rejected_unchanged(
         &mut model,
         &phase_begin(/*phase_index*/ 0, "plan"),
@@ -325,8 +309,8 @@ fn event_headers_and_text_are_bounded_before_mutation() {
     let mut active =
         WorkflowRunModel::from_event(&run_begin(&["plan"])).expect("declared run should begin");
     assert_eq!(
-        active.reduce_event(&phase_begin(/*phase_index*/ 0, "plan")),
-        Ok(ReductionDisposition::Applied)
+        active.apply(&phase_begin(/*phase_index*/ 0, "plan")),
+        Ok(())
     );
     for (title, expected) in invalid_phase_titles() {
         assert_rejected_unchanged(&mut active, &phase_end(/*phase_index*/ 0, &title), expected);
@@ -355,29 +339,21 @@ fn event_headers_and_text_are_bounded_before_mutation() {
     let mut exact = base.clone();
     let exact_title = "p".repeat(WORKFLOW_PHASE_TITLE_MAX_BYTES);
     assert_eq!(
-        exact.reduce_event(&phase_begin(/*phase_index*/ 0, &exact_title)),
-        Ok(ReductionDisposition::Applied)
+        exact.apply(&phase_begin(/*phase_index*/ 0, &exact_title)),
+        Ok(())
     );
     assert_eq!(
-        exact.reduce_event(&log_event(&"l".repeat(WORKFLOW_LOG_MESSAGE_MAX_BYTES))),
-        Ok(ReductionDisposition::Applied)
+        exact.apply(&log_event(&"l".repeat(WORKFLOW_LOG_MESSAGE_MAX_BYTES))),
+        Ok(())
     );
 
-    let mut completed = base.clone();
+    let mut completed = base;
     completed.state = WorkflowRunState::Completed;
     assert_rejected_unchanged(
         &mut completed,
         &log_event("late"),
         WorkflowModelError::RunAlreadyCompleted,
     );
-
-    let mut unhandled = base;
-    let before = unhandled.clone();
-    assert_eq!(
-        unhandled.reduce_event(&run_end()),
-        Ok(ReductionDisposition::Unhandled)
-    );
-    assert_eq!(unhandled, before);
 }
 
 #[test]
@@ -385,14 +361,8 @@ fn phase_and_log_caps_fail_without_mutation() {
     let mut phases = WorkflowRunModel::from_event(&run_begin(&[])).expect("run should begin");
     for phase_index in 0..WORKFLOW_PHASE_MAX_EVENTS {
         let title = format!("phase-{phase_index}");
-        assert_eq!(
-            phases.reduce_event(&phase_begin(phase_index, &title)),
-            Ok(ReductionDisposition::Applied)
-        );
-        assert_eq!(
-            phases.reduce_event(&phase_end(phase_index, &title)),
-            Ok(ReductionDisposition::Applied)
-        );
+        assert_eq!(phases.apply(&phase_begin(phase_index, &title)), Ok(()));
+        assert_eq!(phases.apply(&phase_end(phase_index, &title)), Ok(()));
     }
     assert_eq!(
         phases.phases.len(),
@@ -409,7 +379,7 @@ fn phase_and_log_caps_fail_without_mutation() {
     let mut logs = WorkflowRunModel::from_event(&run_begin(&[])).expect("run should begin");
     let event = log_event("bounded");
     for _ in 0..WORKFLOW_LOG_MAX_EVENTS {
-        assert_eq!(logs.reduce_event(&event), Ok(ReductionDisposition::Applied));
+        assert_eq!(logs.apply(&event), Ok(()));
     }
     assert_eq!(logs.log_event_count, WORKFLOW_LOG_MAX_EVENTS);
     assert_rejected_unchanged(

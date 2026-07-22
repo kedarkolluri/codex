@@ -31,6 +31,7 @@ fn run_begin_seeds_every_declared_phase_pending() {
             state: WorkflowRunState::Running,
             status: AgentStatus::Running,
             terminal_reason: None,
+            budget: None,
             phases: vec![
                 phase(
                     /*index*/ 0,
@@ -76,6 +77,7 @@ fn empty_phase_list_seeds_one_active_implicit_root() {
             state: WorkflowRunState::Running,
             status: AgentStatus::Running,
             terminal_reason: None,
+            budget: None,
             phases: vec![phase(
                 /*index*/ 0,
                 "root",
