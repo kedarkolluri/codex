@@ -449,3 +449,7 @@ mod contract_tests;
 #[cfg(test)]
 #[path = "service_saved_workflow_state_tests.rs"]
 mod saved_workflow_state_tests;
+
+#[cfg(test)]
+#[path = "service_saved_workflow_bounds_tests.rs"]
+mod saved_workflow_bounds_tests;

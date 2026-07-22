@@ -1,8 +1,10 @@
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 
 use super::EXIT_SENTINEL;
 use super::RuntimeEvent;
 use super::RuntimeState;
+use super::state::AdmissionOutcome;
 use super::timers;
 use super::value::json_to_v8;
 use super::value::normalize_output_audio;
@@ -89,11 +91,10 @@ pub(super) fn text_callback(
             return;
         }
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(
-            FunctionCallOutputContentItem::InputText { text },
-        ));
-    }
+    send_content_items(
+        scope,
+        vec![FunctionCallOutputContentItem::InputText { text }],
+    );
     retval.set(v8::undefined(scope).into());
 }
 
@@ -111,9 +112,7 @@ pub(super) fn audio_callback(
         Ok(audio_item) => audio_item,
         Err(()) => return,
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(audio_item));
-    }
+    send_content_items(scope, vec![audio_item]);
     retval.set(v8::undefined(scope).into());
 }
 
@@ -144,9 +143,7 @@ pub(super) fn image_callback(
         Ok(image_item) => image_item,
         Err(()) => return,
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(image_item));
-    }
+    send_content_items(scope, vec![image_item]);
     retval.set(v8::undefined(scope).into());
 }
 
@@ -283,12 +280,25 @@ pub(super) fn notify_callback(
         throw_type_error(scope, "notify expects non-empty text");
         return;
     }
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let event = RuntimeEvent::Notify {
-            call_id: state.tool_call_id.clone(),
-            text,
-        };
-        let _ = state.event_tx.send(event);
+    match scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.output_policy)
+    {
+        Some(ExecuteOutputPolicy::Ordinary) => {
+            if let Some(state) = scope.get_slot::<RuntimeState>() {
+                let _ = state.event_tx.send(RuntimeEvent::Notify {
+                    call_id: state.tool_call_id.clone(),
+                    text,
+                });
+            }
+        }
+        Some(ExecuteOutputPolicy::SavedWorkflow) => {
+            send_content_items(
+                scope,
+                vec![FunctionCallOutputContentItem::InputText { text }],
+            );
+        }
+        None => {}
     }
     retval.set(v8::undefined(scope).into());
 }
@@ -342,5 +352,23 @@ pub(super) fn exit_callback(
     }
     if let Some(error) = v8::String::new(scope, EXIT_SENTINEL) {
         scope.throw_exception(error.into());
+    }
+}
+
+fn send_content_items(scope: &mut v8::PinScope<'_, '_>, items: Vec<FunctionCallOutputContentItem>) {
+    let Some((outcome, event_tx)) = scope.get_slot::<RuntimeState>().map(|state| {
+        (
+            state.output_admission.admit_items(&items),
+            state.event_tx.clone(),
+        )
+    }) else {
+        return;
+    };
+    if outcome == AdmissionOutcome::Rejected {
+        let _ = scope.terminate_execution();
+        return;
+    }
+    for item in items {
+        let _ = event_tx.send(RuntimeEvent::ContentItem(item));
     }
 }

@@ -25,6 +25,8 @@ pub(crate) use events::PendingRuntimeMode;
 pub(crate) use events::RuntimeCommand;
 pub(crate) use events::RuntimeControlCommand;
 pub(crate) use events::RuntimeEvent;
+use state::AdmissionOutcome;
+use state::RuntimeOutputAdmission;
 pub(super) use state::RuntimeState;
 
 const EXIT_SENTINEL: &str = "__codex_code_mode_exit__";
@@ -44,6 +46,7 @@ pub(crate) fn spawn_runtime(
     String,
 > {
     ensure_v8_initialized()?;
+    let output_admission = RuntimeOutputAdmission::new(request.output_policy);
 
     let (command_tx, command_rx) = std_mpsc::channel();
     let (control_tx, control_rx) = std_mpsc::channel();
@@ -59,6 +62,7 @@ pub(crate) fn spawn_runtime(
         enabled_tools,
         source: request.source,
         output_policy: request.output_policy,
+        output_admission,
         stored_values,
     };
 
@@ -101,6 +105,7 @@ struct RuntimeConfig {
     enabled_tools: Vec<EnabledToolMetadata>,
     source: String,
     output_policy: ExecuteOutputPolicy,
+    output_admission: RuntimeOutputAdmission,
     stored_values: HashMap<String, JsonValue>,
 }
 
@@ -145,10 +150,11 @@ fn run_runtime(
         runtime_command_tx,
         exit_requested: false,
         output_policy: config.output_policy,
+        output_admission: config.output_admission,
     });
 
     if let Err(error_text) = globals::install_globals(scope) {
-        send_result(&event_tx, HashMap::new(), Some(error_text));
+        capture_scope_send_error(scope, Some(error_text));
         return;
     }
 
@@ -157,7 +163,7 @@ fn run_runtime(
     let pending_promise = match module_loader::evaluate_main_module(scope, &config.source) {
         Ok(pending_promise) => pending_promise,
         Err(error_text) => {
-            capture_scope_send_error(scope, &event_tx, Some(error_text));
+            capture_scope_send_error(scope, Some(error_text));
             return;
         }
     };
@@ -167,7 +173,7 @@ fn run_runtime(
             stored_value_writes,
             error_text,
         } => {
-            send_result(&event_tx, stored_value_writes, error_text);
+            capture_scope_send_result(scope, stored_value_writes, error_text);
             return;
         }
         CompletionState::Pending => {}
@@ -183,7 +189,7 @@ fn run_runtime(
                 if let Err(error_text) =
                     module_loader::resolve_tool_response(scope, &id, Ok(result))
                 {
-                    capture_scope_send_error(scope, &event_tx, Some(error_text));
+                    capture_scope_send_error(scope, Some(error_text));
                     return;
                 }
             }
@@ -191,13 +197,13 @@ fn run_runtime(
                 if let Err(runtime_error) =
                     module_loader::resolve_tool_response(scope, &id, Err(error_text))
                 {
-                    capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                    capture_scope_send_error(scope, Some(runtime_error));
                     return;
                 }
             }
             RuntimeCommand::TimeoutFired { id } => {
                 if let Err(runtime_error) = timers::invoke_timeout_callback(scope, id) {
-                    capture_scope_send_error(scope, &event_tx, Some(runtime_error));
+                    capture_scope_send_error(scope, Some(runtime_error));
                     return;
                 }
             }
@@ -210,7 +216,7 @@ fn run_runtime(
                 stored_value_writes,
                 error_text,
             } => {
-                send_result(&event_tx, stored_value_writes, error_text);
+                capture_scope_send_result(scope, stored_value_writes, error_text);
                 return;
             }
             CompletionState::Pending => {}
@@ -251,17 +257,32 @@ fn next_runtime_command(
     }
 }
 
-fn capture_scope_send_error(
-    scope: &mut v8::PinScope<'_, '_>,
-    event_tx: &mpsc::UnboundedSender<RuntimeEvent>,
-    error_text: Option<String>,
-) {
+fn capture_scope_send_error(scope: &mut v8::PinScope<'_, '_>, error_text: Option<String>) {
     let stored_value_writes = scope
         .get_slot::<RuntimeState>()
         .map(|state| state.stored_value_writes.clone())
         .unwrap_or_default();
 
-    send_result(event_tx, stored_value_writes, error_text);
+    capture_scope_send_result(scope, stored_value_writes, error_text);
+}
+
+fn capture_scope_send_result(
+    scope: &mut v8::PinScope<'_, '_>,
+    stored_value_writes: HashMap<String, JsonValue>,
+    error_text: Option<String>,
+) {
+    let Some((event_tx, error_text, admission_outcome)) =
+        scope.get_slot::<RuntimeState>().map(|state| {
+            let (error_text, admission_outcome) = state.output_admission.terminal_error(error_text);
+            (state.event_tx.clone(), error_text, admission_outcome)
+        })
+    else {
+        return;
+    };
+    if admission_outcome == AdmissionOutcome::Rejected {
+        let _ = scope.terminate_execution();
+    }
+    send_result(&event_tx, stored_value_writes, error_text);
 }
 
 fn send_result(
