@@ -4,7 +4,6 @@ use pretty_assertions::assert_eq;
 fn insert_terminate(
     driver: &mut ConnectionDriver,
     request_id: RequestId,
-    session: RemoteSession,
     output_admission: RemoteOutputAdmission,
 ) -> oneshot::Receiver<Result<WaitOutcome, String>> {
     let (response_tx, response_rx) = oneshot::channel();
@@ -12,7 +11,7 @@ fn insert_terminate(
     driver.requests.insert_pending(
         request_id,
         PendingRequest::Terminate {
-            session,
+            public_id: CellId::new("cell".to_string()),
             cell_id: WireCellId::try_new("cell").expect("cell ID"),
             output_admission,
             response_tx,
@@ -25,13 +24,8 @@ fn insert_terminate(
 #[tokio::test]
 async fn saved_terminate_invalid_response_and_connection_failure_are_redacted() {
     let (mut driver, alive) = direct_driver();
-    let session = ready_session(&mut driver);
-    let response_rx = insert_terminate(
-        &mut driver,
-        RequestId::new(/*value*/ 1),
-        session,
-        saved_admission(),
-    );
+    ready_session(&mut driver);
+    let response_rx = insert_terminate(&mut driver, RequestId::new(/*value*/ 1), saved_admission());
     driver.fail("private peer failure".to_string());
     assert_eq!(
         response_rx.await.expect("connection failure"),
@@ -42,7 +36,7 @@ async fn saved_terminate_invalid_response_and_connection_failure_are_redacted() 
     let (mut driver, alive) = direct_driver();
     let session = ready_session(&mut driver);
     let request_id = RequestId::new(/*value*/ 1);
-    let response_rx = insert_terminate(&mut driver, request_id, session.clone(), saved_admission());
+    let response_rx = insert_terminate(&mut driver, request_id, saved_admission());
     assert!(!driver.handle_host_message(HostToClient::Response {
         id: request_id,
         result: WireResult::Ok {
@@ -111,10 +105,15 @@ async fn dropped_terminate_caller_still_records_terminal_before_cell_close() {
 #[tokio::test]
 async fn abandoned_saved_execute_retains_admission_after_cell_close() {
     let (mut driver, alive, mut outgoing_rx) = direct_driver_with_outgoing();
-    let session = ready_session(&mut driver);
+    let session = ready_session_with_generation(&mut driver, /*generation*/ 2);
     let execute_id = driver.requests.allocate_id().expect("execute request ID");
     let remote_cell_id = WireCellId::try_new("cell").expect("cell ID");
-    let execute_rx = insert_execute(&mut driver, execute_id, full_saved_admission());
+    let execute_rx = insert_execute_for_session(
+        &mut driver,
+        execute_id,
+        session.clone(),
+        full_saved_admission(),
+    );
 
     assert!(driver.handle_host_message(HostToClient::Response {
         id: execute_id,
@@ -128,6 +127,7 @@ async fn abandoned_saved_execute_retains_admission_after_cell_close() {
         .await
         .expect("execute response")
         .expect("delivered execute");
+    let public_id = delivered.started.cell_id.clone();
 
     assert!(driver.handle_host_message(HostToClient::CellClosed {
         session_id: session.id,
@@ -142,9 +142,25 @@ async fn abandoned_saved_execute_retains_admission_after_cell_close() {
         .recv()
         .await
         .expect("abandoned cell termination frame");
+    let terminate_id = RequestId::new(/*value*/ 2);
+    let pending = driver
+        .requests
+        .remove_pending(terminate_id)
+        .expect("abandoned terminate request");
+    assert!(matches!(
+        &pending,
+        PendingRequest::Terminate {
+            public_id: pending_id,
+            ..
+        } if pending_id == &public_id
+    ));
+    let event_tx = driver.event_tx.clone();
+    driver
+        .requests
+        .insert_pending(terminate_id, pending, &event_tx);
 
     assert!(!driver.handle_host_message(HostToClient::Response {
-        id: RequestId::new(/*value*/ 2),
+        id: terminate_id,
         result: WireResult::Err {
             message: "private abandoned termination failure".to_string(),
         },

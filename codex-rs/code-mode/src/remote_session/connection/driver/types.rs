@@ -116,7 +116,7 @@ impl Drop for CancellableRequest {
 }
 
 pub(super) struct InitialResponse {
-    pub(super) generation: u64,
+    pub(super) public_id: CellId,
     pub(super) cell_id: WireCellId,
     pub(super) output_admission: RemoteOutputAdmission,
     pub(super) response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
@@ -129,6 +129,7 @@ pub(in crate::remote_session::connection) struct DeliveredExecute {
 
 pub(super) struct UnclaimedExecute {
     pub(super) session: RemoteSession,
+    pub(super) public_id: CellId,
     pub(super) cell_id: WireCellId,
     pub(super) output_admission: RemoteOutputAdmission,
     pub(super) cancellation: CancellableRequest,
@@ -152,13 +153,14 @@ pub(super) enum PendingRequest {
     },
     Wait {
         session: RemoteSession,
+        public_id: CellId,
         cell_id: WireCellId,
         output_admission: RemoteOutputAdmission,
         cancellation: CancellableRequest,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     Terminate {
-        session: RemoteSession,
+        public_id: CellId,
         cell_id: WireCellId,
         output_admission: RemoteOutputAdmission,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
@@ -171,6 +173,7 @@ pub(super) enum PendingRequest {
 
 pub(super) struct DeferredWait {
     pub(super) session: RemoteSession,
+    pub(super) public_id: CellId,
     pub(super) request: WireWaitRequest,
     pub(super) output_admission: RemoteOutputAdmission,
     pub(super) caller_cancellation: CancellationToken,

@@ -22,10 +22,6 @@ pub(super) fn public_cell_id(generation: u64, cell_id: &WireCellId) -> CellId {
     }
 }
 
-pub(super) fn public_cell_id_from_protocol(generation: u64, cell_id: &CellId) -> CellId {
-    public_cell_id(generation, &WireCellId::new(cell_id.as_str()))
-}
-
 pub(super) fn remote_cell_id(
     session: &RemoteSession,
     cell_id: &CellId,
@@ -58,43 +54,37 @@ pub(super) fn remote_wait_request(
 }
 
 pub(super) fn public_runtime_response(
-    generation: u64,
+    cell_id: CellId,
     response: RuntimeResponse,
 ) -> RuntimeResponse {
     match response {
-        RuntimeResponse::Yielded {
+        RuntimeResponse::Yielded { content_items, .. } => RuntimeResponse::Yielded {
             cell_id,
-            content_items,
-        } => RuntimeResponse::Yielded {
-            cell_id: public_cell_id_from_protocol(generation, &cell_id),
             content_items,
         },
-        RuntimeResponse::Terminated {
+        RuntimeResponse::Terminated { content_items, .. } => RuntimeResponse::Terminated {
             cell_id,
-            content_items,
-        } => RuntimeResponse::Terminated {
-            cell_id: public_cell_id_from_protocol(generation, &cell_id),
             content_items,
         },
         RuntimeResponse::Result {
-            cell_id,
             content_items,
             error_text,
+            ..
         } => RuntimeResponse::Result {
-            cell_id: public_cell_id_from_protocol(generation, &cell_id),
+            cell_id,
             content_items,
             error_text,
         },
     }
 }
 
-pub(super) fn public_wait_outcome(generation: u64, outcome: WaitOutcome) -> WaitOutcome {
+pub(super) fn public_wait_outcome(cell_id: CellId, outcome: WaitOutcome) -> WaitOutcome {
     match outcome {
         WaitOutcome::LiveCell(response) => {
-            WaitOutcome::LiveCell(public_runtime_response(generation, response))
+            WaitOutcome::LiveCell(public_runtime_response(cell_id, response))
         }
         WaitOutcome::MissingCell(response) => {
-            WaitOutcome::MissingCell(public_runtime_response(generation, response))
+            WaitOutcome::MissingCell(public_runtime_response(cell_id, response))
         }
     }
 }
