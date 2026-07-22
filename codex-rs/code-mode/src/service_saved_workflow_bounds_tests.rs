@@ -6,6 +6,7 @@ use std::time::Duration;
 use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::WORKFLOW_OUTPUT_ITEM_MAX_BYTES;
+use codex_code_mode_protocol::WORKFLOW_OUTPUT_MAX_ITEMS;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
@@ -198,6 +199,32 @@ async fn saved_workflow_media_items_are_rejected_before_enqueue() {
             }
         );
     }
+}
+
+#[tokio::test]
+async fn saved_workflow_generated_image_batch_is_transactional() {
+    let service = InProcessCodeModeSession::new();
+    let prefix_items = WORKFLOW_OUTPUT_MAX_ITEMS - 1;
+    let source = format!(
+        r#"
+for (let index = 0; index < {prefix_items}; index += 1) {{
+    text("");
+}}
+generatedImage({{
+    image_url: "data:image/png;base64,YQ==",
+    output_hint: "must not appear",
+}});
+"#
+    );
+
+    assert_eq!(
+        execute_saved(&service, saved_request(source)).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![text_item(""); prefix_items],
+            error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
+        }
+    );
 }
 
 #[tokio::test]

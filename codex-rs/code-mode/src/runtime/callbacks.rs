@@ -168,14 +168,11 @@ pub(super) fn generated_image_callback(
         Ok(image_item) => image_item,
         Err(()) => return,
     };
-    if let Some(state) = scope.get_slot::<RuntimeState>() {
-        let _ = state.event_tx.send(RuntimeEvent::ContentItem(image_item));
-        if let Some(text) = output_hint {
-            let _ = state.event_tx.send(RuntimeEvent::ContentItem(
-                FunctionCallOutputContentItem::InputText { text },
-            ));
-        }
+    let mut items = vec![image_item];
+    if let Some(text) = output_hint {
+        items.push(FunctionCallOutputContentItem::InputText { text });
     }
+    send_content_items(scope, items);
     retval.set(v8::undefined(scope).into());
 }
 

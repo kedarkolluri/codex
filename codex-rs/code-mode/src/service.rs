@@ -453,3 +453,7 @@ mod saved_workflow_state_tests;
 #[cfg(test)]
 #[path = "service_saved_workflow_bounds_tests.rs"]
 mod saved_workflow_bounds_tests;
+
+#[cfg(test)]
+#[path = "service_saved_workflow_lifecycle_bounds_tests.rs"]
+mod saved_workflow_lifecycle_bounds_tests;
