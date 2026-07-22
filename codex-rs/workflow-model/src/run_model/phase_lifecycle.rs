@@ -78,6 +78,7 @@ impl WorkflowRunModel {
                 state: WorkflowPhaseState::Active,
                 implicit: false,
                 root_node_ids: Vec::new(),
+                aggregate: WorkflowAggregate::default(),
             });
         }
         self.active_phase_index = Some(event.phase_index);

@@ -2,6 +2,7 @@ use std::fmt;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::TokenUsage;
 
 /// Lifecycle of the workflow run represented by the workflow projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +19,53 @@ pub enum WorkflowPhaseState {
     Completed,
 }
 
+/// Rolled-up counters for a workflow run or one of its phases.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkflowAggregate {
+    pub(super) group_count: u64,
+    pub(super) agent_count: u64,
+    pub(super) active_agent_count: u64,
+    pub(super) completed_agent_count: u64,
+    pub(super) returned_null_count: u64,
+    pub(super) token_usage: TokenUsage,
+    pub(super) tool_call_count: u64,
+    pub(super) duration_ms: u64,
+}
+
+impl WorkflowAggregate {
+    pub fn group_count(&self) -> u64 {
+        self.group_count
+    }
+
+    pub fn agent_count(&self) -> u64 {
+        self.agent_count
+    }
+
+    pub fn active_agent_count(&self) -> u64 {
+        self.active_agent_count
+    }
+
+    pub fn completed_agent_count(&self) -> u64 {
+        self.completed_agent_count
+    }
+
+    pub fn returned_null_count(&self) -> u64 {
+        self.returned_null_count
+    }
+
+    pub fn token_usage(&self) -> &TokenUsage {
+        &self.token_usage
+    }
+
+    pub fn tool_call_count(&self) -> u64 {
+        self.tool_call_count
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+}
+
 /// One phase in the declared and dynamically extended phase order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowPhase {
@@ -28,6 +76,7 @@ pub struct WorkflowPhase {
     pub(super) implicit: bool,
     /// Topology roots in deterministic source order.
     pub(super) root_node_ids: Vec<u64>,
+    pub(super) aggregate: WorkflowAggregate,
 }
 
 impl WorkflowPhase {
@@ -49,6 +98,10 @@ impl WorkflowPhase {
 
     pub fn root_node_ids(&self) -> &[u64] {
         &self.root_node_ids
+    }
+
+    pub fn aggregate(&self) -> &WorkflowAggregate {
+        &self.aggregate
     }
 }
 
@@ -173,6 +226,12 @@ pub enum WorkflowModelError {
         previous: u64,
         actual: u64,
     },
+    AggregateOverflow {
+        field: &'static str,
+    },
+    AggregateUnderflow {
+        field: &'static str,
+    },
     NonTerminalStatus {
         node_id: Option<u64>,
         status: AgentStatus,
@@ -284,6 +343,8 @@ impl fmt::Display for WorkflowModelError {
             | Self::NegativeTokenUsage { .. }
             | Self::TokenCounterRegression { .. }
             | Self::UnsignedCounterRegression { .. }
+            | Self::AggregateOverflow { .. }
+            | Self::AggregateUnderflow { .. }
             | Self::NonTerminalStatus { .. }
             | Self::ActiveChildAtAgentEnd { .. }
             | Self::InvalidChildThreadId { .. }

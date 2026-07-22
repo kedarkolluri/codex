@@ -26,11 +26,15 @@ impl WorkflowRunModel {
             event.tool_call_count,
             event.duration_ms,
         )?;
+        let aggregate_update = self.prepare_aggregate_update(agent.phase_index, |aggregate| {
+            aggregate.apply_agent_updated(agent, event)
+        })?;
 
         let agent = self.agent_mut(event.node_id)?;
         agent.token_usage.clone_from(&event.token_usage);
         agent.tool_call_count = event.tool_call_count;
         agent.duration_ms = event.duration_ms;
+        self.commit_aggregate_update(aggregate_update);
         Ok(())
     }
 
@@ -60,6 +64,9 @@ impl WorkflowRunModel {
             event.tool_call_count,
             event.duration_ms,
         )?;
+        let aggregate_update = self.prepare_aggregate_update(agent.phase_index, |aggregate| {
+            aggregate.apply_agent_end(agent, event)
+        })?;
 
         let agent = self.agent_mut(event.node_id)?;
         agent.state = WorkflowNodeState::Completed;
@@ -69,6 +76,7 @@ impl WorkflowRunModel {
         agent.tool_call_count = event.tool_call_count;
         agent.duration_ms = event.duration_ms;
         agent.returned_null = event.returned_null;
+        self.commit_aggregate_update(aggregate_update);
         Ok(())
     }
 
