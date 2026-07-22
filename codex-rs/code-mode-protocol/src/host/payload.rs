@@ -11,7 +11,9 @@ use serde::ser::Error as _;
 use serde_json::Value as JsonValue;
 
 use super::types::CapabilitySet;
+use super::types::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
 use super::types::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
+use super::workflow_cell_id::WireWorkflowCellId;
 use crate::CellId;
 use crate::CodeModeNestedToolCall;
 use crate::CodeModeToolKind;
@@ -221,14 +223,36 @@ pub struct WireExecuteRequest {
     pub source: String,
     #[serde(default, skip_serializing_if = "WireExecuteOutputPolicy::is_ordinary")]
     pub output_policy: WireExecuteOutputPolicy,
+    /// Present only when both Saved-workflow capabilities are selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_cell_id: Option<WireWorkflowCellId>,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<i32>,
+}
+
+/// Describes who chooses the cell identifier for one decoded execute request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WireExecuteCellIdentity {
+    /// The host retains its existing cell-ID allocator.
+    HostAllocated,
+    /// The host must adopt the exact client-assigned Saved-workflow ID.
+    SavedWorkflow(WireWorkflowCellId),
+}
+
+/// A capability-validated execute request and its cell-identity contract.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DecodedWireExecuteRequest {
+    pub request: ExecuteRequest,
+    pub cell_identity: WireExecuteCellIdentity,
 }
 
 /// Failure converting between domain and protocol V2 execute requests.
 #[derive(Debug)]
 pub enum WireExecuteRequestConversionError {
     SavedWorkflowOutputPolicyUnavailable,
+    SavedWorkflowCellIdentityUnavailable,
+    SavedWorkflowCellIdentityRequired,
+    WorkflowCellIdentityRequiresSavedWorkflow,
     MaxOutputTokensOutOfRange(TryFromIntError),
 }
 
@@ -238,6 +262,15 @@ impl fmt::Display for WireExecuteRequestConversionError {
             Self::SavedWorkflowOutputPolicyUnavailable => {
                 formatter.write_str(crate::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE)
             }
+            Self::SavedWorkflowCellIdentityUnavailable => {
+                formatter.write_str("saved workflow cell identity is unavailable")
+            }
+            Self::SavedWorkflowCellIdentityRequired => {
+                formatter.write_str("saved workflow cell identity is required")
+            }
+            Self::WorkflowCellIdentityRequiresSavedWorkflow => {
+                formatter.write_str("workflow cell identity requires saved workflow output")
+            }
             Self::MaxOutputTokensOutOfRange(error) => error.fmt(formatter),
         }
     }
@@ -246,7 +279,10 @@ impl fmt::Display for WireExecuteRequestConversionError {
 impl std::error::Error for WireExecuteRequestConversionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::SavedWorkflowOutputPolicyUnavailable => None,
+            Self::SavedWorkflowOutputPolicyUnavailable
+            | Self::SavedWorkflowCellIdentityUnavailable
+            | Self::SavedWorkflowCellIdentityRequired
+            | Self::WorkflowCellIdentityRequiresSavedWorkflow => None,
             Self::MaxOutputTokensOutOfRange(error) => Some(error),
         }
     }
@@ -264,6 +300,31 @@ impl WireExecuteRequest {
         value: ExecuteRequest,
         selected_capabilities: &CapabilitySet,
     ) -> Result<Self, WireExecuteRequestConversionError> {
+        Self::try_from_domain_with_identity(
+            value,
+            selected_capabilities,
+            WireExecuteCellIdentity::HostAllocated,
+        )
+    }
+
+    /// Converts a Saved-workflow request with a client-assigned cell identifier.
+    pub fn try_from_domain_with_workflow_cell_id(
+        value: ExecuteRequest,
+        selected_capabilities: &CapabilitySet,
+        workflow_cell_id: WireWorkflowCellId,
+    ) -> Result<Self, WireExecuteRequestConversionError> {
+        Self::try_from_domain_with_identity(
+            value,
+            selected_capabilities,
+            WireExecuteCellIdentity::SavedWorkflow(workflow_cell_id),
+        )
+    }
+
+    fn try_from_domain_with_identity(
+        value: ExecuteRequest,
+        selected_capabilities: &CapabilitySet,
+        cell_identity: WireExecuteCellIdentity,
+    ) -> Result<Self, WireExecuteRequestConversionError> {
         let output_policy = match value.output_policy {
             ExecuteOutputPolicy::Ordinary => WireExecuteOutputPolicy::Ordinary,
             ExecuteOutputPolicy::SavedWorkflow
@@ -277,11 +338,17 @@ impl WireExecuteRequest {
                 );
             }
         };
+        let workflow_cell_id =
+            match validate_cell_identity(&output_policy, cell_identity, selected_capabilities)? {
+                WireExecuteCellIdentity::HostAllocated => None,
+                WireExecuteCellIdentity::SavedWorkflow(workflow_cell_id) => Some(workflow_cell_id),
+            };
         Ok(Self {
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,
             output_policy,
+            workflow_cell_id,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens: value.max_output_tokens.map(i32::try_from).transpose()?,
         })
@@ -291,8 +358,8 @@ impl WireExecuteRequest {
     pub fn try_into_domain(
         self,
         selected_capabilities: &CapabilitySet,
-    ) -> Result<ExecuteRequest, WireExecuteRequestConversionError> {
-        let output_policy = match self.output_policy {
+    ) -> Result<DecodedWireExecuteRequest, WireExecuteRequestConversionError> {
+        let output_policy = match &self.output_policy {
             WireExecuteOutputPolicy::Ordinary => ExecuteOutputPolicy::Ordinary,
             WireExecuteOutputPolicy::SavedWorkflow
                 if supports_saved_workflow_output(selected_capabilities) =>
@@ -305,19 +372,65 @@ impl WireExecuteRequest {
                 );
             }
         };
-        Ok(ExecuteRequest {
-            tool_call_id: self.tool_call_id,
-            enabled_tools: self.enabled_tools.into_iter().map(Into::into).collect(),
-            source: self.source,
-            output_policy,
-            yield_time_ms: self.yield_time_ms,
-            max_output_tokens: self.max_output_tokens.map(usize::try_from).transpose()?,
+        let cell_identity = validate_cell_identity(
+            &self.output_policy,
+            self.workflow_cell_id
+                .map(WireExecuteCellIdentity::SavedWorkflow)
+                .unwrap_or(WireExecuteCellIdentity::HostAllocated),
+            selected_capabilities,
+        )?;
+        Ok(DecodedWireExecuteRequest {
+            request: ExecuteRequest {
+                tool_call_id: self.tool_call_id,
+                enabled_tools: self.enabled_tools.into_iter().map(Into::into).collect(),
+                source: self.source,
+                output_policy,
+                yield_time_ms: self.yield_time_ms,
+                max_output_tokens: self.max_output_tokens.map(usize::try_from).transpose()?,
+            },
+            cell_identity,
         })
+    }
+}
+
+fn validate_cell_identity(
+    output_policy: &WireExecuteOutputPolicy,
+    cell_identity: WireExecuteCellIdentity,
+    selected_capabilities: &CapabilitySet,
+) -> Result<WireExecuteCellIdentity, WireExecuteRequestConversionError> {
+    match (output_policy, cell_identity) {
+        (WireExecuteOutputPolicy::Ordinary, WireExecuteCellIdentity::HostAllocated) => {
+            Ok(WireExecuteCellIdentity::HostAllocated)
+        }
+        (WireExecuteOutputPolicy::Ordinary, WireExecuteCellIdentity::SavedWorkflow(_)) => {
+            Err(WireExecuteRequestConversionError::WorkflowCellIdentityRequiresSavedWorkflow)
+        }
+        (WireExecuteOutputPolicy::SavedWorkflow, WireExecuteCellIdentity::HostAllocated)
+            if supports_saved_workflow_cell_identity(selected_capabilities) =>
+        {
+            Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityRequired)
+        }
+        (WireExecuteOutputPolicy::SavedWorkflow, WireExecuteCellIdentity::HostAllocated) => {
+            Ok(WireExecuteCellIdentity::HostAllocated)
+        }
+        (
+            WireExecuteOutputPolicy::SavedWorkflow,
+            WireExecuteCellIdentity::SavedWorkflow(workflow_cell_id),
+        ) if supports_saved_workflow_cell_identity(selected_capabilities) => {
+            Ok(WireExecuteCellIdentity::SavedWorkflow(workflow_cell_id))
+        }
+        (WireExecuteOutputPolicy::SavedWorkflow, WireExecuteCellIdentity::SavedWorkflow(_)) => {
+            Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityUnavailable)
+        }
     }
 }
 
 fn supports_saved_workflow_output(selected_capabilities: &CapabilitySet) -> bool {
     selected_capabilities.contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
+}
+
+fn supports_saved_workflow_cell_identity(selected_capabilities: &CapabilitySet) -> bool {
+    selected_capabilities.contains_name(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)
 }
 
 impl TryFrom<ExecuteRequest> for WireExecuteRequest {
@@ -332,7 +445,7 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
     type Error = WireExecuteRequestConversionError;
 
     fn try_from(value: WireExecuteRequest) -> Result<Self, Self::Error> {
-        value.try_into_domain(&CapabilitySet::empty())
+        Ok(value.try_into_domain(&CapabilitySet::empty())?.request)
     }
 }
 

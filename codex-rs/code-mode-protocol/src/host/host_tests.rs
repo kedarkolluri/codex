@@ -10,6 +10,7 @@ use super::Capability;
 use super::CapabilitySet;
 use super::ClientHello;
 use super::ClientToHost;
+use super::DecodedWireExecuteRequest;
 use super::DelegateRequest;
 use super::DelegateRequestId;
 use super::DelegateResponse;
@@ -20,11 +21,13 @@ use super::HostResponse;
 use super::HostToClient;
 use super::ProtocolVersion;
 use super::RequestId;
+use super::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
 use super::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use super::SessionId;
 use super::SupportedProtocolVersions;
 use super::WireCellId;
 use super::WireContentItem;
+use super::WireExecuteCellIdentity;
 use super::WireExecuteOutputPolicy;
 use super::WireExecuteRequest;
 use super::WireExecuteRequestConversionError;
@@ -37,6 +40,7 @@ use super::WireToolKind;
 use super::WireToolName;
 use super::WireWaitOutcome;
 use super::WireWaitRequest;
+use super::WireWorkflowCellId;
 use crate::ExecuteOutputPolicy;
 use crate::ExecuteRequest;
 
@@ -105,9 +109,30 @@ fn execute_request() -> WireExecuteRequest {
         ],
         source: "text('hello');".to_string(),
         output_policy: WireExecuteOutputPolicy::Ordinary,
+        workflow_cell_id: None,
         yield_time_ms: Some(25),
         max_output_tokens: Some(100),
     }
+}
+
+fn workflow_cell_id() -> WireWorkflowCellId {
+    WireWorkflowCellId::try_new("wf:1:0123456789abcdef0123456789abcdef:7")
+        .expect("workflow cell ID")
+}
+
+fn saved_execute_request() -> ExecuteRequest {
+    ExecuteRequest {
+        output_policy: ExecuteOutputPolicy::SavedWorkflow,
+        ..ExecuteRequest::try_from(execute_request()).expect("domain request")
+    }
+}
+
+fn saved_capabilities() -> CapabilitySet {
+    CapabilitySet::try_new([
+        capability(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY),
+        capability(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY),
+    ])
+    .expect("paired capabilities")
 }
 
 fn content_items() -> Vec<WireContentItem> {
@@ -637,10 +662,7 @@ fn execute_output_policy_defaults_to_ordinary_for_older_requests() {
 
 #[test]
 fn saved_output_policy_requires_the_exact_selected_capability() {
-    let domain_request = ExecuteRequest {
-        output_policy: ExecuteOutputPolicy::SavedWorkflow,
-        ..ExecuteRequest::try_from(execute_request()).expect("domain request")
-    };
+    let domain_request = saved_execute_request();
     let wire_request = WireExecuteRequest {
         output_policy: WireExecuteOutputPolicy::SavedWorkflow,
         ..execute_request()
@@ -658,7 +680,10 @@ fn saved_output_policy_requires_the_exact_selected_capability() {
             .clone()
             .try_into_domain(&selected)
             .expect("capability-aware inbound conversion"),
-        domain_request
+        DecodedWireExecuteRequest {
+            request: domain_request.clone(),
+            cell_identity: WireExecuteCellIdentity::HostAllocated,
+        }
     );
     assert_eq!(
         serde_json::to_value(&wire_request).expect("serialize saved request")["output_policy"],
@@ -691,6 +716,126 @@ fn saved_output_policy_requires_the_exact_selected_capability() {
     assert!(matches!(
         ExecuteRequest::try_from(wire_request),
         Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+    ));
+}
+
+#[test]
+fn saved_workflow_cell_identity_requires_the_paired_capability() {
+    let domain_request = saved_execute_request();
+    let workflow_cell_id = workflow_cell_id();
+    let output_capability = capability(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
+    let identity_capability = capability(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY);
+    let selected = saved_capabilities();
+
+    let wire_request = WireExecuteRequest::try_from_domain_with_workflow_cell_id(
+        domain_request.clone(),
+        &selected,
+        workflow_cell_id.clone(),
+    )
+    .expect("Saved request with client cell identity");
+    let mut expected_json = serde_json::to_value(execute_request()).expect("ordinary request JSON");
+    expected_json["output_policy"] = json!("saved_workflow");
+    expected_json["workflow_cell_id"] = json!(workflow_cell_id.as_str());
+    assert_eq!(
+        serde_json::to_value(&wire_request).expect("Saved request JSON"),
+        expected_json
+    );
+    assert_eq!(
+        wire_request
+            .try_into_domain(&selected)
+            .expect("decode Saved request"),
+        DecodedWireExecuteRequest {
+            request: domain_request.clone(),
+            cell_identity: WireExecuteCellIdentity::SavedWorkflow(workflow_cell_id.clone()),
+        }
+    );
+
+    assert!(matches!(
+        WireExecuteRequest::try_from_domain(domain_request.clone(), &selected),
+        Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityRequired)
+    ));
+    let output_only = CapabilitySet::try_new([output_capability]).expect("output capability");
+    assert!(matches!(
+        WireExecuteRequest::try_from_domain_with_workflow_cell_id(
+            domain_request.clone(),
+            &output_only,
+            workflow_cell_id.clone(),
+        ),
+        Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityUnavailable)
+    ));
+    let identity_only = CapabilitySet::try_new([identity_capability]).expect("identity capability");
+    assert!(matches!(
+        WireExecuteRequest::try_from_domain_with_workflow_cell_id(
+            domain_request,
+            &identity_only,
+            workflow_cell_id,
+        ),
+        Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+    ));
+}
+
+#[test]
+fn workflow_cell_identity_rejects_invalid_policy_and_capability_states() {
+    let ordinary_request =
+        ExecuteRequest::try_from(execute_request()).expect("ordinary domain request");
+    let output_capability = capability(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
+    let identity_capability = capability(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY);
+    let selected = saved_capabilities();
+    assert!(matches!(
+        WireExecuteRequest::try_from_domain_with_workflow_cell_id(
+            ordinary_request,
+            &selected,
+            workflow_cell_id(),
+        ),
+        Err(WireExecuteRequestConversionError::WorkflowCellIdentityRequiresSavedWorkflow)
+    ));
+
+    let ordinary_wire = WireExecuteRequest {
+        workflow_cell_id: Some(workflow_cell_id()),
+        ..execute_request()
+    };
+    assert!(matches!(
+        ordinary_wire.try_into_domain(&selected),
+        Err(WireExecuteRequestConversionError::WorkflowCellIdentityRequiresSavedWorkflow)
+    ));
+
+    let saved_without_identity = WireExecuteRequest {
+        output_policy: WireExecuteOutputPolicy::SavedWorkflow,
+        ..execute_request()
+    };
+    assert!(matches!(
+        saved_without_identity.try_into_domain(&selected),
+        Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityRequired)
+    ));
+
+    let saved_with_identity = WireExecuteRequest {
+        output_policy: WireExecuteOutputPolicy::SavedWorkflow,
+        workflow_cell_id: Some(workflow_cell_id()),
+        ..execute_request()
+    };
+    let output_only = CapabilitySet::try_new([output_capability]).expect("output capability");
+    assert!(matches!(
+        saved_with_identity.clone().try_into_domain(&output_only),
+        Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityUnavailable)
+    ));
+    let identity_only = CapabilitySet::try_new([identity_capability]).expect("identity capability");
+    assert!(matches!(
+        saved_with_identity.try_into_domain(&identity_only),
+        Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+    ));
+
+    let misspelled = CapabilitySet::try_new([
+        capability(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY),
+        capability("saved_workflow_cell_identity_v2"),
+    ])
+    .expect("misspelled capability set");
+    assert!(matches!(
+        WireExecuteRequest::try_from_domain_with_workflow_cell_id(
+            saved_execute_request(),
+            &misspelled,
+            workflow_cell_id(),
+        ),
+        Err(WireExecuteRequestConversionError::SavedWorkflowCellIdentityUnavailable)
     ));
 }
 

@@ -81,6 +81,7 @@ fn execute_request(source: &str) -> WireExecuteRequest {
         enabled_tools: Vec::new(),
         source: source.to_string(),
         output_policy: WireExecuteOutputPolicy::Ordinary,
+        workflow_cell_id: None,
         yield_time_ms: Some(60_000),
         max_output_tokens: Some(1_000),
     }
