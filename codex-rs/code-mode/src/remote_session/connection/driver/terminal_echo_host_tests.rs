@@ -36,6 +36,7 @@ fn saved_harness() -> (DriverHarness, RemoteSession, Arc<RecordingDelegate>, Cel
                 &configured_session,
                 CellId::new("1".to_string()).into(),
                 admission,
+                &driver.workflow_cell_ids,
             )
             .unwrap_or_else(|_| panic!("live cell"));
         assert_eq!(admitted, configured_public_cell_id);
