@@ -21,6 +21,7 @@ impl WorkflowRunModel {
                     phase_index: active_phase_index,
                 })?;
             if phase.implicit && self.next_phase_index == 0 && event.phase_index == 0 {
+                self.ensure_phase_topology_inactive(active_phase_index)?;
                 let next_phase_index = self
                     .next_phase_index
                     .checked_add(1)
@@ -76,6 +77,7 @@ impl WorkflowRunModel {
                 title: event.title.clone(),
                 state: WorkflowPhaseState::Active,
                 implicit: false,
+                root_node_ids: Vec::new(),
             });
         }
         self.active_phase_index = Some(event.phase_index);
@@ -113,6 +115,7 @@ impl WorkflowRunModel {
                 actual: event.title.clone(),
             });
         }
+        self.ensure_phase_topology_inactive(event.phase_index)?;
         debug_assert_eq!(phase.state, WorkflowPhaseState::Active);
 
         self.phases[position].state = WorkflowPhaseState::Completed;
