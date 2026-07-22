@@ -36,6 +36,8 @@ pub struct ProtocolVersion(NonZeroU32);
 
 impl ProtocolVersion {
     pub const V1: Self = Self(NonZeroU32::MIN);
+    /// Protocol V2 requires bounded, control-free cell identifiers in both directions.
+    pub const V2: Self = Self(NonZeroU32::new(2).expect("two is non-zero"));
 
     pub const fn new(value: u32) -> Option<Self> {
         match NonZeroU32::new(value) {

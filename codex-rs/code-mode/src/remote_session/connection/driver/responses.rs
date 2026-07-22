@@ -1,11 +1,14 @@
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::ClientToHost;
+use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::InvalidWireCellId;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::WireCellId;
+use codex_code_mode_protocol::host::WireResult;
 use tokio::sync::oneshot;
 
 use super::ConnectionDriver;
@@ -56,6 +59,10 @@ impl ConnectionDriver {
     }
 
     pub(super) fn handle_host_message(&mut self, message: HostToClient) -> bool {
+        if let Err(err) = validate_host_cell_ids(&message) {
+            self.fail(err.to_string());
+            return false;
+        }
         match message {
             HostToClient::Response { id, result } => {
                 self.complete_request(id, result.into_result())
@@ -395,3 +402,40 @@ impl ConnectionDriver {
         true
     }
 }
+
+fn validate_host_cell_ids(message: &HostToClient) -> Result<(), InvalidWireCellId> {
+    match message {
+        HostToClient::Response {
+            result: WireResult::Ok { value },
+            ..
+        } => match value {
+            HostResponse::ExecutionStarted { cell_id } => cell_id.validate(),
+            HostResponse::WaitCompleted { outcome } => wait_outcome_cell_id(outcome).validate(),
+            HostResponse::SessionReady { .. } | HostResponse::SessionClosed { .. } => Ok(()),
+        },
+        HostToClient::InitialResponse {
+            result: WireResult::Ok { value },
+            ..
+        } => runtime_response_cell_id(value).validate(),
+        HostToClient::DelegateRequest { request, .. } => match request {
+            DelegateRequest::InvokeTool { invocation } => invocation.cell_id.validate(),
+            DelegateRequest::Notify { cell_id, .. } => cell_id.validate(),
+        },
+        HostToClient::CellClosed { cell_id, .. } => cell_id.validate(),
+        HostToClient::HostHello(_)
+        | HostToClient::HandshakeRejected { .. }
+        | HostToClient::Response {
+            result: WireResult::Err { .. },
+            ..
+        }
+        | HostToClient::InitialResponse {
+            result: WireResult::Err { .. },
+            ..
+        }
+        | HostToClient::CancelDelegateRequest { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+#[path = "responses_tests.rs"]
+mod tests;

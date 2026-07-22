@@ -57,7 +57,7 @@ fn capability(value: &str) -> Capability {
 }
 
 fn supported_versions() -> SupportedProtocolVersions {
-    SupportedProtocolVersions::try_new([ProtocolVersion::V1])
+    SupportedProtocolVersions::try_new([ProtocolVersion::V2])
         .expect("nonempty unique protocol versions")
 }
 
@@ -168,7 +168,7 @@ fn content_items_json() -> Value {
 }
 
 #[test]
-fn handshake_v1_variants_are_pinned() {
+fn handshake_v2_variants_are_pinned() {
     assert_wire_round_trip(
         ClientToHost::ClientHello(
             ClientHello::new(
@@ -180,19 +180,19 @@ fn handshake_v1_variants_are_pinned() {
         ),
         json!({
             "type": "connection/hello",
-            "supportedVersions": [1],
+            "supportedVersions": [2],
             "requiredCapabilities": ["required"],
             "optionalCapabilities": ["optional"],
         }),
     );
     assert_wire_round_trip(
         HostToClient::HostHello(HostHello::new(
-            ProtocolVersion::V1,
+            ProtocolVersion::V2,
             CapabilitySet::try_new([capability("required")]).expect("valid capabilities"),
         )),
         json!({
             "type": "connection/ready",
-            "selectedVersion": 1,
+            "selectedVersion": 2,
             "capabilities": ["required"],
         }),
     );
@@ -205,7 +205,7 @@ fn handshake_v1_variants_are_pinned() {
                 "type": "connection/rejected",
                 "reason": {
                     "type": "noCompatibleVersion",
-                    "supportedVersions": [1],
+                    "supportedVersions": [2],
                 },
             }),
         ),
@@ -239,7 +239,7 @@ fn handshake_v1_variants_are_pinned() {
 }
 
 #[test]
-fn client_to_host_v1_variants_are_pinned() {
+fn client_to_host_v2_variants_are_pinned() {
     let execute_request = execute_request();
     for (id, request, encoded_request) in [
         (
@@ -385,7 +385,7 @@ fn client_to_host_v1_variants_are_pinned() {
 }
 
 #[test]
-fn host_to_client_v1_variants_are_pinned() {
+fn host_to_client_v2_variants_are_pinned() {
     for (id, response, encoded_response) in [
         (
             request_id(/*value*/ 1),
@@ -667,7 +667,7 @@ fn invalid_protocol_states_cannot_be_constructed_or_decoded() {
 }
 
 #[test]
-fn every_nested_v1_object_rejects_unknown_fields() {
+fn every_nested_v2_object_rejects_unknown_fields() {
     assert!(
         serde_json::from_value::<ClientToHost>(json!({
             "type": "operation/request",

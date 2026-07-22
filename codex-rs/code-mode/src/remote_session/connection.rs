@@ -14,16 +14,10 @@ use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
-use codex_code_mode_protocol::host::CapabilitySet;
-use codex_code_mode_protocol::host::ClientHello;
-use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
-use codex_code_mode_protocol::host::HostToClient;
-use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
-use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
@@ -44,6 +38,7 @@ pub(super) use self::driver::SessionCleanup;
 use self::reader::drive_reader;
 
 mod driver;
+mod handshake;
 mod reader;
 
 const IPC_CHANNEL_CAPACITY: usize = 128;
@@ -173,38 +168,12 @@ impl Connection {
             .ok_or_else(|| ConnectionError::Other("spawned code-mode host has no stdout".into()))?;
         let mut reader = FramedReader::new(stdout);
         let mut writer = FramedWriter::new(stdin);
-        let handshake = async {
-            let hello = ClientHello::new(
-                SupportedProtocolVersions::try_new([ProtocolVersion::V1])
-                    .map_err(|err| err.to_string())?,
-                CapabilitySet::empty(),
-                CapabilitySet::empty(),
-            )
-            .map_err(|err| err.to_string())?;
-            writer
-                .write(&ClientToHost::ClientHello(hello))
-                .await
-                .map_err(|err| format!("failed to write code-mode host hello: {err}"))?;
-            match reader
-                .read::<HostToClient>()
-                .await
-                .map_err(|err| format!("failed to read code-mode host hello: {err}"))?
-            {
-                Some(HostToClient::HostHello(hello))
-                    if hello.selected_version() == ProtocolVersion::V1 =>
-                {
-                    Ok(())
-                }
-                Some(HostToClient::HandshakeRejected { reason }) => {
-                    Err(format!("code-mode host rejected the handshake: {reason:?}"))
-                }
-                Some(message) => Err(format!(
-                    "code-mode host returned an invalid handshake response: {message:?}"
-                )),
-                None => Err("code-mode host exited during handshake".to_string()),
-            }
-        };
-        let handshake_result = match tokio::time::timeout(HOST_HANDSHAKE_TIMEOUT, handshake).await {
+        let handshake_result = match tokio::time::timeout(
+            HOST_HANDSHAKE_TIMEOUT,
+            handshake::negotiate(&mut reader, &mut writer),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => {
                 kill_and_reap(&mut child).await;

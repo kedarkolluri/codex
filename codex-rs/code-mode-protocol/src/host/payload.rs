@@ -1,8 +1,13 @@
+use std::fmt;
 use std::num::TryFromIntError;
 
 use codex_protocol::ToolName;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde::Serialize;
+use serde::Serializer;
+use serde::de::Error as _;
+use serde::ser::Error as _;
 use serde_json::Value as JsonValue;
 
 use crate::CellId;
@@ -16,19 +21,72 @@ use crate::ToolDefinition;
 use crate::WaitOutcome;
 use crate::WaitRequest;
 
-/// A cell identifier with a wire representation owned by protocol V1.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(transparent)]
+/// A cell identifier with a wire representation owned by protocol V2.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WireCellId(String);
+
+/// Maximum UTF-8 byte length of one protocol V2 cell identifier.
+pub const WIRE_CELL_ID_MAX_BYTES: usize = 256;
+
+/// Failure returned for an empty, oversized, or control-bearing protocol V2 cell identifier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidWireCellId;
+
+impl fmt::Display for InvalidWireCellId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid code-mode cell ID")
+    }
+}
+
+impl std::error::Error for InvalidWireCellId {}
 
 impl WireCellId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
 
+    pub fn try_new(value: impl Into<String>) -> Result<Self, InvalidWireCellId> {
+        let value = value.into();
+        ensure_valid_wire_cell_id(&value)?;
+        Ok(Self(value))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn validate(&self) -> Result<(), InvalidWireCellId> {
+        ensure_valid_wire_cell_id(&self.0)
+    }
+}
+
+impl Serialize for WireCellId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate().map_err(S::Error::custom)?;
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireCellId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_new(String::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+fn ensure_valid_wire_cell_id(value: &str) -> Result<(), InvalidWireCellId> {
+    if value.is_empty()
+        || value.len() > WIRE_CELL_ID_MAX_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(InvalidWireCellId);
+    }
+    Ok(())
 }
 
 impl From<CellId> for WireCellId {
@@ -49,7 +107,7 @@ impl From<WireCellId> for CellId {
     }
 }
 
-/// The V1 wire representation of a tool's stable name.
+/// The V2 wire representation of a tool's stable name.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireToolName {
@@ -72,7 +130,7 @@ impl From<WireToolName> for ToolName {
     }
 }
 
-/// The tool invocation shape supported by protocol V1.
+/// The tool invocation shape supported by protocol V2.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WireToolKind {
@@ -98,7 +156,7 @@ impl From<WireToolKind> for CodeModeToolKind {
     }
 }
 
-/// A V1 tool definition embedded in an execute request.
+/// A V2 tool definition embedded in an execute request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireToolDefinition {
@@ -136,7 +194,7 @@ impl From<WireToolDefinition> for ToolDefinition {
     }
 }
 
-/// The complete execute request shape supported by protocol V1.
+/// The complete execute request shape supported by protocol V2.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireExecuteRequest {
@@ -175,7 +233,7 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
     }
 }
 
-/// The complete wait request shape supported by protocol V1.
+/// The complete wait request shape supported by protocol V2.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireWaitRequest {
@@ -201,7 +259,7 @@ impl From<WireWaitRequest> for WaitRequest {
     }
 }
 
-/// Image detail values accepted in a V1 runtime response.
+/// Image detail values accepted in a V2 runtime response.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WireImageDetail {
@@ -233,7 +291,7 @@ impl From<WireImageDetail> for ImageDetail {
     }
 }
 
-/// One output item emitted by a V1 runtime response.
+/// One output item emitted by a V2 runtime response.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
 pub enum WireContentItem {
@@ -278,7 +336,7 @@ impl From<WireContentItem> for FunctionCallOutputContentItem {
     }
 }
 
-/// Runtime output returned over the V1 host connection.
+/// Runtime output returned over the V2 host connection.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum WireRuntimeResponse {
@@ -357,7 +415,7 @@ impl From<WireRuntimeResponse> for RuntimeResponse {
     }
 }
 
-/// Whether a waited-for cell remained live in protocol V1.
+/// Whether a waited-for cell remained live in protocol V2.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub enum WireWaitOutcome {
@@ -383,7 +441,7 @@ impl From<WireWaitOutcome> for WaitOutcome {
     }
 }
 
-/// A nested tool invocation sent over the V1 host connection.
+/// A nested tool invocation sent over the V2 host connection.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct WireNestedToolCall {
@@ -417,3 +475,7 @@ impl From<WireNestedToolCall> for CodeModeNestedToolCall {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "payload_tests.rs"]
+mod tests;
