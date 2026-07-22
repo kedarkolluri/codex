@@ -7,14 +7,16 @@ use codex_code_mode_protocol::host::HandshakeRejectReason;
 use codex_code_mode_protocol::host::HostHello;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
 use pretty_assertions::assert_eq;
 
+use super::NegotiatedCapabilities;
 use super::negotiate;
 
-async fn negotiate_with_response(response: HostToClient) -> Result<(), String> {
+async fn negotiate_with_response(response: HostToClient) -> Result<NegotiatedCapabilities, String> {
     let (client_stream, host_stream) = tokio::io::duplex(/*max_buf_size*/ 4096);
     let (client_reader, client_writer) = tokio::io::split(client_stream);
     let (host_reader, host_writer) = tokio::io::split(host_stream);
@@ -34,8 +36,12 @@ async fn negotiate_with_response(response: HostToClient) -> Result<(), String> {
         assert_eq!(hello.required_capabilities(), &CapabilitySet::empty());
         assert_eq!(
             hello.optional_capabilities(),
-            &CapabilitySet::try_new([Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
-                .expect("saved output capability"),])
+            &CapabilitySet::try_new([
+                Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
+                    .expect("saved output capability"),
+                Capability::new(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)
+                    .expect("workflow cell identity capability"),
+            ])
             .expect("optional capabilities")
         );
         writer.write(&response).await.expect("write host response");
@@ -65,18 +71,46 @@ async fn client_requires_v2_and_accepts_only_offered_capabilities() {
             CapabilitySet::empty(),
         )))
         .await,
-        Ok(())
+        Ok(NegotiatedCapabilities::default())
     );
+    let selected_capabilities = CapabilitySet::try_new([
+        Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY).expect("saved output capability"),
+        Capability::new(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)
+            .expect("workflow cell identity capability"),
+    ])
+    .expect("selected capabilities");
+    let result = negotiate_with_response(HostToClient::HostHello(HostHello::new(
+        ProtocolVersion::V2,
+        selected_capabilities.clone(),
+    )))
+    .await
+    .expect("paired capabilities");
     assert_eq!(
-        negotiate_with_response(HostToClient::HostHello(HostHello::new(
-            ProtocolVersion::V2,
-            CapabilitySet::try_new([Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
-                .expect("saved output capability"),])
-            .expect("selected capabilities"),
-        )))
-        .await,
-        Ok(())
+        result,
+        NegotiatedCapabilities {
+            selected: selected_capabilities,
+        }
     );
+}
+
+#[tokio::test]
+async fn client_rejects_split_workflow_capability_selection() {
+    for capability in [
+        SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY,
+        SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY,
+    ] {
+        assert_eq!(
+            negotiate_with_response(HostToClient::HostHello(HostHello::new(
+                ProtocolVersion::V2,
+                CapabilitySet::try_new(
+                    [Capability::new(capability).expect("workflow capability"),]
+                )
+                .expect("selected capabilities"),
+            )))
+            .await,
+            Err("code-mode host selected an invalid workflow capability set".to_string())
+        );
+    }
 }
 
 #[tokio::test]

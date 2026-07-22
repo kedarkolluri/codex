@@ -6,6 +6,7 @@ use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use tokio::io::AsyncRead;
@@ -15,23 +16,33 @@ const INVALID_CLIENT_CAPABILITIES: &str = "code-mode client capabilities are inv
 const HOST_SELECTED_UNSUPPORTED_VERSION: &str =
     "code-mode host selected an unsupported protocol version";
 const HOST_SELECTED_UNOFFERED_CAPABILITY: &str = "code-mode host selected an unoffered capability";
+const HOST_SELECTED_SPLIT_WORKFLOW_CAPABILITIES: &str =
+    "code-mode host selected an invalid workflow capability set";
 const HOST_REJECTED_HANDSHAKE: &str = "code-mode host rejected the handshake";
 const HOST_RETURNED_INVALID_HANDSHAKE: &str =
     "code-mode host returned an invalid handshake response";
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct NegotiatedCapabilities {
+    selected: CapabilitySet,
+}
+
 pub(super) async fn negotiate<R, W>(
     reader: &mut FramedReader<R>,
     writer: &mut FramedWriter<W>,
-) -> Result<(), String>
+) -> Result<NegotiatedCapabilities, String>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let saved_workflow_output = Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
         .map_err(|_| INVALID_CLIENT_CAPABILITIES.to_string())?;
-    let required_capabilities = CapabilitySet::empty();
-    let optional_capabilities = CapabilitySet::try_new([saved_workflow_output])
+    let saved_workflow_cell_identity = Capability::new(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)
         .map_err(|_| INVALID_CLIENT_CAPABILITIES.to_string())?;
+    let required_capabilities = CapabilitySet::empty();
+    let optional_capabilities =
+        CapabilitySet::try_new([saved_workflow_output, saved_workflow_cell_identity])
+            .map_err(|_| INVALID_CLIENT_CAPABILITIES.to_string())?;
     let hello = ClientHello::new(
         SupportedProtocolVersions::try_new([ProtocolVersion::V2]).map_err(|err| err.to_string())?,
         required_capabilities.clone(),
@@ -57,7 +68,13 @@ where
             }) {
                 return Err(HOST_SELECTED_UNOFFERED_CAPABILITY.to_string());
             }
-            Ok(())
+            let selected = hello.capabilities().clone();
+            let selected_output = selected.contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
+            let selected_identity = selected.contains_name(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY);
+            if selected_output != selected_identity {
+                return Err(HOST_SELECTED_SPLIT_WORKFLOW_CAPABILITIES.to_string());
+            }
+            Ok(NegotiatedCapabilities { selected })
         }
         Some(HostToClient::HandshakeRejected { .. }) => Err(HOST_REJECTED_HANDSHAKE.to_string()),
         Some(_) => Err(HOST_RETURNED_INVALID_HANDSHAKE.to_string()),
