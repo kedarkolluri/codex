@@ -22,10 +22,13 @@ use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::ReadDirectoryEntry;
 use crate::RemoveOptions;
+use crate::VerifiedFileRead;
+use crate::VerifiedFileReadOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::regular_file;
 use crate::sandboxed_file_system::SandboxedFileSystem;
+use crate::verified_file_capture;
 
 const MAX_READ_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -134,6 +137,31 @@ impl LocalFileSystem {
         file_system.read_file_stream(path, sandbox).await
     }
 
+    async fn read_file_verified(
+        &self,
+        path: &PathUri,
+        options: VerifiedFileReadOptions,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<VerifiedFileRead> {
+        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified file reads do not support platform sandboxing",
+            ));
+        }
+        let bytes = verified_file_capture::capture(path, options.max_bytes).await?;
+        let size = bytes.len() as u64;
+        let chunks = if bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![Ok(bytes)]
+        };
+        Ok(VerifiedFileRead {
+            size,
+            stream: FileSystemReadStream::new(futures::stream::iter(chunks)),
+        })
+    }
+
     async fn write_file(
         &self,
         path: &PathUri,
@@ -229,6 +257,17 @@ impl ExecutorFileSystem for LocalFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
         Box::pin(LocalFileSystem::read_file_stream(self, path, sandbox))
+    }
+
+    fn read_file_verified<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: VerifiedFileReadOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, VerifiedFileRead> {
+        Box::pin(LocalFileSystem::read_file_verified(
+            self, path, options, sandbox,
+        ))
     }
 
     fn write_file<'a>(
