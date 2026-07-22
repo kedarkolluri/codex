@@ -13,7 +13,9 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeSessionProvider;
 use codex_code_mode_protocol::CodeModeSessionProviderFuture;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
@@ -221,6 +223,9 @@ impl ProcessOwnedCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+        if request.output_policy == ExecuteOutputPolicy::SavedWorkflow {
+            return Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string());
+        }
         let binding = self.connection().await?;
         binding.connection.execute(binding.remote, request).await
     }
