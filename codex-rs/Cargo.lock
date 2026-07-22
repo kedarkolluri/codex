@@ -2845,11 +2845,18 @@ dependencies = [
 name = "codex-core-workflows"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "codex-code-mode-protocol",
+ "codex-config",
+ "codex-file-system",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
+ "futures",
  "pretty_assertions",
  "tempfile",
  "tokio",
+ "toml 0.9.11+spec-1.1.0",
+ "tracing",
 ]
 
 [[package]]

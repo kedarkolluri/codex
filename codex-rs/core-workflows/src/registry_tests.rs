@@ -1,4 +1,5 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -7,8 +8,9 @@ use crate::WorkflowLoadError;
 use crate::WorkflowMetadata;
 use crate::WorkflowScope;
 
-fn path(root: &TempDir, relative: &str) -> AbsolutePathBuf {
-    AbsolutePathBuf::from_absolute_path_checked(root.path().join(relative)).unwrap()
+fn path(root: &TempDir, relative: &str) -> PathUri {
+    let path = AbsolutePathBuf::from_absolute_path_checked(root.path().join(relative)).unwrap();
+    PathUri::from_abs_path(&path)
 }
 
 fn workflow(
@@ -66,10 +68,7 @@ fn applies_scope_precedence_independently_of_discovery_order() {
 
     assert_eq!(
         registry,
-        WorkflowRegistry {
-            workflows: vec![personal_only, project],
-            errors: Vec::new(),
-        }
+        WorkflowRegistry::new(vec![personal_only, project], Vec::new())
     );
 }
 
@@ -117,10 +116,7 @@ fn deduplicates_identical_paths_before_names_with_deterministic_ties() {
 
     assert_eq!(
         registry,
-        WorkflowRegistry {
-            workflows: vec![lexically_first, shared_path_project],
-            errors: Vec::new(),
-        }
+        WorkflowRegistry::new(vec![lexically_first, shared_path_project], Vec::new())
     );
 }
 

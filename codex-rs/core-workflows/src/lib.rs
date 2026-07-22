@@ -4,6 +4,7 @@
 //! applies scope precedence independently of discovery order so project workflows reliably shadow
 //! lower-precedence entries with the same name.
 
+mod executor_loader;
 mod loader;
 mod model;
 mod registry;

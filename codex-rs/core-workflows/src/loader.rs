@@ -4,8 +4,10 @@ use std::io;
 use codex_code_mode_protocol::WORKFLOW_META_MAX_BYTES;
 use codex_code_mode_protocol::parse_workflow_meta;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use tokio::io::AsyncReadExt;
 
+use crate::executor_loader::load_workflows_from_executor_root;
 use crate::WorkflowLoadError;
 use crate::WorkflowMetadata;
 use crate::WorkflowRegistry;
@@ -13,10 +15,10 @@ use crate::WorkflowRoot;
 use crate::WorkflowScope;
 
 const MAX_WORKFLOW_ROOTS: usize = 8;
-const MAX_SCAN_DEPTH: usize = 6;
-const MAX_DIRECTORIES_PER_ROOT: usize = 2_000;
-const MAX_ENTRIES_PER_ROOT: usize = 20_000;
-const MAX_CANDIDATES_PER_ROOT: usize = 256;
+pub(crate) const MAX_SCAN_DEPTH: usize = 6;
+pub(crate) const MAX_DIRECTORIES_PER_ROOT: usize = 2_000;
+pub(crate) const MAX_ENTRIES_PER_ROOT: usize = 20_000;
+pub(crate) const MAX_CANDIDATES_PER_ROOT: usize = 256;
 const MAX_DIAGNOSTICS_PER_ROOT: usize = 64;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1_024;
 
@@ -24,8 +26,10 @@ const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1_024;
 // bytes prove a UTF-8 scalar split at the read horizon.
 const META_PARSER_LOOKAHEAD_BYTES: usize = 4 * 1_024;
 const UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
-const META_LOGICAL_READ_BYTES: usize = WORKFLOW_META_MAX_BYTES + META_PARSER_LOOKAHEAD_BYTES;
-const META_PHYSICAL_READ_BYTES: usize = META_LOGICAL_READ_BYTES + UTF8_BOUNDARY_LOOKAHEAD_BYTES;
+pub(crate) const META_LOGICAL_READ_BYTES: usize =
+    WORKFLOW_META_MAX_BYTES + META_PARSER_LOOKAHEAD_BYTES;
+pub(crate) const META_PHYSICAL_READ_BYTES: usize =
+    META_LOGICAL_READ_BYTES + UTF8_BOUNDARY_LOOKAHEAD_BYTES;
 
 #[derive(Clone, Copy)]
 struct DiscoveryLimits {
@@ -64,21 +68,21 @@ impl RootScan {
         unit: &str,
     ) -> Self {
         diagnostics.push(
-            canonical_root.clone(),
+            path_uri(&canonical_root),
             format!("workflow {unit} limit {limit} exceeded; this root was skipped"),
         );
         Self::empty(canonical_root, diagnostics)
     }
 }
 
-struct Diagnostics {
-    root: AbsolutePathBuf,
+pub(crate) struct Diagnostics {
+    root: PathUri,
     errors: Vec<WorkflowLoadError>,
     omitted: usize,
 }
 
 impl Diagnostics {
-    fn new(root: AbsolutePathBuf) -> Self {
+    pub(crate) fn new(root: PathUri) -> Self {
         Self {
             root,
             errors: Vec::new(),
@@ -86,7 +90,7 @@ impl Diagnostics {
         }
     }
 
-    fn push(&mut self, path: AbsolutePathBuf, mut message: String) {
+    pub(crate) fn push(&mut self, path: PathUri, mut message: String) {
         if message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
             let mut end = MAX_DIAGNOSTIC_MESSAGE_BYTES - 3;
             while !message.is_char_boundary(end) {
@@ -102,7 +106,7 @@ impl Diagnostics {
         }
     }
 
-    fn finish(mut self) -> Vec<WorkflowLoadError> {
+    pub(crate) fn finish(mut self) -> Vec<WorkflowLoadError> {
         if self.omitted > 0 {
             let omitted = self.omitted;
             self.errors.push(WorkflowLoadError {
@@ -138,6 +142,18 @@ where
     }
 
     for root in roots {
+        if let Some(file_system) = root.executor_file_system() {
+            let (loaded, diagnostics) =
+                load_workflows_from_executor_root(&root.path, root.scope, file_system.as_ref())
+                    .await;
+            workflows.extend(
+                loaded
+                    .into_iter()
+                    .map(|workflow| (workflow, Some(file_system.clone()))),
+            );
+            errors.extend(diagnostics);
+            continue;
+        }
         let RootScan {
             canonical_root,
             candidates,
@@ -145,29 +161,32 @@ where
         } = scan_workflow_root(&root, DISCOVERY_LIMITS).await;
         for candidate in candidates {
             match load_workflow(&candidate, &canonical_root, root.scope).await {
-                Ok(workflow) => workflows.push(workflow),
+                Ok(workflow) => workflows.push((workflow, None)),
                 Err(error) => diagnostics.push(error.path, error.message),
             }
         }
         errors.extend(diagnostics.finish());
     }
 
-    WorkflowRegistry::new(workflows, errors)
+    WorkflowRegistry::from_discovery(workflows, errors)
 }
 
 async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> RootScan {
+    let root_path = root
+        .host_path()
+        .expect("host-local scan requires a host-local workflow root");
     let mut diagnostics = Diagnostics::new(root.path.clone());
-    let canonical_root = match canonicalize(&root.path).await {
+    let canonical_root = match canonicalize(root_path).await {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return RootScan::empty(root.path.clone(), diagnostics);
+            return RootScan::empty(root_path.clone(), diagnostics);
         }
         Err(error) => {
             diagnostics.push(
                 root.path.clone(),
                 format!("failed to resolve workflow root: {error}"),
             );
-            return RootScan::empty(root.path.clone(), diagnostics);
+            return RootScan::empty(root_path.clone(), diagnostics);
         }
     };
     let mut pending = vec![(canonical_root.clone(), 0_usize)];
@@ -179,7 +198,7 @@ async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> Roo
             Ok(reader) => reader,
             Err(error) => {
                 diagnostics.push(
-                    directory,
+                    path_uri(&directory),
                     format!("failed to read workflow directory: {error}"),
                 );
                 continue;
@@ -192,7 +211,7 @@ async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> Roo
                 Ok(None) => break,
                 Err(error) => {
                     diagnostics.push(
-                        directory.clone(),
+                        path_uri(&directory),
                         format!("failed while reading workflow directory: {error}"),
                     );
                     break;
@@ -207,7 +226,7 @@ async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> Roo
                 Ok(path) => path,
                 Err(error) => {
                     diagnostics.push(
-                        directory.clone(),
+                        path_uri(&directory),
                         format!("workflow entry did not have an absolute path: {error}"),
                     );
                     continue;
@@ -216,7 +235,10 @@ async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> Roo
             match entry.file_type().await {
                 Ok(file_type) => entries.push((path, file_type)),
                 Err(error) => {
-                    diagnostics.push(path, format!("failed to inspect workflow entry: {error}"))
+                    diagnostics.push(
+                        path_uri(&path),
+                        format!("failed to inspect workflow entry: {error}"),
+                    )
                 }
             }
         }
@@ -241,7 +263,7 @@ async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> Roo
                 let child_depth = depth + 1;
                 if child_depth > limits.max_depth {
                     diagnostics.push(
-                        path,
+                        path_uri(&path),
                         format!(
                             "workflow scan reached the {max_depth}-level depth limit; this subtree was skipped",
                             max_depth = limits.max_depth
@@ -253,14 +275,14 @@ async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> Roo
                     Ok(canonical) if canonical.starts_with(canonical_root.as_path()) => canonical,
                     Ok(_) => {
                         diagnostics.push(
-                            path,
+                            path_uri(&path),
                             "workflow directory resolves outside its root".to_string(),
                         );
                         continue;
                     }
                     Err(error) => {
                         diagnostics.push(
-                            path,
+                            path_uri(&path),
                             format!("failed to resolve workflow directory: {error}"),
                         );
                         continue;
@@ -310,30 +332,30 @@ async fn load_workflow(
     let canonical = canonicalize(path)
         .await
         .map_err(|error| WorkflowLoadError {
-            path: path.clone(),
+            path: path_uri(path),
             message: format!("failed to resolve workflow candidate: {error}"),
         })?;
     if !canonical.starts_with(canonical_root.as_path()) {
         return Err(WorkflowLoadError {
-            path: path.clone(),
+            path: path_uri(path),
             message: "workflow candidate resolves outside its root".to_string(),
         });
     }
     let source = read_meta_prefix(&canonical)
         .await
         .map_err(|error| WorkflowLoadError {
-            path: canonical.clone(),
+            path: path_uri(&canonical),
             message: format!("failed to read workflow metadata: {error}"),
         })?;
     let meta = parse_workflow_meta(&source).map_err(|message| WorkflowLoadError {
-        path: canonical.clone(),
+        path: path_uri(&canonical),
         message,
     })?;
     Ok(WorkflowMetadata {
         name: meta.name,
         description: meta.description,
         phases: meta.phases,
-        path: canonical,
+        path: path_uri(&canonical),
         scope,
     })
 }
@@ -353,7 +375,7 @@ async fn read_meta_prefix(path: &AbsolutePathBuf) -> io::Result<String> {
     decode_meta_prefix(&bytes)
 }
 
-fn decode_meta_prefix(bytes: &[u8]) -> io::Result<String> {
+pub(crate) fn decode_meta_prefix(bytes: &[u8]) -> io::Result<String> {
     let logical_len = bytes.len().min(META_LOGICAL_READ_BYTES);
     let logical = &bytes[..logical_len];
     match std::str::from_utf8(logical) {
@@ -385,6 +407,10 @@ fn invalid_utf8() -> io::Error {
 async fn canonicalize(path: &AbsolutePathBuf) -> io::Result<AbsolutePathBuf> {
     let path = tokio::fs::canonicalize(path.as_path()).await?;
     AbsolutePathBuf::from_absolute_path_checked(path)
+}
+
+fn path_uri(path: &AbsolutePathBuf) -> PathUri {
+    PathUri::from_abs_path(path)
 }
 
 #[cfg(test)]
