@@ -863,6 +863,10 @@ pub(crate) async fn apply_bespoke_event_handling(
             // App-server v2 receives TurnItem lifecycle instead, and dispatches dynamic tool
             // requests from DynamicToolCall starts.
         }
+        EventMsg::Workflow(_) => {
+            // The versioned experimental workflow notification mapping lands with its app-server
+            // protocol schema and behavioral tests in a later delivery slice.
+        }
         EventMsg::McpToolCallBegin(_) | EventMsg::McpToolCallEnd(_) => {
             // Deprecated MCP tool-call events are still fanned out for raw-event and rollout
             // compatibility consumers.
