@@ -275,7 +275,7 @@ fn saved_late_yield_is_admitted_without_claiming_a_terminal_role() {
 }
 
 #[test]
-fn saved_terminal_snapshot_budget_is_released_on_match() {
+fn saved_terminal_snapshot_budget_is_released_on_match_drop_and_failure() {
     let budget = TerminalEchoBudget::new();
     let mut admissions = Vec::new();
     let raw = terminal_response("terminal", /*error_text*/ None);
@@ -304,10 +304,33 @@ fn saved_terminal_snapshot_budget_is_released_on_match() {
     assert_eq!(released, AdmissionOutcome::Admitted);
     let replacement = RemoteOutputAdmission::with_terminal_echo_budget(
         ExecuteOutputPolicy::SavedWorkflow,
-        budget,
+        budget.clone(),
     );
     assert_eq!(
         admit(&replacement, &raw, ResponseDelivery::Observer).0,
+        AdmissionOutcome::Admitted
+    );
+
+    drop(admissions.pop());
+    let drop_replacement = RemoteOutputAdmission::with_terminal_echo_budget(
+        ExecuteOutputPolicy::SavedWorkflow,
+        budget.clone(),
+    );
+    assert_eq!(
+        admit(&drop_replacement, &raw, ResponseDelivery::Observer).0,
+        AdmissionOutcome::Admitted
+    );
+
+    assert_eq!(
+        admit(&admissions[1], &raw, ResponseDelivery::Observer).0,
+        AdmissionOutcome::ExecutionFailed
+    );
+    let failure_replacement = RemoteOutputAdmission::with_terminal_echo_budget(
+        ExecuteOutputPolicy::SavedWorkflow,
+        budget,
+    );
+    assert_eq!(
+        admit(&failure_replacement, &raw, ResponseDelivery::Observer).0,
         AdmissionOutcome::Admitted
     );
 }
