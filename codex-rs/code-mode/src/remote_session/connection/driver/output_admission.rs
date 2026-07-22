@@ -11,12 +11,19 @@ use codex_code_mode_protocol::WorkflowOutputBounds;
 #[derive(Clone)]
 pub(super) enum RemoteOutputAdmission {
     Ordinary,
-    SavedWorkflow(Arc<Mutex<Option<WorkflowOutputBounds>>>),
+    SavedWorkflow(Arc<Mutex<SavedAdmissionState>>),
+}
+
+pub(super) enum SavedAdmissionState {
+    Open(WorkflowOutputBounds),
+    ExecutionFailed,
+    Rejected,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum AdmissionOutcome {
     Admitted,
+    ExecutionFailed,
     Rejected,
 }
 
@@ -24,14 +31,10 @@ impl RemoteOutputAdmission {
     pub(super) fn new(output_policy: ExecuteOutputPolicy) -> Self {
         match output_policy {
             ExecuteOutputPolicy::Ordinary => Self::Ordinary,
-            ExecuteOutputPolicy::SavedWorkflow => {
-                Self::SavedWorkflow(Arc::new(Mutex::new(Some(WorkflowOutputBounds::default()))))
-            }
+            ExecuteOutputPolicy::SavedWorkflow => Self::SavedWorkflow(Arc::new(Mutex::new(
+                SavedAdmissionState::Open(WorkflowOutputBounds::default()),
+            ))),
         }
-    }
-
-    pub(super) fn is_saved(&self) -> bool {
-        matches!(self, Self::SavedWorkflow(_))
     }
 
     pub(super) fn admit_response(&self, response: &mut RuntimeResponse) -> AdmissionOutcome {
@@ -66,11 +69,11 @@ impl RemoteOutputAdmission {
                     *error_text = Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string());
                 }
             }
-            AdmissionOutcome::Rejected => {
+            AdmissionOutcome::ExecutionFailed | AdmissionOutcome::Rejected => {
                 *response = RuntimeResponse::Result {
                     cell_id,
                     content_items: Vec::new(),
-                    error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
+                    error_text: Some(visible_saved_error(outcome).to_string()),
                 };
             }
         }
@@ -82,11 +85,53 @@ impl RemoteOutputAdmission {
             return (error, AdmissionOutcome::Admitted);
         }
         let outcome = self.admit_saved(&[], Some(&error));
-        let error = match outcome {
-            AdmissionOutcome::Admitted => SAVED_WORKFLOW_EXECUTION_FAILED,
-            AdmissionOutcome::Rejected => SAVED_WORKFLOW_OUTPUT_REJECTED,
+        (visible_saved_error(outcome).to_string(), outcome)
+    }
+
+    pub(super) fn admit_fatal_error(&self, error: String) -> (String, AdmissionOutcome) {
+        let Self::SavedWorkflow(shared) = self else {
+            return (error, AdmissionOutcome::Admitted);
         };
-        (error.to_string(), outcome)
+        let mut admission = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = match &mut *admission {
+            SavedAdmissionState::ExecutionFailed => AdmissionOutcome::ExecutionFailed,
+            SavedAdmissionState::Rejected => AdmissionOutcome::Rejected,
+            SavedAdmissionState::Open(bounds) => {
+                if bounds.admit_response(&[], Some(&error)).is_ok() {
+                    AdmissionOutcome::ExecutionFailed
+                } else {
+                    AdmissionOutcome::Rejected
+                }
+            }
+        };
+        match outcome {
+            AdmissionOutcome::Admitted => {}
+            AdmissionOutcome::ExecutionFailed => {
+                *admission = SavedAdmissionState::ExecutionFailed;
+            }
+            AdmissionOutcome::Rejected => {
+                *admission = SavedAdmissionState::Rejected;
+            }
+        }
+        (visible_saved_error(outcome).to_string(), outcome)
+    }
+
+    pub(super) fn visible_connection_failure(&self, reason: String) -> String {
+        let Self::SavedWorkflow(shared) = self else {
+            return reason;
+        };
+        let admission = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outcome = match &*admission {
+            SavedAdmissionState::Open(_) | SavedAdmissionState::ExecutionFailed => {
+                AdmissionOutcome::ExecutionFailed
+            }
+            SavedAdmissionState::Rejected => AdmissionOutcome::Rejected,
+        };
+        visible_saved_error(outcome).to_string()
     }
 
     fn admit_saved(
@@ -100,15 +145,27 @@ impl RemoteOutputAdmission {
         let mut admission = shared
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(bounds) = admission.as_mut() else {
-            return AdmissionOutcome::Rejected;
-        };
-        if bounds.admit_response(items, error_text).is_ok() {
-            AdmissionOutcome::Admitted
-        } else {
-            *admission = None;
-            AdmissionOutcome::Rejected
+        match &mut *admission {
+            SavedAdmissionState::Open(bounds) => {
+                if bounds.admit_response(items, error_text).is_ok() {
+                    AdmissionOutcome::Admitted
+                } else {
+                    *admission = SavedAdmissionState::Rejected;
+                    AdmissionOutcome::Rejected
+                }
+            }
+            SavedAdmissionState::ExecutionFailed => AdmissionOutcome::ExecutionFailed,
+            SavedAdmissionState::Rejected => AdmissionOutcome::Rejected,
         }
+    }
+}
+
+fn visible_saved_error(outcome: AdmissionOutcome) -> &'static str {
+    match outcome {
+        AdmissionOutcome::Admitted | AdmissionOutcome::ExecutionFailed => {
+            SAVED_WORKFLOW_EXECUTION_FAILED
+        }
+        AdmissionOutcome::Rejected => SAVED_WORKFLOW_OUTPUT_REJECTED,
     }
 }
 

@@ -193,7 +193,7 @@ impl PendingRequest {
                 output_admission,
                 ..
             } => {
-                let (reason, _) = output_admission.admit_error(reason);
+                let reason = output_admission.visible_connection_failure(reason);
                 let _ = response_tx.send(Err(reason));
             }
             Self::Wait { response_tx, .. } | Self::Terminate { response_tx, .. } => {

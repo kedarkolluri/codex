@@ -31,7 +31,15 @@ fn ordinary_output_is_preserved_above_saved_limits() {
     assert_eq!(actual, expected);
     assert_eq!(
         admission.admit_error(oversized.clone()),
-        (oversized, AdmissionOutcome::Admitted)
+        (oversized.clone(), AdmissionOutcome::Admitted)
+    );
+    assert_eq!(
+        admission.admit_fatal_error(oversized.clone()),
+        (oversized.clone(), AdmissionOutcome::Admitted)
+    );
+    assert_eq!(
+        admission.visible_connection_failure(oversized.clone()),
+        oversized
     );
 }
 
@@ -48,9 +56,16 @@ fn saved_clones_share_one_cumulative_chunk_ledger() {
             AdmissionOutcome::Admitted
         );
     }
+    assert_eq!(
+        second.admit_fatal_error(String::new()),
+        (
+            SAVED_WORKFLOW_OUTPUT_REJECTED.to_string(),
+            AdmissionOutcome::Rejected
+        )
+    );
     let mut overflow = response("overflow", String::new());
     assert_eq!(
-        second.admit_response(&mut overflow),
+        first.admit_response(&mut overflow),
         AdmissionOutcome::Rejected
     );
     assert_eq!(
@@ -90,6 +105,13 @@ fn saved_errors_are_redacted_bounded_and_sticky() {
             AdmissionOutcome::Admitted
         )
     );
+    let mut continued = response("continued", "ok".to_string());
+    let expected = continued.clone();
+    assert_eq!(
+        admission.admit_response(&mut continued),
+        AdmissionOutcome::Admitted
+    );
+    assert_eq!(continued, expected);
     let oversized = "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES);
     assert_eq!(
         admission.admit_error(oversized),
@@ -104,5 +126,56 @@ fn saved_errors_are_redacted_bounded_and_sticky() {
             SAVED_WORKFLOW_OUTPUT_REJECTED.to_string(),
             AdmissionOutcome::Rejected
         )
+    );
+}
+
+#[test]
+fn saved_fatal_error_is_accounted_once_and_shared_as_fixed_failure() {
+    let admission = RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+    let sibling = admission.clone();
+    let full_item = || FunctionCallOutputContentItem::InputText {
+        text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 2),
+    };
+    let mut near_full = RuntimeResponse::Yielded {
+        cell_id: CellId::new("fatal".to_string()),
+        content_items: vec![
+            full_item(),
+            full_item(),
+            full_item(),
+            FunctionCallOutputContentItem::InputText {
+                text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 5),
+            },
+        ],
+    };
+    assert_eq!(
+        admission.admit_response(&mut near_full),
+        AdmissionOutcome::Admitted
+    );
+    assert_eq!(
+        sibling.visible_connection_failure("private global failure".to_string()),
+        SAVED_WORKFLOW_EXECUTION_FAILED
+    );
+    let fixed_failure = (
+        SAVED_WORKFLOW_EXECUTION_FAILED.to_string(),
+        AdmissionOutcome::ExecutionFailed,
+    );
+    assert_eq!(admission.admit_fatal_error("x".to_string()), fixed_failure);
+    assert_eq!(
+        sibling.admit_fatal_error("x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES)),
+        fixed_failure
+    );
+
+    let mut late = response("late", "must not escape".to_string());
+    assert_eq!(
+        sibling.admit_response(&mut late),
+        AdmissionOutcome::ExecutionFailed
+    );
+    assert_eq!(
+        late,
+        RuntimeResponse::Result {
+            cell_id: CellId::new("late".to_string()),
+            content_items: Vec::new(),
+            error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
+        }
     );
 }
