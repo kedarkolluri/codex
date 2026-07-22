@@ -3,6 +3,8 @@ use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientHello;
 use codex_code_mode_protocol::host::ClientToHost;
+use codex_code_mode_protocol::host::DelegateRequest;
+use codex_code_mode_protocol::host::DelegateResponse;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
@@ -13,13 +15,22 @@ use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WireCellId;
+use codex_code_mode_protocol::host::WireContentItem;
 use codex_code_mode_protocol::host::WireExecuteOutputPolicy;
 use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::WireResult;
+use codex_code_mode_protocol::host::WireRuntimeResponse;
+use codex_code_mode_protocol::host::WireToolDefinition;
+use codex_code_mode_protocol::host::WireToolKind;
+use codex_code_mode_protocol::host::WireToolName;
+use codex_code_mode_protocol::host::WireWorkflowCellId;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -223,14 +234,15 @@ async fn incompatible_or_invalid_handshake_is_rejected() {
 }
 
 #[tokio::test]
-async fn unsupported_required_capability_is_rejected() {
+async fn unpaired_required_workflow_identity_capability_is_rejected() {
     let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 1024);
     let (host_reader, host_writer) = tokio::io::split(host_stream);
     let (client_reader, client_writer) = tokio::io::split(client_stream);
     let host = tokio::spawn(run(host_reader, host_writer));
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
-    let capability = Capability::new("required").expect("capability");
+    let capability =
+        Capability::new(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY).expect("identity capability");
 
     writer
         .write(&client_hello(
@@ -308,6 +320,189 @@ async fn saved_output_capability_remains_unselected_and_unavailable() {
         })
     );
 
+    drop(writer);
+    drop(reader);
+    host.await.expect("host task").expect("host connection");
+}
+
+#[tokio::test]
+async fn paired_saved_workflow_capabilities_preserve_exact_lifecycle_ids() {
+    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 4096);
+    let (host_reader, host_writer) = tokio::io::split(host_stream);
+    let (client_reader, client_writer) = tokio::io::split(client_stream);
+    let host = tokio::spawn(run(host_reader, host_writer));
+    let mut reader = FramedReader::new(client_reader);
+    let mut writer = FramedWriter::new(client_writer);
+    let saved_output =
+        Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY).expect("saved output capability");
+    let cell_identity =
+        Capability::new(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY).expect("cell identity capability");
+    let capabilities = CapabilitySet::try_new([saved_output.clone(), cell_identity.clone()])
+        .expect("paired capabilities");
+
+    writer
+        .write(&client_hello(
+            [ProtocolVersion::V2],
+            CapabilitySet::try_new([saved_output]).expect("required capability"),
+            CapabilitySet::try_new([cell_identity]).expect("optional capability"),
+        ))
+        .await
+        .expect("write hello");
+    assert_eq!(
+        reader.read::<HostToClient>().await.expect("read hello"),
+        Some(HostToClient::HostHello(HostHello::new(
+            ProtocolVersion::V2,
+            capabilities,
+        )))
+    );
+
+    let session_id = session_id("session-1");
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 1),
+            request: HostRequest::OpenSession {
+                session_id: session_id.clone(),
+            },
+        })
+        .await
+        .expect("open session");
+    assert_eq!(
+        reader.read::<HostToClient>().await.expect("session ready"),
+        Some(HostToClient::Response {
+            id: request_id(/*value*/ 1),
+            result: WireResult::Ok {
+                value: HostResponse::SessionReady {
+                    session_id: session_id.clone(),
+                },
+            },
+        })
+    );
+
+    let workflow_cell_id = WireWorkflowCellId::try_new("wf:1:0123456789abcdef0123456789abcdef:1")
+        .expect("workflow cell ID");
+    let wire_cell_id = WireCellId::from(&workflow_cell_id);
+    let mut request =
+        execute_request(r#"const result = await tools.echo({}); text(result.value);"#);
+    request.output_policy = WireExecuteOutputPolicy::SavedWorkflow;
+    request.workflow_cell_id = Some(workflow_cell_id);
+    request.enabled_tools = vec![WireToolDefinition {
+        name: "echo".to_string(),
+        tool_name: WireToolName {
+            name: "echo".to_string(),
+            namespace: None,
+        },
+        description: String::new(),
+        kind: WireToolKind::Function,
+        input_schema: None,
+        output_schema: None,
+    }];
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 2),
+            request: HostRequest::Execute {
+                session_id: session_id.clone(),
+                request,
+            },
+        })
+        .await
+        .expect("execute saved workflow");
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("execution started"),
+        Some(HostToClient::Response {
+            id: request_id(/*value*/ 2),
+            result: WireResult::Ok {
+                value: HostResponse::ExecutionStarted {
+                    cell_id: wire_cell_id.clone(),
+                },
+            },
+        })
+    );
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("nested tool request"),
+        Some(HostToClient::DelegateRequest {
+            id: codex_code_mode_protocol::host::DelegateRequestId::new(/*value*/ 1),
+            session_id: session_id.clone(),
+            request: DelegateRequest::InvokeTool {
+                invocation: codex_code_mode_protocol::host::WireNestedToolCall {
+                    cell_id: wire_cell_id.clone(),
+                    runtime_tool_call_id: "tool-1".to_string(),
+                    tool_name: WireToolName {
+                        name: "echo".to_string(),
+                        namespace: None,
+                    },
+                    tool_kind: WireToolKind::Function,
+                    input: Some(json!({})),
+                },
+            },
+        })
+    );
+    writer
+        .write(&ClientToHost::DelegateResponse {
+            id: codex_code_mode_protocol::host::DelegateRequestId::new(/*value*/ 1),
+            result: WireResult::Ok {
+                value: DelegateResponse::ToolResult {
+                    result: json!({ "value": "done" }),
+                },
+            },
+        })
+        .await
+        .expect("write nested tool response");
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("initial response"),
+        Some(HostToClient::InitialResponse {
+            id: request_id(/*value*/ 2),
+            result: WireResult::Ok {
+                value: WireRuntimeResponse::Result {
+                    cell_id: wire_cell_id.clone(),
+                    content_items: vec![WireContentItem::InputText {
+                        text: "done".to_string(),
+                    }],
+                    error_text: None,
+                },
+            },
+        })
+    );
+    assert_eq!(
+        reader.read::<HostToClient>().await.expect("cell closed"),
+        Some(HostToClient::CellClosed {
+            session_id: session_id.clone(),
+            cell_id: wire_cell_id,
+        })
+    );
+
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 3),
+            request: HostRequest::Execute {
+                session_id: session_id.clone(),
+                request: execute_request(r#"text("ordinary");"#),
+            },
+        })
+        .await
+        .expect("execute ordinary cell");
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("ordinary execution started"),
+        Some(HostToClient::Response {
+            id: request_id(/*value*/ 3),
+            result: WireResult::Ok {
+                value: HostResponse::ExecutionStarted {
+                    cell_id: WireCellId::try_new("1").expect("ordinary cell ID"),
+                },
+            },
+        })
+    );
     drop(writer);
     drop(reader);
     host.await.expect("host task").expect("host connection");
@@ -421,6 +616,7 @@ async fn request_task_panic_disconnects_host() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        selected_capabilities: CapabilitySet::empty(),
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     };
@@ -450,6 +646,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        selected_capabilities: CapabilitySet::empty(),
         closing: AtomicBool::new(false),
         peer,
     });
@@ -509,6 +706,7 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(/*permits*/ 0)),
+        selected_capabilities: CapabilitySet::empty(),
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     };
