@@ -1,9 +1,9 @@
 //! Hot-path helpers for recording code-mode runtime cell lifecycles.
 //!
-//! The public `exec` tool is reduced as a first-class `CodeCell` instead of a
-//! generic tool call. This module keeps the runtime response serialization and
-//! lifecycle event policy inside the trace crate while core carries a compact,
-//! no-op capable handle through execution and waits.
+//! Model-authored JavaScript entered through public `exec` or a saved workflow
+//! is reduced as a first-class `CodeCell`. This module keeps runtime response
+//! serialization and lifecycle policy inside the trace crate while core carries
+//! a compact, no-op capable handle through execution and waits.
 
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use crate::model::CodexTurnId;
 use crate::model::ModelVisibleCallId;
 use crate::payload::RawPayloadKind;
 use crate::payload::RawPayloadRef;
+use crate::raw_event::CodeCellModelVisibleCallKind;
 use crate::raw_event::RawTraceEventContext;
 use crate::raw_event::RawTraceEventPayload;
 use crate::writer::TraceWriter;
@@ -43,8 +44,8 @@ struct EnabledCodeCellTraceContext {
 
 /// Raw code-mode response captured at the runtime boundary.
 ///
-/// This is not the model-visible custom-tool output. The reducer links that
-/// output through `CodeCell.output_item_ids` once the conversation item appears.
+/// This is not the model-visible call output. The reducer links that output
+/// through `CodeCell.output_item_ids` once the conversation item appears.
 /// Keeping the raw runtime payload here preserves stored-value and lifecycle
 /// evidence without duplicating the model-facing transcript.
 #[derive(Serialize)]
@@ -83,6 +84,32 @@ impl CodeCellTraceContext {
         model_visible_call_id: impl Into<ModelVisibleCallId>,
         source_js: impl Into<String>,
     ) {
+        self.record_started_with_kind(
+            model_visible_call_id,
+            CodeCellModelVisibleCallKind::CustomToolCall,
+            source_js,
+        );
+    }
+
+    /// Records a code-mode cell owned by a model-visible function call.
+    pub(crate) fn record_function_started(
+        &self,
+        model_visible_call_id: impl Into<ModelVisibleCallId>,
+        source_js: impl Into<String>,
+    ) {
+        self.record_started_with_kind(
+            model_visible_call_id,
+            CodeCellModelVisibleCallKind::FunctionCall,
+            source_js,
+        );
+    }
+
+    fn record_started_with_kind(
+        &self,
+        model_visible_call_id: impl Into<ModelVisibleCallId>,
+        model_visible_call_kind: CodeCellModelVisibleCallKind,
+        source_js: impl Into<String>,
+    ) {
         let CodeCellTraceContextState::Enabled(context) = &self.state else {
             return;
         };
@@ -91,6 +118,7 @@ impl CodeCellTraceContext {
             RawTraceEventPayload::CodeCellStarted {
                 runtime_cell_id: context.runtime_cell_id.clone(),
                 model_visible_call_id: model_visible_call_id.into(),
+                model_visible_call_kind,
                 source_js: source_js.into(),
             },
         );

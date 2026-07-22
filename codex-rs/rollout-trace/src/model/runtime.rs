@@ -20,10 +20,10 @@ use super::TerminalOperationId;
 use super::ToolCallId;
 use super::session::ExecutionWindow;
 
-/// Runtime/debug object for one model-authored `exec` cell.
+/// Runtime/debug object for one model-authored JavaScript cell.
 ///
-/// The JavaScript source and custom-tool outputs are still conversation items;
-/// this object tracks the code-mode runtime boundary and nested runtime work.
+/// The JavaScript source and model-visible call outputs are still conversation
+/// items; this object tracks the code-mode runtime boundary and nested work.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CodeCell {
     /// Reducer-owned graph id derived from the model-visible `exec` call id.
@@ -38,7 +38,7 @@ pub struct CodeCell {
     pub output_item_ids: Vec<ConversationItemId>,
     /// Raw code-mode runtime/session id, useful when matching runtime payloads.
     pub runtime_cell_id: Option<String>,
-    /// Full JS-cell runtime window; yielded cells can outlive the initial custom call.
+    /// Full JS-cell runtime window; yielded cells can outlive the initial call.
     pub execution: ExecutionWindow,
     pub runtime_status: CodeCellRuntimeStatus,
     pub initial_response_at_unix_ms: Option<i64>,

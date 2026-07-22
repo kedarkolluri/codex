@@ -9,6 +9,7 @@ use crate::model::ProducerRef;
 use crate::model::ToolCallKind;
 use crate::model::ToolCallSummary;
 use crate::payload::RawPayloadKind;
+use crate::raw_event::CodeCellModelVisibleCallKind;
 use crate::raw_event::RawToolCallRequester;
 use crate::raw_event::RawTraceEventPayload;
 use crate::reducer::test_support::create_started_writer;
@@ -58,6 +59,7 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
         RawTraceEventPayload::CodeCellStarted {
             runtime_cell_id: "1".to_string(),
             model_visible_call_id: "call-code".to_string(),
+            model_visible_call_kind: CodeCellModelVisibleCallKind::CustomToolCall,
             source_js: "text('hi')".to_string(),
         },
     )?;
@@ -190,6 +192,262 @@ fn code_cell_lifecycle_links_nested_tools_waits_and_outputs() -> anyhow::Result<
 }
 
 #[test]
+fn function_backed_code_cell_links_nested_tool_wait_and_outputs() -> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let writer = create_started_writer(&temp)?;
+    start_turn(&writer, "turn-1")?;
+
+    let request = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "input": [message("user", "run my saved workflow")]
+        }),
+    )?;
+    writer.append(RawTraceEventPayload::InferenceStarted {
+        inference_call_id: "inference-1".to_string(),
+        thread_id: "thread-root".to_string(),
+        codex_turn_id: "turn-1".to_string(),
+        model: "gpt-test".to_string(),
+        provider_name: "test-provider".to_string(),
+        request_payload: request,
+    })?;
+    let response = writer.write_json_payload(
+        RawPayloadKind::InferenceResponse,
+        &json!({
+            "response_id": "resp-1",
+            "output_items": [{
+                "type": "function_call",
+                "name": "workflow_run",
+                "call_id": "call-workflow",
+                "arguments": "{\"name\":\"daily-report\"}"
+            }]
+        }),
+    )?;
+    // Saved workflow execution starts before stream completion reduces the
+    // model-visible function call that owns the cell.
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::CodeCellStarted {
+            runtime_cell_id: "workflow-cell-1".to_string(),
+            model_visible_call_id: "call-workflow".to_string(),
+            model_visible_call_kind: CodeCellModelVisibleCallKind::FunctionCall,
+            source_js: "await tools.exec_command({cmd: 'pwd'});".to_string(),
+        },
+    )?;
+    writer.append(RawTraceEventPayload::InferenceCompleted {
+        inference_call_id: "inference-1".to_string(),
+        response_id: Some("resp-1".to_string()),
+        upstream_request_id: None,
+        response_payload: response,
+    })?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::CodeCellInitialResponse {
+            runtime_cell_id: "workflow-cell-1".to_string(),
+            status: CodeCellRuntimeStatus::Yielded,
+            response_payload: None,
+        },
+    )?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::ToolCallStarted {
+            tool_call_id: "nested-tool-1".to_string(),
+            model_visible_call_id: None,
+            code_mode_runtime_tool_id: Some("runtime-tool-1".to_string()),
+            requester: RawToolCallRequester::CodeCell {
+                runtime_cell_id: "workflow-cell-1".to_string(),
+            },
+            kind: ToolCallKind::ExecCommand,
+            summary: ToolCallSummary::Generic {
+                label: "exec_command".to_string(),
+                input_preview: Some("pwd".to_string()),
+                output_preview: None,
+            },
+            invocation_payload: None,
+        },
+    )?;
+    writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::ToolCallEnded {
+            tool_call_id: "nested-tool-1".to_string(),
+            status: ExecutionStatus::Completed,
+            result_payload: None,
+        },
+    )?;
+
+    start_turn(&writer, "turn-2")?;
+    let workflow_output = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "previous_response_id": "resp-1",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "call-workflow",
+                "output": "Script running with cell ID workflow-cell-1"
+            }]
+        }),
+    )?;
+    writer.append(RawTraceEventPayload::InferenceStarted {
+        inference_call_id: "inference-2".to_string(),
+        thread_id: "thread-root".to_string(),
+        codex_turn_id: "turn-2".to_string(),
+        model: "gpt-test".to_string(),
+        provider_name: "test-provider".to_string(),
+        request_payload: workflow_output,
+    })?;
+    let wait_response = writer.write_json_payload(
+        RawPayloadKind::InferenceResponse,
+        &json!({
+            "response_id": "resp-2",
+            "output_items": [{
+                "type": "function_call",
+                "name": "wait",
+                "call_id": "wait-call",
+                "arguments": "{\"cell_id\":\"workflow-cell-1\"}"
+            }]
+        }),
+    )?;
+    let wait_request = writer.write_json_payload(
+        RawPayloadKind::ToolInvocation,
+        &json!({
+            "tool_name": "wait",
+            "tool_namespace": null,
+            "payload": {
+                "type": "function",
+                "arguments": "{\"cell_id\":\"workflow-cell-1\"}"
+            }
+        }),
+    )?;
+    writer.append_with_context(
+        trace_context("turn-2"),
+        RawTraceEventPayload::ToolCallStarted {
+            tool_call_id: "wait-tool-1".to_string(),
+            model_visible_call_id: Some("wait-call".to_string()),
+            code_mode_runtime_tool_id: None,
+            requester: RawToolCallRequester::Model,
+            kind: ToolCallKind::Other {
+                name: "wait".to_string(),
+            },
+            summary: ToolCallSummary::Generic {
+                label: "wait".to_string(),
+                input_preview: Some("{\"cell_id\":\"workflow-cell-1\"}".to_string()),
+                output_preview: None,
+            },
+            invocation_payload: Some(wait_request),
+        },
+    )?;
+    writer.append_with_context(
+        trace_context("turn-2"),
+        RawTraceEventPayload::CodeCellEnded {
+            runtime_cell_id: "workflow-cell-1".to_string(),
+            status: CodeCellRuntimeStatus::Completed,
+            response_payload: None,
+        },
+    )?;
+    writer.append_with_context(
+        trace_context("turn-2"),
+        RawTraceEventPayload::ToolCallEnded {
+            tool_call_id: "wait-tool-1".to_string(),
+            status: ExecutionStatus::Completed,
+            result_payload: None,
+        },
+    )?;
+    writer.append(RawTraceEventPayload::InferenceCompleted {
+        inference_call_id: "inference-2".to_string(),
+        response_id: Some("resp-2".to_string()),
+        upstream_request_id: None,
+        response_payload: wait_response,
+    })?;
+
+    start_turn(&writer, "turn-3")?;
+    let wait_output = writer.write_json_payload(
+        RawPayloadKind::InferenceRequest,
+        &json!({
+            "previous_response_id": "resp-2",
+            "input": [{
+                "type": "function_call_output",
+                "call_id": "wait-call",
+                "output": "done"
+            }]
+        }),
+    )?;
+    writer.append(RawTraceEventPayload::InferenceStarted {
+        inference_call_id: "inference-3".to_string(),
+        thread_id: "thread-root".to_string(),
+        codex_turn_id: "turn-3".to_string(),
+        model: "gpt-test".to_string(),
+        provider_name: "test-provider".to_string(),
+        request_payload: wait_output,
+    })?;
+
+    let rollout = replay_bundle(temp.path())?;
+    let code_cell_id = test_reduced_code_cell_id("call-workflow");
+    let cell = &rollout.code_cells[&code_cell_id];
+    let workflow_output_item_id = rollout.inference_calls["inference-2"]
+        .request_item_ids
+        .last()
+        .expect("workflow output item");
+    let wait_call_item_id = &rollout.inference_calls["inference-2"].response_item_ids[0];
+    let wait_output_item_id = rollout.inference_calls["inference-3"]
+        .request_item_ids
+        .last()
+        .expect("wait output item");
+    let wait_tool = &rollout.tool_calls["wait-tool-1"];
+
+    assert_eq!(cell.runtime_status, CodeCellRuntimeStatus::Completed);
+    assert_eq!(cell.execution.status, ExecutionStatus::Completed);
+    assert_eq!(cell.nested_tool_call_ids, vec!["nested-tool-1"]);
+    assert_eq!(cell.wait_tool_call_ids, vec!["wait-tool-1"]);
+    assert_eq!(cell.output_item_ids, vec![workflow_output_item_id.clone()]);
+    assert_eq!(
+        rollout.conversation_items[&cell.source_item_id].kind,
+        ConversationItemKind::FunctionCall,
+    );
+    assert_eq!(
+        rollout.conversation_items[workflow_output_item_id].kind,
+        ConversationItemKind::FunctionCallOutput,
+    );
+    assert_eq!(
+        rollout.conversation_items[workflow_output_item_id].produced_by,
+        vec![ProducerRef::CodeCell {
+            code_cell_id: code_cell_id.clone(),
+        }]
+    );
+    assert_eq!(
+        wait_tool.model_visible_call_item_ids,
+        vec![wait_call_item_id.clone()]
+    );
+    assert_eq!(
+        wait_tool.model_visible_output_item_ids,
+        vec![wait_output_item_id.clone()]
+    );
+
+    Ok(())
+}
+
+#[test]
+fn code_cell_start_without_call_kind_defaults_to_custom_tool_call() -> anyhow::Result<()> {
+    let payload: RawTraceEventPayload = serde_json::from_value(json!({
+        "type": "code_cell_started",
+        "runtime_cell_id": "cell-1",
+        "model_visible_call_id": "call-code",
+        "source_js": "text('hi')"
+    }))?;
+
+    assert_eq!(
+        payload,
+        RawTraceEventPayload::CodeCellStarted {
+            runtime_cell_id: "cell-1".to_string(),
+            model_visible_call_id: "call-code".to_string(),
+            model_visible_call_kind: CodeCellModelVisibleCallKind::CustomToolCall,
+            source_js: "text('hi')".to_string(),
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
 fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
@@ -214,6 +472,7 @@ fn fast_code_cell_lifecycle_waits_for_source_item() -> anyhow::Result<()> {
         RawTraceEventPayload::CodeCellStarted {
             runtime_cell_id: "1".to_string(),
             model_visible_call_id: "call-code".to_string(),
+            model_visible_call_kind: CodeCellModelVisibleCallKind::CustomToolCall,
             source_js: "not valid js".to_string(),
         },
     )?;
@@ -311,6 +570,7 @@ fn cancelled_turn_terminates_unfinished_code_cell() -> anyhow::Result<()> {
         RawTraceEventPayload::CodeCellStarted {
             runtime_cell_id: "1".to_string(),
             model_visible_call_id: "call-code".to_string(),
+            model_visible_call_kind: CodeCellModelVisibleCallKind::CustomToolCall,
             source_js: "await tools.exec_command({cmd: 'slow'});".to_string(),
         },
     )?;
@@ -373,6 +633,7 @@ fn runtime_code_cell_ids_can_repeat_across_threads() -> anyhow::Result<()> {
             RawTraceEventPayload::CodeCellStarted {
                 runtime_cell_id: "1".to_string(),
                 model_visible_call_id: call_id.to_string(),
+                model_visible_call_kind: CodeCellModelVisibleCallKind::CustomToolCall,
                 source_js: "text('hi')".to_string(),
             },
         )?;
