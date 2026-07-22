@@ -6,14 +6,15 @@ use codex_code_mode_protocol::WORKFLOW_SOURCE_MAX_BYTES;
 use codex_code_mode_protocol::parse_workflow_meta;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileMetadata;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
 
 use crate::WorkflowMetadata;
 use crate::WorkflowRegistry;
+
+mod host_source;
+
+use host_source::read_host_source;
 
 /// One bounded source value captured from an exact saved-workflow registry entry.
 ///
@@ -89,8 +90,10 @@ impl WorkflowRegistry {
     /// Captures the source for the exact case-sensitive registry winner named by `name`.
     ///
     /// Executor-backed entries stay on their retained filesystem even when their URI could be
-    /// represented on this host. This freezes one bounded read but does not claim race-free path
-    /// containment. Observed I/O, file-kind, path, size, UTF-8, or metadata drift fails closed.
+    /// represented on this host. Host capture binds the bytes to one opened object and checks
+    /// observed file state and bytes for stability; portable mutable filesystems do not provide a
+    /// universal read transaction. Observed I/O, file-kind, identity, path, size, UTF-8, or
+    /// metadata drift fails closed.
     pub async fn source_snapshot_by_name(
         &self,
         name: &str,
@@ -202,78 +205,6 @@ async fn validate_executor_source(
     Ok(metadata)
 }
 
-async fn read_host_source(path: &PathUri) -> Result<Vec<u8>, WorkflowSourceLoadError> {
-    let native_path = path.to_abs_path().map_err(|error| {
-        WorkflowSourceLoadError::new(
-            path.clone(),
-            format!("source is not representable on the host: {error}"),
-        )
-    })?;
-    validate_host_source(path, &native_path).await?;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_no_follow(&mut options);
-    let file = options
-        .open(native_path.as_path())
-        .await
-        .map_err(|error| source_io_error(path, "open source", error))?;
-    let opened_metadata = file
-        .metadata()
-        .await
-        .map_err(|error| source_io_error(path, "inspect opened source", error))?;
-    if is_link_or_reparse_point(&opened_metadata) || !opened_metadata.is_file() {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            "opened workflow source is not a regular, non-reparse file",
-        ));
-    }
-    if opened_metadata.len() > WORKFLOW_SOURCE_MAX_BYTES as u64 {
-        return Err(source_too_large(path));
-    }
-
-    let read_limit = (WORKFLOW_SOURCE_MAX_BYTES + 1) as u64;
-    let mut bytes = Vec::new();
-    file.take(read_limit)
-        .read_to_end(&mut bytes)
-        .await
-        .map_err(|error| source_io_error(path, "read source", error))?;
-    if bytes.len() > WORKFLOW_SOURCE_MAX_BYTES {
-        return Err(source_too_large(path));
-    }
-    validate_host_source(path, &native_path).await?;
-    Ok(bytes)
-}
-
-async fn validate_host_source(
-    path: &PathUri,
-    native_path: &AbsolutePathBuf,
-) -> Result<(), WorkflowSourceLoadError> {
-    let metadata = tokio::fs::symlink_metadata(native_path.as_path())
-        .await
-        .map_err(|error| source_io_error(path, "inspect source", error))?;
-    if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            "workflow source is not a regular, non-symlink file",
-        ));
-    }
-    if metadata.len() > WORKFLOW_SOURCE_MAX_BYTES as u64 {
-        return Err(source_too_large(path));
-    }
-    let canonical = tokio::fs::canonicalize(native_path.as_path())
-        .await
-        .and_then(PathUri::from_host_native_path)
-        .map_err(|error| source_io_error(path, "resolve source", error))?;
-    if canonical != *path {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            format!("workflow source now resolves to {canonical}"),
-        ));
-    }
-    Ok(())
-}
-
 fn source_too_large(path: &PathUri) -> WorkflowSourceLoadError {
     WorkflowSourceLoadError::new(
         path.clone(),
@@ -284,34 +215,6 @@ fn source_too_large(path: &PathUri) -> WorkflowSourceLoadError {
 fn source_io_error(path: &PathUri, action: &str, error: std::io::Error) -> WorkflowSourceLoadError {
     let kind = error.kind();
     WorkflowSourceLoadError::new(path.clone(), format!("failed to {action} ({kind:?})"))
-}
-
-#[cfg(unix)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
-}
-
-#[cfg(windows)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_no_follow(_options: &mut OpenOptions) {}
-
-#[cfg(windows)]
-fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-    metadata.file_type().is_symlink()
-        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(not(windows))]
-fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
-    metadata.file_type().is_symlink()
 }
 
 #[cfg(test)]
