@@ -103,6 +103,9 @@ impl<'de> Deserialize<'de> for NonEmptyString {
 #[serde(transparent)]
 pub struct Capability(NonEmptyString);
 
+/// Enables the version-one Saved-workflow output wire contract.
+pub const SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY: &str = "saved_workflow_output_v1";
+
 impl Capability {
     pub fn new(value: impl Into<String>) -> Result<Self, InvalidIdentifier> {
         NonEmptyString::new(value).map(Self)
@@ -163,6 +166,11 @@ impl CapabilitySet {
 
     pub fn contains(&self, capability: &Capability) -> bool {
         self.0.contains(capability)
+    }
+
+    /// Returns whether this set contains the exact capability name.
+    pub fn contains_name(&self, capability: &str) -> bool {
+        self.0.iter().any(|item| item.as_str() == capability)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &Capability> {

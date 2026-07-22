@@ -20,10 +20,12 @@ use super::HostResponse;
 use super::HostToClient;
 use super::ProtocolVersion;
 use super::RequestId;
+use super::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use super::SessionId;
 use super::SupportedProtocolVersions;
 use super::WireCellId;
 use super::WireContentItem;
+use super::WireExecuteOutputPolicy;
 use super::WireExecuteRequest;
 use super::WireExecuteRequestConversionError;
 use super::WireImageDetail;
@@ -102,6 +104,7 @@ fn execute_request() -> WireExecuteRequest {
             },
         ],
         source: "text('hello');".to_string(),
+        output_policy: WireExecuteOutputPolicy::Ordinary,
         yield_time_ms: Some(25),
         max_output_tokens: Some(100),
     }
@@ -633,14 +636,60 @@ fn execute_output_policy_defaults_to_ordinary_for_older_requests() {
 }
 
 #[test]
-fn saved_output_policy_cannot_silently_degrade_during_wire_conversion() {
+fn saved_output_policy_requires_the_exact_selected_capability() {
     let domain_request = ExecuteRequest {
         output_policy: ExecuteOutputPolicy::SavedWorkflow,
         ..ExecuteRequest::try_from(execute_request()).expect("domain request")
     };
+    let wire_request = WireExecuteRequest {
+        output_policy: WireExecuteOutputPolicy::SavedWorkflow,
+        ..execute_request()
+    };
+    let selected = CapabilitySet::try_new([capability(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)])
+        .expect("selected capability");
+
+    assert_eq!(
+        WireExecuteRequest::try_from_domain(domain_request.clone(), &selected)
+            .expect("capability-aware outbound conversion"),
+        wire_request
+    );
+    assert_eq!(
+        wire_request
+            .clone()
+            .try_into_domain(&selected)
+            .expect("capability-aware inbound conversion"),
+        domain_request
+    );
+    assert_eq!(
+        serde_json::to_value(&wire_request).expect("serialize saved request")["output_policy"],
+        json!("saved_workflow")
+    );
+
+    for unavailable in [
+        CapabilitySet::empty(),
+        CapabilitySet::try_new([capability("saved_workflow_output")])
+            .expect("unversioned capability"),
+        CapabilitySet::try_new([capability("saved_workflow_outputs_v1")])
+            .expect("misspelled capability"),
+        CapabilitySet::try_new([capability("saved_workflow_output_v2")])
+            .expect("different capability version"),
+    ] {
+        assert!(matches!(
+            WireExecuteRequest::try_from_domain(domain_request.clone(), &unavailable),
+            Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+        ));
+        assert!(matches!(
+            wire_request.clone().try_into_domain(&unavailable),
+            Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+        ));
+    }
 
     assert!(matches!(
         WireExecuteRequest::try_from(domain_request),
+        Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
+    ));
+    assert!(matches!(
+        ExecuteRequest::try_from(wire_request),
         Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable)
     ));
 }

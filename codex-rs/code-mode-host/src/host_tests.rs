@@ -1,3 +1,4 @@
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientHello;
@@ -12,8 +13,10 @@ use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WireExecuteOutputPolicy;
 use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::WireResult;
 use pretty_assertions::assert_eq;
@@ -35,12 +38,13 @@ use super::run;
 fn client_hello(
     versions: impl IntoIterator<Item = ProtocolVersion>,
     required_capabilities: CapabilitySet,
+    optional_capabilities: CapabilitySet,
 ) -> ClientToHost {
     ClientToHost::ClientHello(
         ClientHello::new(
             SupportedProtocolVersions::try_new(versions).expect("supported versions"),
             required_capabilities,
-            CapabilitySet::empty(),
+            optional_capabilities,
         )
         .expect("client hello"),
     )
@@ -76,6 +80,7 @@ fn execute_request(source: &str) -> WireExecuteRequest {
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+        output_policy: WireExecuteOutputPolicy::Ordinary,
         yield_time_ms: Some(60_000),
         max_output_tokens: Some(1_000),
     }
@@ -91,7 +96,11 @@ async fn handshake_and_multiple_session_lifecycles_are_ordered() {
     let mut writer = FramedWriter::new(client_writer);
 
     writer
-        .write(&client_hello([ProtocolVersion::V2], CapabilitySet::empty()))
+        .write(&client_hello(
+            [ProtocolVersion::V2],
+            CapabilitySet::empty(),
+            CapabilitySet::empty(),
+        ))
         .await
         .expect("write hello");
     assert_eq!(
@@ -168,7 +177,11 @@ async fn incompatible_or_invalid_handshake_is_rejected() {
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
     writer
-        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
+        .write(&client_hello(
+            [ProtocolVersion::V1],
+            CapabilitySet::empty(),
+            CapabilitySet::empty(),
+        ))
         .await
         .expect("write hello");
     assert_eq!(
@@ -222,6 +235,7 @@ async fn unsupported_required_capability_is_rejected() {
         .write(&client_hello(
             [ProtocolVersion::V2],
             CapabilitySet::try_new([capability.clone()]).expect("capabilities"),
+            CapabilitySet::empty(),
         ))
         .await
         .expect("write hello");
@@ -235,6 +249,70 @@ async fn unsupported_required_capability_is_rejected() {
 }
 
 #[tokio::test]
+async fn saved_output_capability_remains_unselected_and_unavailable() {
+    let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 2048);
+    let (host_reader, host_writer) = tokio::io::split(host_stream);
+    let (client_reader, client_writer) = tokio::io::split(client_stream);
+    let host = tokio::spawn(run(host_reader, host_writer));
+    let mut reader = FramedReader::new(client_reader);
+    let mut writer = FramedWriter::new(client_writer);
+    let optional_capabilities =
+        CapabilitySet::try_new([
+            Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY).expect("saved output capability")
+        ])
+        .expect("optional capabilities");
+
+    writer
+        .write(&client_hello(
+            [ProtocolVersion::V2],
+            CapabilitySet::empty(),
+            optional_capabilities,
+        ))
+        .await
+        .expect("write hello");
+    assert_eq!(
+        reader.read::<HostToClient>().await.expect("read hello"),
+        Some(HostToClient::HostHello(HostHello::new(
+            ProtocolVersion::V2,
+            CapabilitySet::empty(),
+        )))
+    );
+
+    let id = request_id(/*value*/ 1);
+    writer
+        .write(&ClientToHost::Request {
+            id,
+            request: HostRequest::Execute {
+                session_id: session_id("missing-session"),
+                request: WireExecuteRequest {
+                    output_policy: WireExecuteOutputPolicy::SavedWorkflow,
+                    ..execute_request("text('must not run');")
+                },
+            },
+        })
+        .await
+        .expect("write unavailable execute");
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("read unavailable execute"),
+        Some(HostToClient::Response {
+            id,
+            result: WireResult::Err {
+                message: format!(
+                    "invalid code-mode execute request: {SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE}"
+                ),
+            },
+        })
+    );
+
+    drop(writer);
+    drop(reader);
+    host.await.expect("host task").expect("host connection");
+}
+
+#[tokio::test]
 async fn session_id_cannot_be_reused_after_shutdown() {
     let (host_stream, client_stream) = tokio::io::duplex(/*max_buf_size*/ 2048);
     let (host_reader, host_writer) = tokio::io::split(host_stream);
@@ -243,7 +321,11 @@ async fn session_id_cannot_be_reused_after_shutdown() {
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
     writer
-        .write(&client_hello([ProtocolVersion::V2], CapabilitySet::empty()))
+        .write(&client_hello(
+            [ProtocolVersion::V2],
+            CapabilitySet::empty(),
+            CapabilitySet::empty(),
+        ))
         .await
         .expect("write hello");
     reader
