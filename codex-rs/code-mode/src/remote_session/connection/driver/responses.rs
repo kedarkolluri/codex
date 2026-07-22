@@ -1,4 +1,5 @@
 use codex_code_mode_protocol::RuntimeResponse;
+use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::ClientToHost;
@@ -417,11 +418,17 @@ impl ConnectionDriver {
         admission: AdmissionOutcome,
     ) -> bool {
         let _ = response_tx.send(response);
-        if admission == AdmissionOutcome::Rejected {
-            self.fail(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string());
-            return false;
+        match admission {
+            AdmissionOutcome::Admitted => true,
+            AdmissionOutcome::ExecutionFailed => {
+                self.fail(SAVED_WORKFLOW_EXECUTION_FAILED.to_string());
+                false
+            }
+            AdmissionOutcome::Rejected => {
+                self.fail(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string());
+                false
+            }
         }
-        true
     }
 
     fn fail_admitted<T>(
@@ -430,15 +437,9 @@ impl ConnectionDriver {
         reason: String,
         output_admission: &RemoteOutputAdmission,
     ) -> bool {
-        let saved = output_admission.is_saved();
-        let (visible_reason, _) = output_admission.admit_error(reason.clone());
-        let failure_reason = if saved {
-            visible_reason.clone()
-        } else {
-            reason
-        };
-        let _ = response_tx.send(Err(visible_reason));
-        self.fail(failure_reason);
+        let (visible_reason, _) = output_admission.admit_fatal_error(reason);
+        let _ = response_tx.send(Err(visible_reason.clone()));
+        self.fail(visible_reason);
         false
     }
 }

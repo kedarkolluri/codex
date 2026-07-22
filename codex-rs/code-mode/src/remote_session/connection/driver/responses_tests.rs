@@ -10,6 +10,7 @@ use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::WORKFLOW_OUTPUT_ITEM_MAX_BYTES;
+use codex_code_mode_protocol::WORKFLOW_OUTPUT_MAX_BYTES;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
 use codex_code_mode_protocol::host::HostResponse;
@@ -36,6 +37,7 @@ use super::super::DriverEvent;
 use super::super::DriverLifecycle;
 use super::super::RemoteSession;
 use super::super::SessionCleanup;
+use super::super::output_admission::AdmissionOutcome;
 use super::super::output_admission::RemoteOutputAdmission;
 use super::super::types::CancellableRequest;
 use super::super::types::DeliveredExecute;
@@ -64,9 +66,32 @@ fn direct_driver() -> (ConnectionDriver, Arc<AtomicBool>) {
     (driver, alive)
 }
 
-fn insert_saved_execute(
+fn saved_admission() -> RemoteOutputAdmission {
+    RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow)
+}
+
+fn full_saved_admission() -> RemoteOutputAdmission {
+    let admission = saved_admission();
+    let mut response = RuntimeResponse::Yielded {
+        cell_id: CellId::new("full".to_string()),
+        content_items: (0..WORKFLOW_OUTPUT_MAX_BYTES / WORKFLOW_OUTPUT_ITEM_MAX_BYTES)
+            .map(|_| WireContentItem::InputText {
+                text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 2),
+            })
+            .map(Into::into)
+            .collect(),
+    };
+    assert_eq!(
+        admission.admit_response(&mut response),
+        super::super::output_admission::AdmissionOutcome::Admitted
+    );
+    admission
+}
+
+fn insert_execute(
     driver: &mut ConnectionDriver,
     request_id: RequestId,
+    output_admission: RemoteOutputAdmission,
 ) -> oneshot::Receiver<Result<DeliveredExecute, String>> {
     let (response_tx, response_rx) = oneshot::channel();
     let (initial_response_tx, initial_response_rx) = oneshot::channel();
@@ -81,7 +106,7 @@ fn insert_saved_execute(
             response_tx,
             initial_response_tx,
             initial_response_rx,
-            output_admission: RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow),
+            output_admission,
             cancellation: CancellableRequest::new(CancellationToken::new()),
         },
         &event_tx,
@@ -89,10 +114,11 @@ fn insert_saved_execute(
     response_rx
 }
 
-fn insert_saved_initial(
+fn insert_initial(
     driver: &mut ConnectionDriver,
     request_id: RequestId,
     cell_id: &str,
+    output_admission: RemoteOutputAdmission,
 ) -> oneshot::Receiver<Result<RuntimeResponse, String>> {
     let (response_tx, response_rx) = oneshot::channel();
     driver.requests.insert_initial_response(
@@ -100,7 +126,7 @@ fn insert_saved_initial(
         InitialResponse {
             generation: 1,
             cell_id: WireCellId::try_new(cell_id).expect("cell ID"),
-            output_admission: RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow),
+            output_admission,
             response_tx,
         },
     );
@@ -238,11 +264,22 @@ async fn invalid_typed_host_cell_id_fails_connection_and_pending_request() {
 #[tokio::test]
 async fn saved_driver_errors_are_redacted_before_delivery_and_failure() {
     let (mut driver, alive) = direct_driver();
-    let raw_execute_rx = insert_saved_execute(&mut driver, RequestId::new(/*value*/ 1));
-    let raw_rx = insert_saved_initial(&mut driver, RequestId::new(/*value*/ 2), "raw");
-    let pending_execute_rx = insert_saved_execute(&mut driver, RequestId::new(/*value*/ 4));
-    let pending_initial_rx =
-        insert_saved_initial(&mut driver, RequestId::new(/*value*/ 5), "pending");
+    let raw_execute_rx =
+        insert_execute(&mut driver, RequestId::new(/*value*/ 1), saved_admission());
+    let raw_rx = insert_initial(
+        &mut driver,
+        RequestId::new(/*value*/ 2),
+        "raw",
+        saved_admission(),
+    );
+    let pending_execute_rx =
+        insert_execute(&mut driver, RequestId::new(/*value*/ 4), saved_admission());
+    let pending_initial_rx = insert_initial(
+        &mut driver,
+        RequestId::new(/*value*/ 5),
+        "pending",
+        saved_admission(),
+    );
     assert!(driver.handle_host_message(HostToClient::Response {
         id: RequestId::new(/*value*/ 1),
         result: WireResult::Err {
@@ -277,7 +314,19 @@ async fn saved_driver_errors_are_redacted_before_delivery_and_failure() {
     assert!(!alive.load(Ordering::Acquire));
 
     let (mut driver, alive) = direct_driver();
-    let invalid_execute_rx = insert_saved_execute(&mut driver, RequestId::new(/*value*/ 3));
+    let invalid_execute_rx =
+        insert_execute(&mut driver, RequestId::new(/*value*/ 3), saved_admission());
+    let pending_execute_rx = insert_execute(
+        &mut driver,
+        RequestId::new(/*value*/ 4),
+        full_saved_admission(),
+    );
+    let pending_initial_rx = insert_initial(
+        &mut driver,
+        RequestId::new(/*value*/ 5),
+        "pending",
+        full_saved_admission(),
+    );
     assert!(!driver.handle_host_message(HostToClient::Response {
         id: RequestId::new(/*value*/ 3),
         result: WireResult::Ok {
@@ -291,6 +340,15 @@ async fn saved_driver_errors_are_redacted_before_delivery_and_failure() {
         panic!("invalid execute response should not start a cell");
     };
     assert_eq!(invalid_execute_error, SAVED_WORKFLOW_EXECUTION_FAILED);
+    let Err(pending_execute_error) = pending_execute_rx.await.expect("pending execute failure")
+    else {
+        panic!("connection failure should not start a pending cell");
+    };
+    assert_eq!(pending_execute_error, SAVED_WORKFLOW_EXECUTION_FAILED);
+    assert_eq!(
+        pending_initial_rx.await.expect("pending initial failure"),
+        Err(SAVED_WORKFLOW_EXECUTION_FAILED.to_string())
+    );
     assert!(!alive.load(Ordering::Acquire));
     assert_eq!(
         driver.failure.lock().expect("failure lock").as_deref(),
@@ -303,7 +361,7 @@ async fn rejected_saved_initial_response_is_delivered_before_connection_failure(
     let (mut driver, alive) = direct_driver();
     let request_id = RequestId::new(/*value*/ 1);
     let cell_id = WireCellId::try_new("cell").expect("cell ID");
-    let response_rx = insert_saved_initial(&mut driver, request_id, "cell");
+    let response_rx = insert_initial(&mut driver, request_id, "cell", saved_admission());
     assert!(!driver.handle_host_message(HostToClient::InitialResponse {
         id: request_id,
         result: WireResult::Ok {
@@ -324,4 +382,45 @@ async fn rejected_saved_initial_response_is_delivered_before_connection_failure(
         })
     );
     assert!(!alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn execution_failed_saved_initial_response_is_delivered_before_connection_failure() {
+    let (mut driver, alive) = direct_driver();
+    let request_id = RequestId::new(/*value*/ 1);
+    let admission = saved_admission();
+    let sibling = admission.clone();
+    assert_eq!(
+        admission.admit_fatal_error("private fatal detail".to_string()),
+        (
+            SAVED_WORKFLOW_EXECUTION_FAILED.to_string(),
+            AdmissionOutcome::ExecutionFailed
+        )
+    );
+    let response_rx = insert_initial(&mut driver, request_id, "cell", sibling);
+
+    assert!(!driver.handle_host_message(HostToClient::InitialResponse {
+        id: request_id,
+        result: WireResult::Ok {
+            value: WireRuntimeResponse::Yielded {
+                cell_id: WireCellId::try_new("cell").expect("cell ID"),
+                content_items: vec![WireContentItem::InputText {
+                    text: "must not escape".to_string(),
+                }],
+            },
+        },
+    }));
+    assert_eq!(
+        response_rx.await.expect("initial response"),
+        Ok(RuntimeResponse::Result {
+            cell_id: CellId::new("cell".to_string()),
+            content_items: Vec::new(),
+            error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
+        })
+    );
+    assert!(!alive.load(Ordering::Acquire));
+    assert_eq!(
+        driver.failure.lock().expect("failure lock").as_deref(),
+        Some(SAVED_WORKFLOW_EXECUTION_FAILED)
+    );
 }
