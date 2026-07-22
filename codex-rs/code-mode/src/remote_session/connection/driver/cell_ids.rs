@@ -1,7 +1,6 @@
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::WaitOutcome;
-use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
@@ -10,7 +9,6 @@ use codex_code_mode_protocol::host::WireCellId;
 use codex_code_mode_protocol::host::WireResult;
 use codex_code_mode_protocol::host::WireRuntimeResponse;
 use codex_code_mode_protocol::host::WireWaitOutcome;
-use codex_code_mode_protocol::host::WireWaitRequest;
 
 use super::RemoteSession;
 
@@ -41,16 +39,6 @@ pub(super) fn remote_cell_id(
         ));
     };
     WireCellId::try_new(remote_id).map_err(|err| err.to_string())
-}
-
-pub(super) fn remote_wait_request(
-    session: &RemoteSession,
-    request: WaitRequest,
-) -> Result<WireWaitRequest, String> {
-    Ok(WireWaitRequest {
-        cell_id: remote_cell_id(session, &request.cell_id)?,
-        yield_time_ms: request.yield_time_ms,
-    })
 }
 
 pub(super) fn public_runtime_response(

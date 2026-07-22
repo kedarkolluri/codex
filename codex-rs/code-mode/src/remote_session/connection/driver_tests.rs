@@ -63,6 +63,7 @@ impl DriverHarness {
             event_rx,
             event_tx.clone(),
             outgoing_tx,
+            crate::remote_session::connection::handshake::NegotiatedCapabilities::default(),
             DriverLifecycle {
                 alive: Arc::clone(&alive),
                 failure: Arc::new(StdMutex::new(None)),
