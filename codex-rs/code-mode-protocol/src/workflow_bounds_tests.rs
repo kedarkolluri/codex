@@ -85,82 +85,181 @@ fn exported_text_validators_apply_their_exact_contracts() {
     assert_bound("workflow log message", WORKFLOW_LOG_MESSAGE_MAX_BYTES, log);
 }
 
-#[test]
-fn workflow_output_bounds_admit_chunks_transactionally() {
-    let mut bounds = WorkflowOutputBounds::default();
-    let first = [FunctionCallOutputContentItem::InputText {
-        text: "first".to_string(),
-    }];
-    assert_eq!(bounds.admit(&first), Ok(()));
-    let first_bytes = "first".len() + 2;
+fn text_item_with_serialized_len(serialized_bytes: usize) -> FunctionCallOutputContentItem {
+    FunctionCallOutputContentItem::InputText {
+        text: escaped_string_with_serialized_len(serialized_bytes),
+    }
+}
 
-    let image_url = "data:image/png;base64,YQ==";
-    let audio_url = "data:audio/wav;base64,YQ==";
-    let media = [
-        FunctionCallOutputContentItem::InputImage {
-            image_url: image_url.to_string(),
-            detail: None,
-        },
-        FunctionCallOutputContentItem::InputAudio {
-            audio_url: audio_url.to_string(),
-        },
-    ];
-    assert_eq!(bounds.admit(&media), Ok(()));
-    let admitted = WorkflowOutputBounds {
-        item_count: 3,
-        serialized_bytes: first_bytes + image_url.len() + audio_url.len() + 4,
-    };
-
-    let oversized_chunk = [
-        FunctionCallOutputContentItem::InputText {
-            text: "must not commit".to_string(),
-        },
-        FunctionCallOutputContentItem::InputAudio {
-            audio_url: "x".repeat(WORKFLOW_OUTPUT_MAX_BYTES),
-        },
-    ];
-    let error = bounds
-        .admit(&oversized_chunk)
-        .expect_err("a later oversized item must reject the entire chunk");
-    assert_eq!(error, output_byte_limit_error());
+fn assert_authored_payload_boundary(make_item: impl Fn(String) -> FunctionCallOutputContentItem) {
+    let exact_item = [make_item(escaped_string_with_serialized_len(
+        WORKFLOW_OUTPUT_ITEM_MAX_BYTES,
+    ))];
+    let mut exact = WorkflowOutputBounds::default();
+    assert_eq!(exact.admit(&exact_item), Ok(()));
     assert_eq!(
-        bounds, admitted,
-        "a rejected chunk must not partially mutate aggregate accounting"
+        exact,
+        WorkflowOutputBounds {
+            item_count: 1,
+            serialized_bytes: WORKFLOW_OUTPUT_ITEM_MAX_BYTES,
+        }
     );
+
+    let oversized_item = [make_item(escaped_string_with_serialized_len(
+        WORKFLOW_OUTPUT_ITEM_MAX_BYTES + 1,
+    ))];
+    let mut oversized = WorkflowOutputBounds::default();
+    assert_eq!(
+        oversized.admit(&oversized_item),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(oversized, WorkflowOutputBounds::default());
 }
 
 #[test]
-fn workflow_output_bounds_enforce_exact_payload_and_item_caps() {
-    let exact_payload = [FunctionCallOutputContentItem::InputText {
-        text: escaped_string_with_serialized_len(WORKFLOW_OUTPUT_MAX_BYTES),
-    }];
+fn workflow_output_per_item_bound_covers_text_image_and_audio_payloads() {
+    assert_authored_payload_boundary(|text| FunctionCallOutputContentItem::InputText { text });
+    assert_authored_payload_boundary(|image_url| FunctionCallOutputContentItem::InputImage {
+        image_url,
+        detail: Some(crate::ImageDetail::Original),
+    });
+    assert_authored_payload_boundary(|audio_url| FunctionCallOutputContentItem::InputAudio {
+        audio_url,
+    });
+}
+
+#[test]
+fn workflow_output_per_item_bound_covers_terminal_errors() {
+    let exact_error = escaped_string_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES);
     let mut exact = WorkflowOutputBounds::default();
-    assert_eq!(exact.admit(&exact_payload), Ok(()));
-    let exact_full = WorkflowOutputBounds {
-        item_count: 1,
-        serialized_bytes: WORKFLOW_OUTPUT_MAX_BYTES,
+    assert_eq!(exact.admit_response(&[], Some(&exact_error)), Ok(()));
+    assert_eq!(
+        exact,
+        WorkflowOutputBounds {
+            item_count: 1,
+            serialized_bytes: WORKFLOW_OUTPUT_ITEM_MAX_BYTES,
+        }
+    );
+
+    let oversized_error = escaped_string_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES + 1);
+    let mut oversized = WorkflowOutputBounds::default();
+    assert_eq!(
+        oversized.admit_response(&[], Some(&oversized_error)),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(oversized, WorkflowOutputBounds::default());
+}
+
+#[test]
+fn workflow_output_bounds_enforce_the_aggregate_lifetime_cap() {
+    let exact_item_count = WORKFLOW_OUTPUT_MAX_BYTES / WORKFLOW_OUTPUT_ITEM_MAX_BYTES;
+    let exact_items =
+        vec![text_item_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES); exact_item_count];
+    let mut exact = WorkflowOutputBounds::default();
+    assert_eq!(exact.admit(&exact_items), Ok(()));
+    assert_eq!(
+        exact,
+        WorkflowOutputBounds {
+            item_count: exact_item_count,
+            serialized_bytes: WORKFLOW_OUTPUT_MAX_BYTES,
+        }
+    );
+
+    let mut exact_with_error = WorkflowOutputBounds::default();
+    assert_eq!(
+        exact_with_error.admit(&exact_items[..exact_item_count - 1]),
+        Ok(())
+    );
+    let exact_error = escaped_string_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES);
+    assert_eq!(
+        exact_with_error.admit_response(&[], Some(&exact_error)),
+        Ok(())
+    );
+    assert_eq!(
+        exact_with_error,
+        WorkflowOutputBounds {
+            item_count: exact_item_count,
+            serialized_bytes: WORKFLOW_OUTPUT_MAX_BYTES,
+        }
+    );
+
+    let mut one_under_items =
+        vec![text_item_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES); exact_item_count - 1];
+    one_under_items.push(text_item_with_serialized_len(
+        WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 1,
+    ));
+    let mut one_under = WorkflowOutputBounds::default();
+    assert_eq!(one_under.admit(&one_under_items), Ok(()));
+    let admitted = WorkflowOutputBounds {
+        item_count: exact_item_count,
+        serialized_bytes: WORKFLOW_OUTPUT_MAX_BYTES - 1,
     };
-    assert_eq!(exact, exact_full);
+    assert_eq!(one_under, admitted);
 
-    let overflow = [FunctionCallOutputContentItem::InputText {
-        text: String::new(),
-    }];
-    assert_eq!(exact.admit(&overflow), Err(output_byte_limit_error()));
-    assert_eq!(exact, exact_full);
+    let one_byte_over = [text_item_with_serialized_len(2)];
+    assert_eq!(
+        one_under.admit(&one_byte_over),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(one_under, admitted);
+    assert_eq!(
+        one_under.admit_response(&[], Some("")),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(one_under, admitted);
+}
 
-    let items = vec![
-        FunctionCallOutputContentItem::InputText {
-            text: String::new(),
-        };
-        WORKFLOW_OUTPUT_MAX_ITEMS
-    ];
-    let mut count = WorkflowOutputBounds::default();
-    assert_eq!(count.admit(&items), Ok(()));
-    let count_full = WorkflowOutputBounds {
+#[test]
+fn workflow_output_item_cap_counts_terminal_errors() {
+    let empty_items = vec![text_item_with_serialized_len(2); WORKFLOW_OUTPUT_MAX_ITEMS - 1];
+    let mut bounds = WorkflowOutputBounds::default();
+    assert_eq!(bounds.admit_response(&empty_items, Some("")), Ok(()));
+    let full = WorkflowOutputBounds {
         item_count: WORKFLOW_OUTPUT_MAX_ITEMS,
         serialized_bytes: WORKFLOW_OUTPUT_MAX_ITEMS * 2,
     };
-    assert_eq!(count, count_full);
-    assert_eq!(count.admit(&overflow), Err(output_item_limit_error()));
-    assert_eq!(count, count_full);
+    assert_eq!(bounds, full);
+
+    assert_eq!(
+        bounds.admit_response(&[], Some("")),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(bounds, full);
+}
+
+#[test]
+fn workflow_output_later_item_and_error_failures_are_transactional() {
+    let first = [FunctionCallOutputContentItem::InputText {
+        text: "first".to_string(),
+    }];
+    let mut item_bounds = WorkflowOutputBounds::default();
+    assert_eq!(item_bounds.admit(&first), Ok(()));
+    let admitted = WorkflowOutputBounds {
+        item_count: 1,
+        serialized_bytes: "first".len() + 2,
+    };
+    assert_eq!(item_bounds, admitted);
+
+    let later_oversized_item = [
+        text_item_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES),
+        text_item_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES + 1),
+    ];
+    assert_eq!(
+        item_bounds.admit(&later_oversized_item),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(item_bounds, admitted);
+
+    let response_item = [text_item_with_serialized_len(
+        WORKFLOW_OUTPUT_ITEM_MAX_BYTES,
+    )];
+    let oversized_error = escaped_string_with_serialized_len(WORKFLOW_OUTPUT_ITEM_MAX_BYTES + 1);
+    let mut error_bounds = WorkflowOutputBounds::default();
+    assert_eq!(error_bounds.admit(&first), Ok(()));
+    assert_eq!(error_bounds, admitted);
+    assert_eq!(
+        error_bounds.admit_response(&response_item, Some(&oversized_error)),
+        Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
+    );
+    assert_eq!(error_bounds, admitted);
 }
