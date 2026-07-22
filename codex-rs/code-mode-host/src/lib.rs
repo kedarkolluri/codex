@@ -11,8 +11,11 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use codex_code_mode::InProcessCodeModeSession;
+use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::host::Capability;
 use codex_code_mode_protocol::host::CapabilitySet;
 use codex_code_mode_protocol::host::ClientToHost;
+use codex_code_mode_protocol::host::DecodedWireExecuteRequest;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
@@ -23,8 +26,12 @@ use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::ProtocolVersion;
 use codex_code_mode_protocol::host::RequestId;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
+use codex_code_mode_protocol::host::WireCellId;
+use codex_code_mode_protocol::host::WireExecuteCellIdentity;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::Semaphore;
@@ -57,9 +64,9 @@ where
 {
     let mut reader = FramedReader::new(reader);
     let mut writer = FramedWriter::new(writer);
-    if !negotiate(&mut reader, &mut writer).await? {
+    let Some(selected_capabilities) = negotiate(&mut reader, &mut writer).await? else {
         return Ok(());
-    }
+    };
 
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<EncodedFrame>(/*max_capacity*/ 128);
     let peer = Arc::new(HostPeer::new(outgoing_tx));
@@ -70,6 +77,7 @@ where
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        selected_capabilities,
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
     });
@@ -158,7 +166,10 @@ where
     Ok(())
 }
 
-async fn negotiate<R, W>(reader: &mut FramedReader<R>, writer: &mut FramedWriter<W>) -> Result<bool>
+async fn negotiate<R, W>(
+    reader: &mut FramedReader<R>,
+    writer: &mut FramedWriter<W>,
+) -> Result<Option<CapabilitySet>>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -168,7 +179,7 @@ where
         .await
         .context("failed to read code-mode client hello")?
     else {
-        return Ok(false);
+        return Ok(None);
     };
     let ClientToHost::ClientHello(client_hello) = first_message else {
         writer
@@ -179,7 +190,7 @@ where
             })
             .await
             .context("failed to reject invalid code-mode client hello")?;
-        return Ok(false);
+        return Ok(None);
     };
 
     let supported_versions = SupportedProtocolVersions::try_new([ProtocolVersion::V2])?;
@@ -193,10 +204,23 @@ where
             })
             .await
             .context("failed to reject incompatible code-mode client")?;
-        return Ok(false);
+        return Ok(None);
     }
 
-    let host_capabilities = CapabilitySet::empty();
+    let offers_capability = |name| {
+        client_hello.required_capabilities().contains_name(name)
+            || client_hello.optional_capabilities().contains_name(name)
+    };
+    let host_capabilities = if offers_capability(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
+        && offers_capability(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)
+    {
+        CapabilitySet::try_new([
+            Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)?,
+            Capability::new(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)?,
+        ])?
+    } else {
+        CapabilitySet::empty()
+    };
     if let Some(capability) = client_hello
         .required_capabilities()
         .iter()
@@ -210,17 +234,17 @@ where
             })
             .await
             .context("failed to reject unsupported code-mode capability")?;
-        return Ok(false);
+        return Ok(None);
     }
 
     writer
         .write(&HostToClient::HostHello(HostHello::new(
             ProtocolVersion::V2,
-            host_capabilities,
+            host_capabilities.clone(),
         )))
         .await
         .context("failed to write code-mode host hello")?;
-    Ok(true)
+    Ok(Some(host_capabilities))
 }
 
 struct HostState {
@@ -230,6 +254,7 @@ struct HostState {
     request_tasks: TaskTracker,
     request_permits: Arc<Semaphore>,
     active_cell_permits: Arc<Semaphore>,
+    selected_capabilities: CapabilitySet,
     closing: AtomicBool,
     peer: Arc<HostPeer>,
 }
@@ -302,7 +327,10 @@ impl HostState {
                     self.respond(request_id, Err("code-mode request cancelled".to_string()));
                     return;
                 }
-                let request = match request.try_into() {
+                let DecodedWireExecuteRequest {
+                    request,
+                    cell_identity,
+                } = match request.try_into_domain(&self.selected_capabilities) {
                     Ok(request) => request,
                     Err(err) => {
                         self.respond(
@@ -328,7 +356,15 @@ impl HostState {
                     );
                     return;
                 };
-                let result = session.execute(request).await;
+                let result = match cell_identity {
+                    WireExecuteCellIdentity::HostAllocated => session.execute(request).await,
+                    WireExecuteCellIdentity::SavedWorkflow(workflow_cell_id) => {
+                        let cell_id = CellId::from(WireCellId::from(workflow_cell_id));
+                        session
+                            .execute_saved_workflow_with_cell_id(cell_id, request)
+                            .await
+                    }
+                };
                 match result {
                     Ok(started) => {
                         let cell_id = started.cell_id.clone();

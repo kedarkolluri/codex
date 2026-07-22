@@ -83,13 +83,21 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             return Err(Error::ShuttingDown);
         }
         let cell_id = self.allocate_cell_id()?;
-        let initial_event = self
-            .start_cell(cell_id.clone(), request, initial_observe_mode)
-            .await?;
-        Ok(StartedCell {
-            cell_id,
-            initial_event,
-        })
+        self.start_cell(cell_id, request, initial_observe_mode)
+            .await
+    }
+
+    pub(crate) async fn execute_with_cell_id(
+        &self,
+        cell_id: CellId,
+        request: CreateCellRequest,
+        initial_observe_mode: ObserveMode,
+    ) -> Result<StartedCell, Error> {
+        if self.inner.shutdown_token.is_cancelled() {
+            return Err(Error::ShuttingDown);
+        }
+        self.start_cell(cell_id, request, initial_observe_mode)
+            .await
     }
 
     pub(crate) async fn observe(
@@ -159,7 +167,7 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
         cell_id: CellId,
         request: CreateCellRequest,
         initial_observe_mode: ObserveMode,
-    ) -> Result<RuntimeEventFuture, Error> {
+    ) -> Result<StartedCell, Error> {
         let output_policy = request.output_policy;
         let stored_values = match output_policy {
             OutputPolicy::Ordinary => self.inner.stored_values.lock().await.clone(),
@@ -200,7 +208,10 @@ impl<D: SessionRuntimeDelegate> SessionRuntime<D> {
             });
         }
         drop(cells);
-        Ok(map_actor_event(cell_id, initial_event))
+        Ok(StartedCell {
+            cell_id: cell_id.clone(),
+            initial_event: map_actor_event(cell_id, initial_event),
+        })
     }
 
     fn begin_shutdown(&self) {

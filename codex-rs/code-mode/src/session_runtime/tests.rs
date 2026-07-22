@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use pretty_assertions::assert_eq;
 use serde_json::Value as JsonValue;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use super::*;
@@ -16,6 +17,47 @@ use crate::cell_actor::CompletionCommit;
 struct RecordingDelegate;
 
 struct PanickingClosedDelegate;
+
+#[derive(Debug, Eq, PartialEq)]
+enum CellCallback {
+    Tool(CellId),
+    Notification(CellId),
+    Closed(CellId),
+}
+
+struct CellCallbackDelegate {
+    callbacks_tx: mpsc::UnboundedSender<CellCallback>,
+}
+
+impl SessionRuntimeDelegate for CellCallbackDelegate {
+    async fn invoke_tool(
+        &self,
+        invocation: NestedToolCall,
+        _cancellation_token: CancellationToken,
+    ) -> Result<JsonValue, String> {
+        let _ = self
+            .callbacks_tx
+            .send(CellCallback::Tool(invocation.cell_id));
+        Ok(JsonValue::Null)
+    }
+
+    async fn notify(
+        &self,
+        _call_id: String,
+        cell_id: CellId,
+        _text: String,
+        _cancellation_token: CancellationToken,
+    ) -> Result<(), String> {
+        let _ = self.callbacks_tx.send(CellCallback::Notification(cell_id));
+        Ok(())
+    }
+
+    fn cell_closed(&self, cell_id: &CellId) {
+        let _ = self
+            .callbacks_tx
+            .send(CellCallback::Closed(cell_id.clone()));
+    }
+}
 
 impl SessionRuntimeDelegate for RecordingDelegate {
     async fn invoke_tool(
@@ -197,6 +239,99 @@ async fn cell_id_allocation_fails_before_wrapping() {
             .err(),
         Some(Error::CellIdSpaceExhausted)
     );
+}
+
+#[tokio::test]
+async fn supplied_cell_id_preserves_allocator_and_duplicate_rejection() {
+    let runtime = SessionRuntime::new(Arc::new(RecordingDelegate));
+    let supplied_cell_id = CellId::new("wf:1:0123456789abcdef0123456789abcdef:1");
+    let observe_mode = ObserveMode::YieldAfter(Duration::from_millis(/*millis*/ 1));
+    let supplied = runtime
+        .execute_with_cell_id(
+            supplied_cell_id.clone(),
+            execute_request("await new Promise(() => {});"),
+            observe_mode,
+        )
+        .await
+        .expect("start supplied cell");
+
+    assert_eq!(supplied.cell_id, supplied_cell_id);
+    assert_eq!(
+        supplied.initial_event().await,
+        Ok(CellEvent::Yielded {
+            content_items: Vec::new(),
+        })
+    );
+    assert_eq!(
+        runtime
+            .execute_with_cell_id(
+                supplied_cell_id.clone(),
+                execute_request(r#"text("duplicate");"#),
+                observe_mode,
+            )
+            .await
+            .err(),
+        Some(Error::DuplicateCell(supplied_cell_id.clone()))
+    );
+    let allocated = runtime
+        .execute(execute_request(r#"text("allocated");"#), observe_mode)
+        .await
+        .expect("start allocated cell");
+    assert_eq!(allocated.cell_id, CellId::new("1"));
+    runtime.shutdown().await.expect("shutdown runtime");
+}
+
+#[tokio::test]
+async fn supplied_cell_id_is_installed_before_cell_callbacks_start() {
+    let (callbacks_tx, mut callbacks_rx) = mpsc::unbounded_channel();
+    let runtime = SessionRuntime::new(Arc::new(CellCallbackDelegate { callbacks_tx }));
+    let cell_id = CellId::new("wf:1:0123456789abcdef0123456789abcdef:1");
+    let started = runtime
+        .execute_with_cell_id(
+            cell_id.clone(),
+            CreateCellRequest {
+                tool_call_id: "call-1".to_string(),
+                enabled_tools: vec![ToolDefinition {
+                    name: "echo".to_string(),
+                    tool_name: ToolName {
+                        name: "echo".to_string(),
+                        namespace: None,
+                    },
+                    description: String::new(),
+                    kind: ToolKind::Function,
+                }],
+                source: r#"await tools.echo({}); notify("done"); text("done");"#.to_string(),
+                output_policy: OutputPolicy::Ordinary,
+            },
+            ObserveMode::YieldAfter(Duration::from_secs(/*secs*/ 1)),
+        )
+        .await
+        .expect("start supplied cell");
+
+    assert_eq!(started.cell_id, cell_id);
+    assert_eq!(
+        started.initial_event().await,
+        Ok(CellEvent::Completed {
+            content_items: vec![OutputItem::Text {
+                text: "done".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+    for expected in [
+        CellCallback::Tool(cell_id.clone()),
+        CellCallback::Notification(cell_id.clone()),
+        CellCallback::Closed(cell_id),
+    ] {
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(/*secs*/ 1), callbacks_rx.recv())
+                .await
+                .expect("cell callback timeout")
+                .expect("cell callback channel closed"),
+            expected
+        );
+    }
+    runtime.shutdown().await.expect("shutdown runtime");
 }
 
 #[tokio::test]
