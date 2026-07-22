@@ -30,6 +30,8 @@ pub const ENVIRONMENT_INFO_METHOD: &str = "environment/info";
 pub const ENVIRONMENT_STATUS_METHOD: &str = "environment/status";
 pub const FS_READ_FILE_METHOD: &str = "fs/readFile";
 pub const FS_OPEN_METHOD: &str = "fs/open";
+/// Opens a bounded immutable file capture verified by the executor that owns the path.
+pub const FS_OPEN_VERIFIED_METHOD: &str = "fs/openVerified";
 pub const FS_READ_BLOCK_METHOD: &str = "fs/readBlock";
 pub const FS_CLOSE_METHOD: &str = "fs/close";
 pub const FS_WRITE_FILE_METHOD: &str = "fs/writeFile";
@@ -321,6 +323,24 @@ pub struct FsOpenParams {
 #[serde(rename_all = "camelCase")]
 pub struct FsOpenResponse {
     pub handle_id: String,
+}
+
+/// Request to capture one bounded file through the executor-local filesystem authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsOpenVerifiedParams {
+    pub handle_id: String,
+    pub path: PathUri,
+    pub max_bytes: u64,
+    pub sandbox: Option<FileSystemSandboxContext>,
+}
+
+/// Handle and exact byte length for an immutable executor-verified capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FsOpenVerifiedResponse {
+    pub handle_id: String,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,6 +753,8 @@ mod tests {
     use super::EnvironmentInfo;
     use super::ExecExitedNotification;
     use super::ExecParams;
+    use super::FsOpenVerifiedParams;
+    use super::FsOpenVerifiedResponse;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
     use super::ProcessId;
@@ -868,6 +890,41 @@ mod tests {
             "sandbox": native_path_sandbox,
         }))
         .expect_err("native absolute sandbox cwd should not deserialize as a URI");
+    }
+
+    #[test]
+    fn verified_file_open_uses_bounded_camel_case_wire_fields() {
+        let params = FsOpenVerifiedParams {
+            handle_id: "capture-1".to_string(),
+            path: PathUri::parse("file:///workspace/workflow.js").expect("workflow URI"),
+            max_bytes: 1_048_576,
+            sandbox: None,
+        };
+
+        let encoded = serde_json::to_value(&params).expect("serialize verified open params");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "handleId": "capture-1",
+                "path": "file:///workspace/workflow.js",
+                "maxBytes": 1_048_576,
+                "sandbox": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<FsOpenVerifiedParams>(encoded)
+                .expect("deserialize verified open params"),
+            params
+        );
+
+        let response = FsOpenVerifiedResponse {
+            handle_id: "capture-1".to_string(),
+            size: 37,
+        };
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize verified open response"),
+            serde_json::json!({"handleId": "capture-1", "size": 37})
+        );
     }
 
     #[test]

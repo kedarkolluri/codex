@@ -65,6 +65,7 @@ use crate::protocol::FS_COPY_METHOD;
 use crate::protocol::FS_CREATE_DIRECTORY_METHOD;
 use crate::protocol::FS_GET_METADATA_METHOD;
 use crate::protocol::FS_OPEN_METHOD;
+use crate::protocol::FS_OPEN_VERIFIED_METHOD;
 use crate::protocol::FS_READ_BLOCK_METHOD;
 use crate::protocol::FS_READ_DIRECTORY_METHOD;
 use crate::protocol::FS_READ_FILE_METHOD;
@@ -83,6 +84,8 @@ use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsGetMetadataResponse;
 use crate::protocol::FsOpenParams;
 use crate::protocol::FsOpenResponse;
+use crate::protocol::FsOpenVerifiedParams;
+use crate::protocol::FsOpenVerifiedResponse;
 use crate::protocol::FsReadBlockParams;
 use crate::protocol::FsReadBlockResponse;
 use crate::protocol::FsReadDirectoryParams;
@@ -765,6 +768,13 @@ impl ExecServerClient {
 
     pub async fn fs_open(&self, params: FsOpenParams) -> Result<FsOpenResponse, ExecServerError> {
         self.call(FS_OPEN_METHOD, &params).await
+    }
+
+    pub async fn fs_open_verified(
+        &self,
+        params: FsOpenVerifiedParams,
+    ) -> Result<FsOpenVerifiedResponse, ExecServerError> {
+        self.call(FS_OPEN_VERIFIED_METHOD, &params).await
     }
 
     pub async fn fs_read_block(
