@@ -22,6 +22,7 @@ mod cell_ids;
 mod cleanup;
 mod commands;
 mod delegate_runtime;
+mod output_admission;
 mod request_tracker;
 mod responses;
 mod session_registry;

@@ -177,7 +177,8 @@ impl RequestTracker {
         }
         self.unclaimed_executes.clear();
         for (_, initial) in self.initial_responses.drain() {
-            let _ = initial.response_tx.send(Err(reason.to_string()));
+            let (reason, _) = initial.output_admission.admit_error(reason.to_string());
+            let _ = initial.response_tx.send(Err(reason));
         }
         for wait in self.deferred_waits.drain(..) {
             let _ = wait.response_tx.send(Err(reason.to_string()));

@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::ConnectionDriver;
 use super::cell_ids::remote_cell_id;
 use super::cell_ids::remote_wait_request;
+use super::output_admission::RemoteOutputAdmission;
 use super::types::CancellableRequest;
 use super::types::DeferredWait;
 use super::types::DeliveredExecute;
@@ -125,6 +126,7 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string()));
             return true;
         }
+        let output_admission = RemoteOutputAdmission::new(request.output_policy);
         let request = match request.try_into() {
             Ok(request) => request,
             Err(err) => {
@@ -166,6 +168,7 @@ impl ConnectionDriver {
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,
+                output_admission,
                 cancellation,
             },
             &self.event_tx,
