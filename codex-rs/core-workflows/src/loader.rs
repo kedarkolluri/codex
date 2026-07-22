@@ -12,12 +12,14 @@ use crate::WorkflowMetadata;
 use crate::WorkflowRegistry;
 use crate::WorkflowRoot;
 use crate::WorkflowScope;
+use crate::executor_loader::load_workflows_from_executor_root;
+use crate::model::WorkflowRootSource;
 
 const MAX_WORKFLOW_ROOTS: usize = 8;
-const MAX_SCAN_DEPTH: usize = 6;
-const MAX_DIRECTORIES_PER_ROOT: usize = 2_000;
-const MAX_ENTRIES_PER_ROOT: usize = 20_000;
-const MAX_CANDIDATES_PER_ROOT: usize = 256;
+pub(crate) const MAX_SCAN_DEPTH: usize = 6;
+pub(crate) const MAX_DIRECTORIES_PER_ROOT: usize = 2_000;
+pub(crate) const MAX_ENTRIES_PER_ROOT: usize = 20_000;
+pub(crate) const MAX_CANDIDATES_PER_ROOT: usize = 256;
 const MAX_DIAGNOSTICS_PER_ROOT: usize = 64;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1_024;
 
@@ -26,7 +28,8 @@ const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 1_024;
 const META_PARSER_LOOKAHEAD_BYTES: usize = 4 * 1_024;
 const UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
 const META_LOGICAL_READ_BYTES: usize = WORKFLOW_META_MAX_BYTES + META_PARSER_LOOKAHEAD_BYTES;
-const META_PHYSICAL_READ_BYTES: usize = META_LOGICAL_READ_BYTES + UTF8_BOUNDARY_LOOKAHEAD_BYTES;
+pub(crate) const META_PHYSICAL_READ_BYTES: usize =
+    META_LOGICAL_READ_BYTES + UTF8_BOUNDARY_LOOKAHEAD_BYTES;
 
 #[derive(Clone, Copy)]
 struct DiscoveryLimits {
@@ -72,14 +75,14 @@ impl RootScan {
     }
 }
 
-struct Diagnostics {
+pub(crate) struct Diagnostics {
     root: PathUri,
     errors: Vec<WorkflowLoadError>,
     omitted: usize,
 }
 
 impl Diagnostics {
-    fn new(root: PathUri) -> Self {
+    pub(crate) fn new(root: PathUri) -> Self {
         Self {
             root,
             errors: Vec::new(),
@@ -87,7 +90,7 @@ impl Diagnostics {
         }
     }
 
-    fn push(&mut self, path: PathUri, mut message: String) {
+    pub(crate) fn push(&mut self, path: PathUri, mut message: String) {
         if message.len() > MAX_DIAGNOSTIC_MESSAGE_BYTES {
             let mut end = MAX_DIAGNOSTIC_MESSAGE_BYTES - 3;
             while !message.is_char_boundary(end) {
@@ -103,7 +106,7 @@ impl Diagnostics {
         }
     }
 
-    fn finish(mut self) -> Vec<WorkflowLoadError> {
+    pub(crate) fn finish(mut self) -> Vec<WorkflowLoadError> {
         if self.omitted > 0 {
             let omitted = self.omitted;
             self.errors.push(WorkflowLoadError {
@@ -115,11 +118,12 @@ impl Diagnostics {
     }
 }
 
-/// Discovers host-local saved workflows without evaluating their JavaScript bodies.
+/// Discovers saved workflows without evaluating their JavaScript bodies.
 ///
-/// Missing roots are ignored. Descendant symlinks are not followed; an explicit root alias is
-/// resolved once. Other scan, containment, read, UTF-8, and static metadata failures become
-/// bounded diagnostics while discovery continues with safe neighbors.
+/// Host-local roots use native filesystem access while executor-backed project roots stay on their
+/// supplied filesystem authority. Missing roots are ignored. Descendant symlinks are not followed;
+/// an explicit root alias is resolved once. Other scan, containment, read, UTF-8, and static
+/// metadata failures become bounded diagnostics while discovery continues with safe neighbors.
 pub async fn load_workflows_from_roots<I>(roots: I) -> WorkflowRegistry
 where
     I: IntoIterator<Item = WorkflowRoot>,
@@ -139,36 +143,60 @@ where
     }
 
     for root in roots {
-        let RootScan {
-            canonical_root,
-            candidates,
-            mut diagnostics,
-        } = scan_workflow_root(&root, DISCOVERY_LIMITS).await;
-        for candidate in candidates {
-            match load_workflow(&candidate, &canonical_root, root.scope).await {
-                Ok(workflow) => workflows.push(workflow),
-                Err(error) => diagnostics.push(error.path, error.message),
+        match root.source() {
+            WorkflowRootSource::Executor(authority) => {
+                let (loaded, diagnostics) = load_workflows_from_executor_root(
+                    root.path(),
+                    root.scope,
+                    authority.file_system().as_ref(),
+                )
+                .await;
+                workflows.extend(
+                    loaded
+                        .into_iter()
+                        .map(|workflow| (workflow, Some(authority.clone()))),
+                );
+                errors.extend(diagnostics);
+            }
+            WorkflowRootSource::HostLocal(_) => {
+                let RootScan {
+                    canonical_root,
+                    candidates,
+                    mut diagnostics,
+                } = scan_workflow_root(&root, DISCOVERY_LIMITS).await;
+                for candidate in candidates {
+                    match load_workflow(&candidate, &canonical_root, root.scope).await {
+                        Ok(workflow) => workflows.push((workflow, None)),
+                        Err(error) => diagnostics.push(error.path, error.message),
+                    }
+                }
+                errors.extend(diagnostics.finish());
             }
         }
-        errors.extend(diagnostics.finish());
     }
 
-    WorkflowRegistry::new(workflows, errors)
+    WorkflowRegistry::from_discovery(workflows, errors)
 }
 
 async fn scan_workflow_root(root: &WorkflowRoot, limits: DiscoveryLimits) -> RootScan {
+    let root_path = match root.source() {
+        WorkflowRootSource::HostLocal(root_path) => root_path,
+        WorkflowRootSource::Executor(_) => {
+            unreachable!("host-local scan requires a host-local workflow root")
+        }
+    };
     let mut diagnostics = Diagnostics::new(root.path().clone());
-    let canonical_root = match canonicalize(root.host_path()).await {
+    let canonical_root = match canonicalize(root_path).await {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return RootScan::empty(root.host_path().clone(), diagnostics);
+            return RootScan::empty(root_path.clone(), diagnostics);
         }
         Err(error) => {
             diagnostics.push(
                 root.path().clone(),
                 format!("failed to resolve workflow root: {error}"),
             );
-            return RootScan::empty(root.host_path().clone(), diagnostics);
+            return RootScan::empty(root_path.clone(), diagnostics);
         }
     };
     let mut pending = vec![(canonical_root.clone(), 0_usize)];
@@ -355,7 +383,7 @@ async fn read_meta_prefix(path: &AbsolutePathBuf) -> io::Result<String> {
     decode_meta_prefix(&bytes)
 }
 
-fn decode_meta_prefix(bytes: &[u8]) -> io::Result<String> {
+pub(crate) fn decode_meta_prefix(bytes: &[u8]) -> io::Result<String> {
     let logical_len = bytes.len().min(META_LOGICAL_READ_BYTES);
     let logical = &bytes[..logical_len];
     match std::str::from_utf8(logical) {

@@ -71,6 +71,7 @@ fn applies_scope_precedence_independently_of_discovery_order() {
         WorkflowRegistry {
             workflows: vec![personal_only, project],
             errors: Vec::new(),
+            ..Default::default()
         }
     );
 }
@@ -106,6 +107,13 @@ fn deduplicates_identical_paths_before_names_with_deterministic_ties() {
         "later",
         WorkflowScope::Personal,
     );
+    let safe_neighbor = workflow(
+        &root,
+        "z/deploy.js",
+        "safe",
+        "neighbor",
+        WorkflowScope::Personal,
+    );
 
     let registry = WorkflowRegistry::new(
         vec![
@@ -113,6 +121,7 @@ fn deduplicates_identical_paths_before_names_with_deterministic_ties() {
             shared_path_personal,
             lexically_first.clone(),
             shared_path_project.clone(),
+            safe_neighbor.clone(),
         ],
         Vec::new(),
     );
@@ -120,8 +129,9 @@ fn deduplicates_identical_paths_before_names_with_deterministic_ties() {
     assert_eq!(
         registry,
         WorkflowRegistry {
-            workflows: vec![lexically_first, shared_path_project],
+            workflows: vec![lexically_first, safe_neighbor, shared_path_project],
             errors: Vec::new(),
+            ..Default::default()
         }
     );
 }
