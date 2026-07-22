@@ -10,8 +10,13 @@ use super::WireCellId;
 
 const WORKFLOW_CELL_ID_PREFIX: &str = "wf:1:";
 const WORKFLOW_CELL_EPOCH_HEX_BYTES: usize = 32;
+const WORKFLOW_CELL_SEQUENCE_OFFSET: usize =
+    WORKFLOW_CELL_ID_PREFIX.len() + WORKFLOW_CELL_EPOCH_HEX_BYTES + 1;
 
 /// A client-assigned Saved-workflow cell identity for protocol V2.
+///
+/// While the identity capability is selected, one connection uses one fresh
+/// epoch and emits strictly increasing sequences in request-frame order.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WireWorkflowCellId(WireCellId);
 
@@ -35,6 +40,18 @@ impl WireWorkflowCellId {
 
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// Returns the lowercase hexadecimal epoch carried by this identity.
+    pub fn epoch(&self) -> &str {
+        &self.as_str()[WORKFLOW_CELL_ID_PREFIX.len()..WORKFLOW_CELL_SEQUENCE_OFFSET - 1]
+    }
+
+    /// Returns the nonzero sequence carried by this identity.
+    pub fn sequence(&self) -> u64 {
+        self.as_str()[WORKFLOW_CELL_SEQUENCE_OFFSET..]
+            .bytes()
+            .fold(0, |sequence, digit| sequence * 10 + u64::from(digit - b'0'))
     }
 }
 

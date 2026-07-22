@@ -7,12 +7,25 @@ use crate::host::WireCellId;
 
 #[test]
 fn workflow_cell_id_accepts_only_canonical_components() {
-    for value in [
-        "wf:1:00000000000000000000000000000000:1",
-        "wf:1:0123456789abcdef0123456789abcdef:42",
-        "wf:1:ffffffffffffffffffffffffffffffff:18446744073709551615",
+    for (value, epoch, sequence) in [
+        (
+            "wf:1:00000000000000000000000000000000:1",
+            "00000000000000000000000000000000",
+            1,
+        ),
+        (
+            "wf:1:0123456789abcdef0123456789abcdef:42",
+            "0123456789abcdef0123456789abcdef",
+            42,
+        ),
+        (
+            "wf:1:ffffffffffffffffffffffffffffffff:18446744073709551615",
+            "ffffffffffffffffffffffffffffffff",
+            u64::MAX,
+        ),
     ] {
         let identity = WireWorkflowCellId::try_new(value).expect("workflow cell identity");
+        assert_eq!((identity.epoch(), identity.sequence()), (epoch, sequence));
         assert_eq!(identity.as_str(), value);
         assert_eq!(identity.to_string(), value);
         assert_eq!(

@@ -32,6 +32,7 @@ use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::SupportedProtocolVersions;
 use codex_code_mode_protocol::host::WireCellId;
 use codex_code_mode_protocol::host::WireExecuteCellIdentity;
+use codex_code_mode_protocol::host::WireExecuteOutputPolicy;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::sync::Semaphore;
@@ -41,9 +42,11 @@ use tokio_util::task::TaskTracker;
 
 use self::delegate::RemoteDelegate;
 use self::peer::HostPeer;
+use self::workflow_cell_ids::WorkflowCellSequenceGuard;
 
 mod delegate;
 mod peer;
+mod workflow_cell_ids;
 
 const MAX_IN_FLIGHT_REQUESTS: usize = 256;
 const MAX_ACTIVE_CELLS: usize = 128;
@@ -77,6 +80,7 @@ where
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        workflow_cell_sequence: Mutex::new(WorkflowCellSequenceGuard::default()),
         selected_capabilities,
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
@@ -254,6 +258,7 @@ struct HostState {
     request_tasks: TaskTracker,
     request_permits: Arc<Semaphore>,
     active_cell_permits: Arc<Semaphore>,
+    workflow_cell_sequence: Mutex<WorkflowCellSequenceGuard>,
     selected_capabilities: CapabilitySet,
     closing: AtomicBool,
     peer: Arc<HostPeer>,
@@ -270,6 +275,28 @@ impl HostState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .start(request_id, RequestKind::from(&request))?;
+        if self
+            .selected_capabilities
+            .contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
+            && self
+                .selected_capabilities
+                .contains_name(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY)
+            && let HostRequest::Execute { request, .. } = &request
+            && request.output_policy == WireExecuteOutputPolicy::SavedWorkflow
+            && let Some(identity) = &request.workflow_cell_id
+            && let Err(error) = self
+                .workflow_cell_sequence
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reserve(identity)
+        {
+            self.respond(
+                request_id,
+                Err(format!("invalid code-mode execute request: {error}")),
+            );
+            self.finish_request(request_id);
+            return Ok(());
+        }
         let Ok(permit) = Arc::clone(&self.request_permits).try_acquire_owned() else {
             self.respond(
                 request_id,
