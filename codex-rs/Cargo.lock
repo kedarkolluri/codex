@@ -2845,9 +2845,12 @@ dependencies = [
 name = "codex-core-workflows"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "codex-code-mode-protocol",
+ "codex-file-system",
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
+ "futures",
  "pretty_assertions",
  "tempfile",
  "tokio",

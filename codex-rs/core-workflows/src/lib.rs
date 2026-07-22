@@ -1,9 +1,10 @@
-//! Host-local saved-workflow registry contracts.
+//! Saved-workflow registry contracts for host-local and executor-backed roots.
 //!
 //! Discovery populates this registry from project, personal, and Codex-home roots. The registry
 //! applies scope precedence independently of discovery order so project workflows reliably shadow
 //! lower-precedence entries with the same name.
 
+mod executor_loader;
 mod loader;
 mod model;
 mod registry;
