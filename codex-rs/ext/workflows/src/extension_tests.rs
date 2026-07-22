@@ -384,3 +384,22 @@ async fn registry_snapshot_is_stable_until_a_new_thread_starts() {
         vec!["first", "second"]
     );
 }
+
+#[tokio::test]
+async fn disabled_feature_stores_no_discovery_state() {
+    let temp = TempDir::new().expect("temp dir");
+    let cwd = absolute(temp.path().join("project"));
+    let config = WorkflowExtensionConfig {
+        enabled: false,
+        ..config(&temp, cwd)
+    };
+
+    let thread_store = start_thread(
+        Arc::new(EnvironmentManager::without_environments()),
+        config,
+        &[],
+    )
+    .await;
+
+    assert!(workflow_session_registry(&thread_store).await.is_none());
+}
