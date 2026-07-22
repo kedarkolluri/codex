@@ -4,6 +4,7 @@ use std::path::Path;
 use codex_code_mode_protocol::WORKFLOW_META_MAX_BYTES;
 use codex_code_mode_protocol::parse_workflow_meta;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -32,6 +33,10 @@ fn canonical(path: impl AsRef<Path>) -> AbsolutePathBuf {
     absolute(path).canonicalize().unwrap()
 }
 
+fn uri(path: &AbsolutePathBuf) -> PathUri {
+    PathUri::from_abs_path(path)
+}
+
 fn write_workflow(directory: &Path, file_name: &str, source: impl AsRef<[u8]>) -> AbsolutePathBuf {
     fs::create_dir_all(directory).unwrap();
     let path = directory.join(file_name);
@@ -56,7 +61,7 @@ fn workflow(
         name: name.to_string(),
         description: description.to_string(),
         phases: phases.iter().map(ToString::to_string).collect(),
-        path,
+        path: uri(&path),
         scope,
     }
 }
@@ -172,17 +177,17 @@ async fn skips_invalid_metadata_and_keeps_valid_neighbors_and_missing_roots() {
         registry.errors(),
         &[
             WorkflowLoadError {
-                path: canonical(computed_path),
+                path: uri(&canonical(computed_path)),
                 message: "`meta` must be a static object literal beginning with `{`".to_string(),
             },
             WorkflowLoadError {
-                path: canonical(invalid_path),
+                path: uri(&canonical(invalid_path)),
                 message:
                     "failed to read workflow metadata: workflow metadata prefix is not valid UTF-8"
                         .to_string(),
             },
             WorkflowLoadError {
-                path: ignored_root,
+                path: uri(&ignored_root),
                 message: format!(
                     "workflow root limit {MAX_WORKFLOW_ROOTS} exceeded; extras ignored"
                 ),
@@ -257,7 +262,7 @@ async fn preserves_parser_lookahead_and_bounds_utf8_prefix_reads() {
     assert_eq!(
         registry.errors(),
         &[WorkflowLoadError {
-            path: canonical(boundary_path),
+            path: uri(&canonical(boundary_path)),
             message: "the `meta` object must end its statement before the workflow body; add `;` or a non-continuing line break".to_string(),
         }]
     );
@@ -343,6 +348,7 @@ async fn bounded_traversal_discards_truncated_root_results() {
 #[test]
 fn bounds_diagnostic_count_and_message_size() {
     let path = absolute(std::env::current_dir().unwrap());
+    let path = uri(&path);
     let mut diagnostics = Diagnostics::new(path.clone());
     diagnostics.push(path.clone(), "é".repeat(MAX_DIAGNOSTIC_MESSAGE_BYTES));
     for _ in 0..MAX_DIAGNOSTICS_PER_ROOT {

@@ -1,4 +1,5 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 
@@ -7,8 +8,9 @@ use crate::WorkflowLoadError;
 use crate::WorkflowMetadata;
 use crate::WorkflowScope;
 
-fn path(root: &TempDir, relative: &str) -> AbsolutePathBuf {
-    AbsolutePathBuf::from_absolute_path_checked(root.path().join(relative)).unwrap()
+fn path(root: &TempDir, relative: &str) -> PathUri {
+    let path = AbsolutePathBuf::from_absolute_path_checked(root.path().join(relative)).unwrap();
+    PathUri::from_abs_path(&path)
 }
 
 fn workflow(
