@@ -1,3 +1,5 @@
+use codex_code_mode_protocol::RuntimeResponse;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::DelegateRequest;
@@ -16,6 +18,8 @@ use super::cell_ids::public_runtime_response;
 use super::cell_ids::public_wait_outcome;
 use super::cell_ids::runtime_response_cell_id;
 use super::cell_ids::wait_outcome_cell_id;
+use super::output_admission::AdmissionOutcome;
+use super::output_admission::RemoteOutputAdmission;
 use super::request_tracker::CancellationAction;
 use super::session_registry::CellAdmissionError;
 use super::types::DeliveredExecute;
@@ -127,6 +131,7 @@ impl ConnectionDriver {
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,
+                output_admission,
                 cancellation,
             } => match result {
                 Ok(HostResponse::ExecutionStarted { cell_id }) => {
@@ -136,9 +141,9 @@ impl ConnectionDriver {
                     let public_id = match self.sessions.admit_cell(&session, cell_id) {
                         Ok(public_id) => public_id,
                         Err(CellAdmissionError::MissingSession) => {
-                            let _ = response_tx
-                                .send(Err("code-mode session closed during execute".to_string()));
-                            return true;
+                            let (reason, admission) = output_admission
+                                .admit_error("code-mode session closed during execute".to_string());
+                            return self.deliver_admitted(response_tx, Err(reason), admission);
                         }
                         Err(CellAdmissionError::DuplicateCell) => {
                             let reason = format!(
@@ -146,9 +151,7 @@ impl ConnectionDriver {
                                 remote_cell_id.as_str(),
                                 session.id
                             );
-                            let _ = response_tx.send(Err(reason.clone()));
-                            self.fail(reason);
-                            return false;
+                            return self.fail_admitted(response_tx, reason, &output_admission);
                         }
                     };
                     self.requests.insert_initial_response(
@@ -156,6 +159,7 @@ impl ConnectionDriver {
                         InitialResponse {
                             generation: session.generation,
                             cell_id: remote_cell_id.clone(),
+                            output_admission,
                             response_tx: initial_response_tx,
                         },
                     );
@@ -181,12 +185,11 @@ impl ConnectionDriver {
                 }
                 Ok(_) => {
                     let reason = "code-mode host returned an invalid execute response".to_string();
-                    let _ = response_tx.send(Err(reason.clone()));
-                    self.fail(reason);
-                    return false;
+                    return self.fail_admitted(response_tx, reason, &output_admission);
                 }
                 Err(err) => {
-                    let _ = response_tx.send(Err(err));
+                    let (err, admission) = output_admission.admit_error(err);
+                    return self.deliver_admitted(response_tx, Err(err), admission);
                 }
             },
             PendingRequest::Wait {
@@ -382,9 +385,14 @@ impl ConnectionDriver {
             ));
             return false;
         };
-        let response = match result {
+        let (response, admission) = match result {
             Ok(response) if runtime_response_cell_id(&response) == &initial.cell_id => {
-                Ok(public_runtime_response(initial.generation, response.into()))
+                let mut response: RuntimeResponse = response.into();
+                let admission = initial.output_admission.admit_response(&mut response);
+                (
+                    Ok(public_runtime_response(initial.generation, response)),
+                    admission,
+                )
             }
             Ok(response) => {
                 let reason = format!(
@@ -392,14 +400,46 @@ impl ConnectionDriver {
                     runtime_response_cell_id(&response).as_str(),
                     initial.cell_id.as_str()
                 );
-                let _ = initial.response_tx.send(Err(reason.clone()));
-                self.fail(reason);
-                return false;
+                return self.fail_admitted(initial.response_tx, reason, &initial.output_admission);
             }
-            Err(err) => Err(err),
+            Err(err) => {
+                let (err, admission) = initial.output_admission.admit_error(err);
+                (Err(err), admission)
+            }
         };
-        let _ = initial.response_tx.send(response);
+        self.deliver_admitted(initial.response_tx, response, admission)
+    }
+
+    fn deliver_admitted<T>(
+        &mut self,
+        response_tx: oneshot::Sender<Result<T, String>>,
+        response: Result<T, String>,
+        admission: AdmissionOutcome,
+    ) -> bool {
+        let _ = response_tx.send(response);
+        if admission == AdmissionOutcome::Rejected {
+            self.fail(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string());
+            return false;
+        }
         true
+    }
+
+    fn fail_admitted<T>(
+        &mut self,
+        response_tx: oneshot::Sender<Result<T, String>>,
+        reason: String,
+        output_admission: &RemoteOutputAdmission,
+    ) -> bool {
+        let saved = output_admission.is_saved();
+        let (visible_reason, _) = output_admission.admit_error(reason.clone());
+        let failure_reason = if saved {
+            visible_reason.clone()
+        } else {
+            reason
+        };
+        let _ = response_tx.send(Err(visible_reason));
+        self.fail(failure_reason);
+        false
     }
 }
 

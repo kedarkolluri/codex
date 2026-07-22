@@ -863,7 +863,10 @@ async fn mismatched_initial_response_fails_connection_and_closes_cell_once() {
         .await
         .expect("initial response");
 
-    assert!(started.initial_response().await.is_err());
+    assert_eq!(
+        started.initial_response().await,
+        Err("code-mode host returned initial response for cell 2 instead of 1".to_string())
+    );
     assert!(!harness.alive.load(Ordering::Acquire));
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),

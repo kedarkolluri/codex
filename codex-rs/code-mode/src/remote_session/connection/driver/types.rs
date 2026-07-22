@@ -19,6 +19,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::cleanup::SessionCleanup;
+use super::output_admission::RemoteOutputAdmission;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::remote_session) struct RemoteSession {
@@ -117,6 +118,7 @@ impl Drop for CancellableRequest {
 pub(super) struct InitialResponse {
     pub(super) generation: u64,
     pub(super) cell_id: WireCellId,
+    pub(super) output_admission: RemoteOutputAdmission,
     pub(super) response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
 }
 
@@ -144,6 +146,7 @@ pub(super) enum PendingRequest {
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
         initial_response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
         initial_response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,
+        output_admission: RemoteOutputAdmission,
         cancellation: CancellableRequest,
     },
     Wait {
@@ -185,7 +188,12 @@ impl PendingRequest {
             Self::OpenSession { response_tx, .. } | Self::ShutdownSession { response_tx, .. } => {
                 let _ = response_tx.send(Err(reason));
             }
-            Self::Execute { response_tx, .. } => {
+            Self::Execute {
+                response_tx,
+                output_admission,
+                ..
+            } => {
+                let (reason, _) = output_admission.admit_error(reason);
                 let _ = response_tx.send(Err(reason));
             }
             Self::Wait { response_tx, .. } | Self::Terminate { response_tx, .. } => {
