@@ -18,11 +18,7 @@
 use crate::config::Config;
 use crate::context::UserInstructions as ContextUserInstructions;
 use crate::environment_selection::TurnEnvironmentSnapshot;
-use codex_config::ConfigLayerSource;
-use codex_config::ConfigLayerStackOrdering;
-use codex_config::default_project_root_markers;
-use codex_config::merge_toml_values;
-use codex_config::project_root_markers_from_config;
+use codex_config::effective_project_root_markers;
 use codex_exec_server::ExecutorFileSystem;
 use codex_extension_api::UserInstructions;
 use codex_file_system::FindUpErrorPolicy;
@@ -31,7 +27,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 use std::io;
-use toml::Value as TomlValue;
 use tracing::error;
 
 /// Default filename scanned for AGENTS.md instructions.
@@ -159,24 +154,7 @@ async fn agents_md_paths(
 ) -> io::Result<Vec<PathUri>> {
     let dir = cwd.clone();
 
-    let mut merged = TomlValue::Table(toml::map::Map::new());
-    for layer in config.config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
-        if matches!(layer.name, ConfigLayerSource::Project { .. }) {
-            continue;
-        }
-        merge_toml_values(&mut merged, &layer.config);
-    }
-    let project_root_markers = match project_root_markers_from_config(&merged) {
-        Ok(Some(markers)) => markers,
-        Ok(None) => default_project_root_markers(),
-        Err(err) => {
-            tracing::warn!("invalid project_root_markers: {err}");
-            default_project_root_markers()
-        }
-    };
+    let project_root_markers = effective_project_root_markers(&config.config_layer_stack);
     let project_root = find_nearest_ancestor_with_markers(
         fs,
         &dir,

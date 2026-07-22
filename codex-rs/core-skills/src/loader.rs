@@ -20,9 +20,7 @@ use crate::system::system_cache_root_dir;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
-use codex_config::default_project_root_markers;
-use codex_config::merge_toml_values;
-use codex_config::project_root_markers_from_config;
+use codex_config::effective_project_root_markers;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_protocol::protocol::Product;
@@ -53,7 +51,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use toml::Value as TomlValue;
 use tracing::error;
 
 // TODO(anp): Tune this eight-scan limit after revisiting byte-based backpressure.
@@ -394,7 +391,7 @@ async fn repo_agents_skill_roots(
     let Some(fs) = fs else {
         return Vec::new();
     };
-    let project_root_markers = project_root_markers_from_stack(config_layer_stack);
+    let project_root_markers = effective_project_root_markers(config_layer_stack);
     let project_root = find_project_root(fs.as_ref(), cwd, &project_root_markers).await;
     let dirs = dirs_between_project_root_and_cwd(cwd, &project_root);
     let mut roots = Vec::new();
@@ -430,28 +427,6 @@ async fn repo_agents_skill_roots(
         }
     }
     roots
-}
-
-fn project_root_markers_from_stack(config_layer_stack: &ConfigLayerStack) -> Vec<String> {
-    let mut merged = TomlValue::Table(toml::map::Map::new());
-    for layer in config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
-        if matches!(layer.name, ConfigLayerSource::Project { .. }) {
-            continue;
-        }
-        merge_toml_values(&mut merged, &layer.config);
-    }
-
-    match project_root_markers_from_config(&merged) {
-        Ok(Some(markers)) => markers,
-        Ok(None) => default_project_root_markers(),
-        Err(err) => {
-            tracing::warn!("invalid project_root_markers: {err}");
-            default_project_root_markers()
-        }
-    }
 }
 
 async fn find_project_root(
