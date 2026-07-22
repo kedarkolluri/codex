@@ -4,8 +4,11 @@ use std::sync::Arc;
 
 use codex_code_mode_protocol::WORKFLOW_SOURCE_MAX_BYTES;
 use codex_code_mode_protocol::parse_workflow_meta;
+use codex_file_system::ExecutorFileSystem;
+use codex_file_system::FileMetadata;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use futures::StreamExt;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncReadExt;
 
@@ -85,9 +88,9 @@ impl Error for WorkflowSourceLoadError {}
 impl WorkflowRegistry {
     /// Captures the source for the exact case-sensitive registry winner named by `name`.
     ///
-    /// Executor-backed entries fail closed until source capture through their retained filesystem
-    /// authority is available. Host capture freezes one bounded read but does not claim race-free
-    /// path containment. Observed I/O, file-kind, path, size, UTF-8, or metadata drift fails closed.
+    /// Executor-backed entries stay on their retained filesystem even when their URI could be
+    /// represented on this host. This freezes one bounded read but does not claim race-free path
+    /// containment. Observed I/O, file-kind, path, size, UTF-8, or metadata drift fails closed.
     pub async fn source_snapshot_by_name(
         &self,
         name: &str,
@@ -95,13 +98,10 @@ impl WorkflowRegistry {
         let Some(metadata) = self.resolve_by_name(name).cloned() else {
             return Ok(None);
         };
-        if self.executor_file_system_for(&metadata).is_some() {
-            return Err(WorkflowSourceLoadError::new(
-                metadata.path.clone(),
-                "executor-backed workflow source capture is not supported",
-            ));
-        }
-        let bytes = read_host_source(&metadata.path).await?;
+        let bytes = match self.executor_file_system_for(&metadata) {
+            Some(file_system) => read_executor_source(file_system.as_ref(), &metadata.path).await?,
+            None => read_host_source(&metadata.path).await?,
+        };
         let source = String::from_utf8(bytes).map_err(|error| {
             WorkflowSourceLoadError::new(
                 metadata.path.clone(),
@@ -128,6 +128,78 @@ impl WorkflowRegistry {
             source: Arc::from(source),
         }))
     }
+}
+
+async fn read_executor_source(
+    file_system: &dyn ExecutorFileSystem,
+    path: &PathUri,
+) -> Result<Vec<u8>, WorkflowSourceLoadError> {
+    let before = validate_executor_source(file_system, path).await?;
+    let mut stream = file_system
+        .read_file_stream(path, /*sandbox*/ None)
+        .await
+        .map_err(|error| source_io_error(path, "read source", error))?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| source_io_error(path, "read source", error))?;
+        if chunk.is_empty() {
+            return Err(WorkflowSourceLoadError::new(
+                path.clone(),
+                "source stream returned an empty chunk",
+            ));
+        }
+        let Some(next_len) = bytes.len().checked_add(chunk.len()) else {
+            return Err(source_too_large(path));
+        };
+        if next_len > WORKFLOW_SOURCE_MAX_BYTES {
+            return Err(source_too_large(path));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let after = validate_executor_source(file_system, path).await?;
+    if before != after || bytes.len() as u64 != after.size {
+        return Err(WorkflowSourceLoadError::new(
+            path.clone(),
+            "workflow source changed while being read",
+        ));
+    }
+    Ok(bytes)
+}
+
+async fn validate_executor_source(
+    file_system: &dyn ExecutorFileSystem,
+    path: &PathUri,
+) -> Result<FileMetadata, WorkflowSourceLoadError> {
+    let metadata = file_system
+        .get_metadata(path, /*sandbox*/ None)
+        .await
+        .map_err(|error| source_io_error(path, "inspect source", error))?;
+    if metadata.is_symlink {
+        return Err(WorkflowSourceLoadError::new(
+            path.clone(),
+            "workflow source is a symlink",
+        ));
+    }
+    if !metadata.is_file {
+        return Err(WorkflowSourceLoadError::new(
+            path.clone(),
+            "workflow source is not a regular file",
+        ));
+    }
+    if metadata.size > WORKFLOW_SOURCE_MAX_BYTES as u64 {
+        return Err(source_too_large(path));
+    }
+    let canonical = file_system
+        .canonicalize(path, /*sandbox*/ None)
+        .await
+        .map_err(|error| source_io_error(path, "resolve source", error))?;
+    if canonical != *path {
+        return Err(WorkflowSourceLoadError::new(
+            path.clone(),
+            format!("workflow source now resolves to {canonical}"),
+        ));
+    }
+    Ok(metadata)
 }
 
 async fn read_host_source(path: &PathUri) -> Result<Vec<u8>, WorkflowSourceLoadError> {
@@ -245,3 +317,7 @@ fn is_link_or_reparse_point(metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 #[path = "source_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "executor_source_tests.rs"]
+mod executor_tests;
