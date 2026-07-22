@@ -194,22 +194,38 @@ impl ConnectionDriver {
                 return true;
             }
         };
+        let output_admission = match self.sessions.cell_output(&session, &request.cell_id) {
+            Ok(Some(output_admission)) => output_admission,
+            Ok(None) => RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
+            Err(err) => {
+                let _ = response_tx.send(Err(err));
+                return true;
+            }
+        };
         if self.requests.has_cancelled_wait(&session, &request.cell_id) {
             self.requests.push_deferred_wait(DeferredWait {
                 session,
                 request,
+                output_admission,
                 caller_cancellation,
                 response_tx,
             });
             return true;
         }
-        self.start_wait(session, request, caller_cancellation, response_tx)
+        self.start_wait(
+            session,
+            request,
+            output_admission,
+            caller_cancellation,
+            response_tx,
+        )
     }
 
     pub(super) fn start_wait(
         &mut self,
         session: RemoteSession,
         request: WireWaitRequest,
+        output_admission: RemoteOutputAdmission,
         caller_cancellation: CancellationToken,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     ) -> bool {
@@ -222,6 +238,7 @@ impl ConnectionDriver {
             PendingRequest::Wait {
                 session,
                 cell_id,
+                output_admission,
                 cancellation: CancellableRequest::new(caller_cancellation),
                 response_tx,
             },

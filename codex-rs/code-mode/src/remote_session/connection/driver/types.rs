@@ -152,6 +152,7 @@ pub(super) enum PendingRequest {
     Wait {
         session: RemoteSession,
         cell_id: WireCellId,
+        output_admission: RemoteOutputAdmission,
         cancellation: CancellableRequest,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
@@ -169,6 +170,7 @@ pub(super) enum PendingRequest {
 pub(super) struct DeferredWait {
     pub(super) session: RemoteSession,
     pub(super) request: WireWaitRequest,
+    pub(super) output_admission: RemoteOutputAdmission,
     pub(super) caller_cancellation: CancellationToken,
     pub(super) response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
 }
@@ -196,7 +198,15 @@ impl PendingRequest {
                 let reason = output_admission.visible_connection_failure(reason);
                 let _ = response_tx.send(Err(reason));
             }
-            Self::Wait { response_tx, .. } | Self::Terminate { response_tx, .. } => {
+            Self::Wait {
+                response_tx,
+                output_admission,
+                ..
+            } => {
+                let reason = output_admission.visible_connection_failure(reason);
+                let _ = response_tx.send(Err(reason));
+            }
+            Self::Terminate { response_tx, .. } => {
                 let _ = response_tx.send(Err(reason));
             }
         }
