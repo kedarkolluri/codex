@@ -10,6 +10,8 @@ use serde::de::Error as _;
 use serde::ser::Error as _;
 use serde_json::Value as JsonValue;
 
+use super::types::CapabilitySet;
+use super::types::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use crate::CellId;
 use crate::CodeModeNestedToolCall;
 use crate::CodeModeToolKind;
@@ -195,6 +197,21 @@ impl From<WireToolDefinition> for ToolDefinition {
     }
 }
 
+/// Selects the output contract encoded in a protocol V2 execute request.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireExecuteOutputPolicy {
+    #[default]
+    Ordinary,
+    SavedWorkflow,
+}
+
+impl WireExecuteOutputPolicy {
+    fn is_ordinary(&self) -> bool {
+        *self == Self::Ordinary
+    }
+}
+
 /// The complete execute request shape supported by protocol V2.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -202,11 +219,13 @@ pub struct WireExecuteRequest {
     pub tool_call_id: String,
     pub enabled_tools: Vec<WireToolDefinition>,
     pub source: String,
+    #[serde(default, skip_serializing_if = "WireExecuteOutputPolicy::is_ordinary")]
+    pub output_policy: WireExecuteOutputPolicy,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<i32>,
 }
 
-/// Failure converting a domain execute request into the currently ordinary-only V2 wire shape.
+/// Failure converting between domain and protocol V2 execute requests.
 #[derive(Debug)]
 pub enum WireExecuteRequestConversionError {
     SavedWorkflowOutputPolicyUnavailable,
@@ -239,35 +258,81 @@ impl From<TryFromIntError> for WireExecuteRequestConversionError {
     }
 }
 
-impl TryFrom<ExecuteRequest> for WireExecuteRequest {
-    type Error = WireExecuteRequestConversionError;
-
-    fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
-        if value.output_policy == ExecuteOutputPolicy::SavedWorkflow {
-            return Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable);
-        }
+impl WireExecuteRequest {
+    /// Converts a domain request using the capabilities selected for this connection.
+    pub fn try_from_domain(
+        value: ExecuteRequest,
+        selected_capabilities: &CapabilitySet,
+    ) -> Result<Self, WireExecuteRequestConversionError> {
+        let output_policy = match value.output_policy {
+            ExecuteOutputPolicy::Ordinary => WireExecuteOutputPolicy::Ordinary,
+            ExecuteOutputPolicy::SavedWorkflow
+                if supports_saved_workflow_output(selected_capabilities) =>
+            {
+                WireExecuteOutputPolicy::SavedWorkflow
+            }
+            ExecuteOutputPolicy::SavedWorkflow => {
+                return Err(
+                    WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable,
+                );
+            }
+        };
         Ok(Self {
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,
+            output_policy,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens: value.max_output_tokens.map(i32::try_from).transpose()?,
         })
     }
+
+    /// Converts a wire request using the capabilities selected for this connection.
+    pub fn try_into_domain(
+        self,
+        selected_capabilities: &CapabilitySet,
+    ) -> Result<ExecuteRequest, WireExecuteRequestConversionError> {
+        let output_policy = match self.output_policy {
+            WireExecuteOutputPolicy::Ordinary => ExecuteOutputPolicy::Ordinary,
+            WireExecuteOutputPolicy::SavedWorkflow
+                if supports_saved_workflow_output(selected_capabilities) =>
+            {
+                ExecuteOutputPolicy::SavedWorkflow
+            }
+            WireExecuteOutputPolicy::SavedWorkflow => {
+                return Err(
+                    WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable,
+                );
+            }
+        };
+        Ok(ExecuteRequest {
+            tool_call_id: self.tool_call_id,
+            enabled_tools: self.enabled_tools.into_iter().map(Into::into).collect(),
+            source: self.source,
+            output_policy,
+            yield_time_ms: self.yield_time_ms,
+            max_output_tokens: self.max_output_tokens.map(usize::try_from).transpose()?,
+        })
+    }
+}
+
+fn supports_saved_workflow_output(selected_capabilities: &CapabilitySet) -> bool {
+    selected_capabilities.contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY)
+}
+
+impl TryFrom<ExecuteRequest> for WireExecuteRequest {
+    type Error = WireExecuteRequestConversionError;
+
+    fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
+        Self::try_from_domain(value, &CapabilitySet::empty())
+    }
 }
 
 impl TryFrom<WireExecuteRequest> for ExecuteRequest {
-    type Error = TryFromIntError;
+    type Error = WireExecuteRequestConversionError;
 
     fn try_from(value: WireExecuteRequest) -> Result<Self, Self::Error> {
-        Ok(Self {
-            tool_call_id: value.tool_call_id,
-            enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
-            source: value.source,
-            output_policy: ExecuteOutputPolicy::Ordinary,
-            yield_time_ms: value.yield_time_ms,
-            max_output_tokens: value.max_output_tokens.map(usize::try_from).transpose()?,
-        })
+        value.try_into_domain(&CapabilitySet::empty())
     }
 }
 

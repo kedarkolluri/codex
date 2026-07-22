@@ -4,6 +4,10 @@
 //! request ID over one ordered connection and requires bounded cell identifiers
 //! in both directions. Capability names provide an extension point without
 //! weakening the versioned decoder contract.
+//!
+//! Compatibility guarantees apply to the serialized messages exchanged across
+//! the host boundary. These Rust construction types are workspace-internal and
+//! evolve together with their workspace callers.
 
 mod codec;
 mod error;
@@ -30,6 +34,7 @@ pub use payload::InvalidWireCellId;
 pub use payload::WIRE_CELL_ID_MAX_BYTES;
 pub use payload::WireCellId;
 pub use payload::WireContentItem;
+pub use payload::WireExecuteOutputPolicy;
 pub use payload::WireExecuteRequest;
 pub use payload::WireExecuteRequestConversionError;
 pub use payload::WireImageDetail;
@@ -48,6 +53,7 @@ pub use types::InvalidIdentifier;
 pub use types::InvalidSupportedProtocolVersions;
 pub use types::ProtocolVersion;
 pub use types::RequestId;
+pub use types::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 pub use types::SessionId;
 pub use types::SupportedProtocolVersions;
 
