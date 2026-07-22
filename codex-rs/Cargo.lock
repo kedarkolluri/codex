@@ -2637,6 +2637,7 @@ dependencies = [
  "codex-context-fragments",
  "codex-core-plugins",
  "codex-core-skills",
+ "codex-core-workflows",
  "codex-exec-server",
  "codex-execpolicy",
  "codex-extension-api",
