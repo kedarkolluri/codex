@@ -13,6 +13,7 @@ use serde_json::Value as JsonValue;
 use crate::CellId;
 use crate::CodeModeNestedToolCall;
 use crate::CodeModeToolKind;
+use crate::ExecuteOutputPolicy;
 use crate::ExecuteRequest;
 use crate::FunctionCallOutputContentItem;
 use crate::ImageDetail;
@@ -205,10 +206,46 @@ pub struct WireExecuteRequest {
     pub max_output_tokens: Option<i32>,
 }
 
+/// Failure converting a domain execute request into the currently ordinary-only V2 wire shape.
+#[derive(Debug)]
+pub enum WireExecuteRequestConversionError {
+    SavedWorkflowOutputPolicyUnavailable,
+    MaxOutputTokensOutOfRange(TryFromIntError),
+}
+
+impl fmt::Display for WireExecuteRequestConversionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SavedWorkflowOutputPolicyUnavailable => {
+                formatter.write_str(crate::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE)
+            }
+            Self::MaxOutputTokensOutOfRange(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for WireExecuteRequestConversionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SavedWorkflowOutputPolicyUnavailable => None,
+            Self::MaxOutputTokensOutOfRange(error) => Some(error),
+        }
+    }
+}
+
+impl From<TryFromIntError> for WireExecuteRequestConversionError {
+    fn from(error: TryFromIntError) -> Self {
+        Self::MaxOutputTokensOutOfRange(error)
+    }
+}
+
 impl TryFrom<ExecuteRequest> for WireExecuteRequest {
-    type Error = TryFromIntError;
+    type Error = WireExecuteRequestConversionError;
 
     fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
+        if value.output_policy == ExecuteOutputPolicy::SavedWorkflow {
+            return Err(WireExecuteRequestConversionError::SavedWorkflowOutputPolicyUnavailable);
+        }
         Ok(Self {
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
@@ -227,6 +264,7 @@ impl TryFrom<WireExecuteRequest> for ExecuteRequest {
             tool_call_id: value.tool_call_id,
             enabled_tools: value.enabled_tools.into_iter().map(Into::into).collect(),
             source: value.source,
+            output_policy: ExecuteOutputPolicy::Ordinary,
             yield_time_ms: value.yield_time_ms,
             max_output_tokens: value.max_output_tokens.map(usize::try_from).transpose()?,
         })

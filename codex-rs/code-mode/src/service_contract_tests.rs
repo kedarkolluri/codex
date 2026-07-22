@@ -159,6 +159,7 @@ fn execute_request(source: &str) -> ExecuteRequest {
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+        output_policy: codex_code_mode_protocol::ExecuteOutputPolicy::Ordinary,
         yield_time_ms: Some(1),
         max_output_tokens: None,
     }

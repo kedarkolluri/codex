@@ -31,6 +31,7 @@ pub use payload::WIRE_CELL_ID_MAX_BYTES;
 pub use payload::WireCellId;
 pub use payload::WireContentItem;
 pub use payload::WireExecuteRequest;
+pub use payload::WireExecuteRequestConversionError;
 pub use payload::WireImageDetail;
 pub use payload::WireNestedToolCall;
 pub use payload::WireRuntimeResponse;

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use codex_code_mode_protocol::CodeModeSessionProvider;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::RuntimeResponse;
@@ -86,6 +87,7 @@ async fn provider_falls_back_to_in_process_session_when_host_is_missing() {
             tool_call_id: "call-1".to_string(),
             enabled_tools: Vec::new(),
             source: "text('fallback')".to_string(),
+            output_policy: ExecuteOutputPolicy::Ordinary,
             yield_time_ms: None,
             max_output_tokens: None,
         })
@@ -117,6 +119,7 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
             tool_call_id: "call-1".to_string(),
             enabled_tools: Vec::new(),
             source: "text('unreachable')".to_string(),
+            output_policy: ExecuteOutputPolicy::Ordinary,
             yield_time_ms: None,
             max_output_tokens: None,
         })

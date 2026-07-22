@@ -16,6 +16,7 @@ use super::WaitToPendingOutcome;
 use super::WaitToPendingRequest;
 use super::yield_timeout;
 use crate::CodeModeToolKind;
+use crate::ExecuteOutputPolicy;
 use crate::ExecuteRequest;
 use crate::ExecuteToPendingOutcome;
 use crate::FunctionCallOutputContentItem;
@@ -173,17 +174,18 @@ impl CodeModeSessionDelegate for ReleasableToolDelegate {
     fn cell_closed(&self, _cell_id: &CellId) {}
 }
 
-fn execute_request(source: &str) -> ExecuteRequest {
+pub(super) fn execute_request(source: &str) -> ExecuteRequest {
     ExecuteRequest {
         tool_call_id: "call_1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+        output_policy: ExecuteOutputPolicy::Ordinary,
         yield_time_ms: Some(1),
         max_output_tokens: None,
     }
 }
 
-fn cell_id(value: &str) -> CellId {
+pub(super) fn cell_id(value: &str) -> CellId {
     CellId::new(value.to_string())
 }
 
@@ -198,7 +200,10 @@ fn echo_tool() -> ToolDefinition {
     }
 }
 
-async fn execute(service: &InProcessCodeModeSession, request: ExecuteRequest) -> RuntimeResponse {
+pub(super) async fn execute(
+    service: &InProcessCodeModeSession,
+    request: ExecuteRequest,
+) -> RuntimeResponse {
     service
         .execute(request)
         .await

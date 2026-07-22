@@ -11,12 +11,29 @@ use crate::ToolDefinition;
 pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
 pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+/// Fixed error returned while saved-workflow output remains unavailable.
+pub const SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE: &str =
+    "saved workflow output policy is unavailable";
+
+/// Selects output behavior for one code-mode execution.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecuteOutputPolicy {
+    /// Public `exec` behavior, including asynchronous delegate notifications.
+    #[default]
+    Ordinary,
+    /// Reserved saved-workflow behavior, unavailable until its bounded output contract is active.
+    SavedWorkflow,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ExecuteRequest {
     pub tool_call_id: String,
     pub enabled_tools: Vec<ToolDefinition>,
     pub source: String,
+    /// Missing values from older serialized requests retain ordinary `exec` behavior.
+    #[serde(default)]
+    pub output_policy: ExecuteOutputPolicy,
     pub yield_time_ms: Option<u64>,
     pub max_output_tokens: Option<usize>,
 }

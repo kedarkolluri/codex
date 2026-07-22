@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
@@ -117,6 +119,10 @@ impl ConnectionDriver {
     ) -> bool {
         if let Err(err) = self.sessions.require_ready(&session) {
             let _ = response_tx.send(Err(err));
+            return true;
+        }
+        if request.output_policy == ExecuteOutputPolicy::SavedWorkflow {
+            let _ = response_tx.send(Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string()));
             return true;
         }
         let request = match request.try_into() {

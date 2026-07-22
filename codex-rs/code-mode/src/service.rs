@@ -10,12 +10,14 @@ use codex_code_mode_protocol::CodeModeSessionProviderFuture;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
 use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::DEFAULT_EXEC_YIELD_TIME_MS;
+use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::ExecuteToPendingOutcome;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
 use codex_code_mode_protocol::NotificationFuture;
 use codex_code_mode_protocol::RuntimeResponse;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitOutcome;
@@ -112,6 +114,7 @@ impl InProcessCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
+        validate_output_policy(request.output_policy)?;
         let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let started = self
             .runtime
@@ -139,6 +142,7 @@ impl InProcessCodeModeSession {
         &self,
         request: ExecuteRequest,
     ) -> Result<ExecuteToPendingOutcome, String> {
+        validate_output_policy(request.output_policy)?;
         let started = self
             .runtime
             .execute(
@@ -230,6 +234,15 @@ impl InProcessCodeModeSession {
             .shutdown()
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+fn validate_output_policy(output_policy: ExecuteOutputPolicy) -> Result<(), String> {
+    match output_policy {
+        ExecuteOutputPolicy::Ordinary => Ok(()),
+        ExecuteOutputPolicy::SavedWorkflow => {
+            Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string())
+        }
     }
 }
 
@@ -332,6 +345,10 @@ fn runtime_request(request: ExecuteRequest) -> runtime::CreateCellRequest {
             })
             .collect(),
         source: request.source,
+        output_policy: match request.output_policy {
+            ExecuteOutputPolicy::Ordinary => runtime::OutputPolicy::Ordinary,
+            ExecuteOutputPolicy::SavedWorkflow => runtime::OutputPolicy::SavedWorkflow,
+        },
     }
 }
 
@@ -428,3 +445,7 @@ mod tests;
 #[cfg(test)]
 #[path = "service_contract_tests.rs"]
 mod contract_tests;
+
+#[cfg(test)]
+#[path = "service_saved_workflow_state_tests.rs"]
+mod saved_workflow_state_tests;

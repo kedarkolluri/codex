@@ -32,6 +32,13 @@ pub(crate) enum ObserveMode {
     PendingFrontier,
 }
 
+/// Output behavior for one transport-neutral cell request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OutputPolicy {
+    Ordinary,
+    SavedWorkflow,
+}
+
 /// An observable cell lifecycle event.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum CellEvent {
@@ -82,6 +89,7 @@ pub(crate) struct CreateCellRequest {
     pub(crate) tool_call_id: String,
     pub(crate) enabled_tools: Vec<ToolDefinition>,
     pub(crate) source: String,
+    pub(crate) output_policy: OutputPolicy,
 }
 
 /// Tool metadata exposed to code running inside a cell.

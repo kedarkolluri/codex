@@ -47,6 +47,7 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id.clone(),
                 enabled_tools,
                 source: args.code.clone(),
+                output_policy: codex_code_mode::ExecuteOutputPolicy::Ordinary,
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
             })

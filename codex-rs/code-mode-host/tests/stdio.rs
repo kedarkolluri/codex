@@ -15,11 +15,13 @@ use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionDelegate;
 use codex_code_mode::CodeModeSessionProvider;
 use codex_code_mode::CodeModeToolKind;
+use codex_code_mode::ExecuteOutputPolicy;
 use codex_code_mode::ExecuteRequest;
 use codex_code_mode::FunctionCallOutputContentItem;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_code_mode::RuntimeResponse;
+use codex_code_mode::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode::ToolDefinition;
 use codex_code_mode::ToolInvocationFuture;
 use codex_code_mode::WaitOutcome;
@@ -209,9 +211,39 @@ fn execute_request(source: &str) -> ExecuteRequest {
         tool_call_id: "call-1".to_string(),
         enabled_tools: Vec::new(),
         source: source.to_string(),
+        output_policy: ExecuteOutputPolicy::Ordinary,
         yield_time_ms: None,
         max_output_tokens: None,
     }
+}
+
+#[tokio::test]
+async fn saved_workflow_rejection_does_not_terminate_the_host_process() {
+    let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
+        codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
+    );
+    let session = provider
+        .create_session(Arc::new(RecordingDelegate::default()))
+        .await
+        .expect("create remote session");
+    let mut request = execute_request(r#"text("unreachable");"#);
+    request.output_policy = ExecuteOutputPolicy::SavedWorkflow;
+
+    assert_eq!(
+        session.execute(request).await.err().as_deref(),
+        Some(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE)
+    );
+    assert_eq!(
+        execute(&session, execute_request(r#"text("ordinary");"#)).await,
+        RuntimeResponse::Result {
+            cell_id: cell_id("1"),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "ordinary".to_string(),
+            }],
+            error_text: None,
+        }
+    );
+    session.shutdown().await.expect("shutdown remote session");
 }
 
 async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {

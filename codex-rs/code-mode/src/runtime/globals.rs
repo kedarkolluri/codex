@@ -1,3 +1,5 @@
+use codex_code_mode_protocol::ExecuteOutputPolicy;
+
 use super::RuntimeState;
 use super::callbacks::audio_callback;
 use super::callbacks::clear_timeout_callback;
@@ -14,6 +16,10 @@ use super::callbacks::yield_control_callback;
 
 pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
     let global = scope.get_current_context().global(scope);
+    let output_policy = scope
+        .get_slot::<RuntimeState>()
+        .map(|state| state.output_policy)
+        .ok_or_else(|| "runtime state unavailable".to_string())?;
     delete_global(scope, global, "console")?;
     delete_global(scope, global, "Atomics")?;
     delete_global(scope, global, "SharedArrayBuffer")?;
@@ -21,8 +27,6 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
 
     let tools = build_tools_object(scope)?;
     let all_tools = build_all_tools_value(scope)?;
-    let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
-    let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
     let text = helper_function(scope, "text", text_callback)?;
     let image = helper_function(scope, "image", image_callback)?;
     let audio = helper_function(scope, "audio", audio_callback)?;
@@ -35,8 +39,12 @@ pub(super) fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), St
 
     set_global(scope, global, "tools", tools.into())?;
     set_global(scope, global, "ALL_TOOLS", all_tools)?;
-    set_global(scope, global, "clearTimeout", clear_timeout.into())?;
-    set_global(scope, global, "setTimeout", set_timeout.into())?;
+    if output_policy == ExecuteOutputPolicy::Ordinary {
+        let clear_timeout = helper_function(scope, "clearTimeout", clear_timeout_callback)?;
+        let set_timeout = helper_function(scope, "setTimeout", set_timeout_callback)?;
+        set_global(scope, global, "clearTimeout", clear_timeout.into())?;
+        set_global(scope, global, "setTimeout", set_timeout.into())?;
+    }
     set_global(scope, global, "text", text.into())?;
     set_global(scope, global, "image", image.into())?;
     set_global(scope, global, "audio", audio.into())?;
