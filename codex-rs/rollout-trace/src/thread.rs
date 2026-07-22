@@ -301,7 +301,7 @@ impl ThreadTraceContext {
         );
     }
 
-    /// Starts a first-class code-mode cell lifecycle and returns its trace handle.
+    /// Starts a custom-tool-backed code-mode cell and returns its trace handle.
     pub fn start_code_cell_trace(
         &self,
         codex_turn_id: impl Into<CodexTurnId>,
@@ -311,6 +311,19 @@ impl ThreadTraceContext {
     ) -> CodeCellTraceContext {
         let context = self.code_cell_trace_context(codex_turn_id, runtime_cell_id);
         context.record_started(model_visible_call_id, source_js);
+        context
+    }
+
+    /// Starts a function-backed code-mode cell and returns its trace handle.
+    pub fn start_function_code_cell_trace(
+        &self,
+        codex_turn_id: impl Into<CodexTurnId>,
+        runtime_cell_id: impl Into<String>,
+        model_visible_call_id: impl Into<String>,
+        source_js: impl Into<String>,
+    ) -> CodeCellTraceContext {
+        let context = self.code_cell_trace_context(codex_turn_id, runtime_cell_id);
+        context.record_function_started(model_visible_call_id, source_js);
         context
     }
 

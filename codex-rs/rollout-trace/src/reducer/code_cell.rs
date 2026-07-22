@@ -1,17 +1,17 @@
 //! Code-mode reduction.
 //!
-//! A code cell is the runtime parent for model-authored `exec`
-//! JavaScript. Nested tools, waits, and terminal operations hang off this
-//! object so viewers can inspect runtime work without flattening it into the
-//! model-visible conversation.
+//! A code cell is the runtime parent for model-authored JavaScript entered
+//! through `exec` or a function-backed workflow. Nested tools, waits, and
+//! terminal operations hang off this object so viewers can inspect runtime
+//! work without flattening it into the model-visible conversation.
 //!
 //! The reducer has to reconcile two clocks:
 //! - model-visible items come from inference request/response payloads;
 //! - runtime work starts as soon as Codex dispatches the tool.
 //!
 //! In real traces `CodeCellStarted` can arrive before the inference completion
-//! payload that contains the `custom_tool_call` item. We therefore queue starts
-//! until their source conversation item exists, then attach runtime edges.
+//! payload that contains its source call item. We therefore queue starts until
+//! that source conversation item exists, then attach runtime edges.
 
 use anyhow::Context;
 use anyhow::Result;
@@ -29,6 +29,7 @@ use crate::model::ProducerRef;
 use crate::model::ToolCallId;
 use crate::model::ToolCallRequester;
 use crate::payload::RawPayloadRef;
+use crate::raw_event::CodeCellModelVisibleCallKind;
 use crate::raw_event::RawEventSeq;
 use crate::raw_event::RawToolCallRequester;
 
@@ -41,13 +42,14 @@ pub(super) struct StartedCodeCell {
     pub(super) code_cell_id: CodeCellId,
     pub(super) runtime_cell_id: String,
     pub(super) model_visible_call_id: crate::model::ModelVisibleCallId,
+    pub(super) model_visible_call_kind: CodeCellModelVisibleCallKind,
     pub(super) source_js: String,
 }
 
 /// Queued code-cell start waiting for its model-visible source item.
 ///
 /// Code execution can begin before inference stream completion records the
-/// custom-tool call item that authored it. This wrapper keeps the original
+/// source call item that authored it. This wrapper keeps the original
 /// event timing intact until that source item exists.
 pub(super) struct PendingCodeCellStart {
     pub(super) seq: RawEventSeq,
@@ -152,11 +154,12 @@ impl TraceReducer {
             &thread_id,
             &started.code_cell_id,
             &started.model_visible_call_id,
+            started.model_visible_call_kind,
         )?;
         let output_item_ids = self.model_visible_code_cell_item_ids(
             &thread_id,
             &started.model_visible_call_id,
-            ConversationItemKind::CustomToolCallOutput,
+            output_item_kind(started.model_visible_call_kind),
         );
         // Runtime events may also have arrived while the start was queued.
         // Seed these reverse links from already-reduced tool calls so replay is
@@ -210,7 +213,7 @@ impl TraceReducer {
         Ok(())
     }
 
-    /// Returns the source item if the model-visible `exec` call has been reduced.
+    /// Returns the source item if the model-visible call has been reduced.
     fn source_item_id_for_pending_code_cell(
         &self,
         pending: &PendingCodeCellStart,
@@ -219,7 +222,7 @@ impl TraceReducer {
             .model_visible_code_cell_item_ids(
                 &pending.thread_id,
                 &pending.started.model_visible_call_id,
-                ConversationItemKind::CustomToolCall,
+                source_item_kind(pending.started.model_visible_call_kind),
             )
             .into_iter()
             .next())
@@ -500,8 +503,8 @@ impl TraceReducer {
 
     /// Attaches a later-observed model-visible output item to its code cell.
     ///
-    /// This is used when an inference request carries a custom-tool output after
-    /// the runtime cell already exists.
+    /// This is used when an inference request carries a function/custom-tool
+    /// output after the runtime cell already exists.
     pub(super) fn attach_model_visible_code_cell_item(
         &mut self,
         item_id: &str,
@@ -511,7 +514,10 @@ impl TraceReducer {
         let Some(call_id) = call_id else {
             return Ok(());
         };
-        if *kind != ConversationItemKind::CustomToolCallOutput {
+        if !matches!(
+            kind,
+            ConversationItemKind::FunctionCallOutput | ConversationItemKind::CustomToolCallOutput
+        ) {
             return Ok(());
         }
         // The output item can be observed after the CodeCell was created, e.g.
@@ -519,7 +525,25 @@ impl TraceReducer {
         // the model. Add the reverse ProducerRef at that later observation
         // point instead of copying runtime bytes into the conversation model.
         let code_cell_id = self.reduced_code_cell_id_for_model_visible_call(call_id);
-        if !self.rollout.code_cells.contains_key(&code_cell_id) {
+        let Some(cell) = self.rollout.code_cells.get(&code_cell_id) else {
+            return Ok(());
+        };
+        let Some(source_item) = self.rollout.conversation_items.get(&cell.source_item_id) else {
+            bail!(
+                "code cell {code_cell_id} referenced missing source item {}",
+                cell.source_item_id
+            );
+        };
+        if !matches!(
+            (&source_item.kind, kind),
+            (
+                ConversationItemKind::FunctionCall,
+                ConversationItemKind::FunctionCallOutput
+            ) | (
+                ConversationItemKind::CustomToolCall,
+                ConversationItemKind::CustomToolCallOutput
+            )
+        ) {
             return Ok(());
         }
         self.add_code_cell_output_item(&code_cell_id, item_id)
@@ -677,18 +701,20 @@ impl TraceReducer {
         thread_id: &str,
         code_cell_id: &str,
         model_visible_call_id: &str,
+        model_visible_call_kind: CodeCellModelVisibleCallKind,
     ) -> Result<String> {
+        let source_item_kind = source_item_kind(model_visible_call_kind);
         self.model_visible_code_cell_item_ids(
             thread_id,
             model_visible_call_id,
-            ConversationItemKind::CustomToolCall,
+            source_item_kind.clone(),
         )
         .into_iter()
         .next()
         .with_context(|| {
             format!(
                 "code cell {code_cell_id} referenced model-visible call {model_visible_call_id}, \
-                 but no custom tool call item was observed"
+                 but no {source_item_kind:?} item was observed"
             )
         })
     }
@@ -720,6 +746,20 @@ fn execution_status_for_code_cell(status: &CodeCellRuntimeStatus) -> ExecutionSt
         CodeCellRuntimeStatus::Completed => ExecutionStatus::Completed,
         CodeCellRuntimeStatus::Failed => ExecutionStatus::Failed,
         CodeCellRuntimeStatus::Terminated => ExecutionStatus::Cancelled,
+    }
+}
+
+fn source_item_kind(kind: CodeCellModelVisibleCallKind) -> ConversationItemKind {
+    match kind {
+        CodeCellModelVisibleCallKind::CustomToolCall => ConversationItemKind::CustomToolCall,
+        CodeCellModelVisibleCallKind::FunctionCall => ConversationItemKind::FunctionCall,
+    }
+}
+
+fn output_item_kind(kind: CodeCellModelVisibleCallKind) -> ConversationItemKind {
+    match kind {
+        CodeCellModelVisibleCallKind::CustomToolCall => ConversationItemKind::CustomToolCallOutput,
+        CodeCellModelVisibleCallKind::FunctionCall => ConversationItemKind::FunctionCallOutput,
     }
 }
 

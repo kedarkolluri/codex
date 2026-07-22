@@ -63,6 +63,18 @@ pub enum RawToolCallRequester {
     },
 }
 
+/// Model-visible call item that owns a code-mode cell.
+///
+/// Public `exec` cells use custom-tool calls, while function-backed entry
+/// points such as saved workflows use function calls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeCellModelVisibleCallKind {
+    #[default]
+    CustomToolCall,
+    FunctionCall,
+}
+
 /// Typed payload for a raw trace event.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
@@ -163,9 +175,15 @@ pub enum RawTraceEventPayload {
     CodeCellStarted {
         /// Runtime-local handle allocated by code mode for waits and nested tools.
         runtime_cell_id: String,
-        /// Custom tool call id on the model-visible `exec` item.
+        /// Call id on the model-visible item that started this cell.
         model_visible_call_id: ModelVisibleCallId,
-        /// JavaScript source after the public `exec` wrapper has been parsed.
+        /// Kind of model-visible call item that started this cell.
+        ///
+        /// Missing values in older trace bundles default to the custom-tool
+        /// shape used by the public `exec` entry point.
+        #[serde(default)]
+        model_visible_call_kind: CodeCellModelVisibleCallKind,
+        /// JavaScript source after the model-visible wrapper has been parsed.
         source_js: String,
     },
     CodeCellInitialResponse {

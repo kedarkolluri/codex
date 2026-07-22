@@ -478,6 +478,7 @@ fn code_mode_write_stdin_result_projects_structured_exec_fields() -> anyhow::Res
         RawTraceEventPayload::CodeCellStarted {
             runtime_cell_id: "cell-1".to_string(),
             model_visible_call_id: "call-code".to_string(),
+            model_visible_call_kind: crate::raw_event::CodeCellModelVisibleCallKind::CustomToolCall,
             source_js: "await tools.write_stdin({ chars: '' })".to_string(),
         },
     )?;

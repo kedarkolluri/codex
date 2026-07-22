@@ -106,13 +106,13 @@ struct TraceReducer {
     pending_compaction_replacement_item_ids: BTreeMap<String, Vec<String>>,
     /// Runtime cell ids indexed by thread-local code-mode handle.
     ///
-    /// Reduced `CodeCellId`s are based on the model-visible `exec` call id
+    /// Reduced `CodeCellId`s are based on the model-visible source call id
     /// because that is the durable source identity. Runtime lifecycle, nested
     /// tools, and `wait` calls arrive with the runtime-local `cell_id`, so this
     /// index is the one intentional bridge between those namespaces.
     code_cell_ids_by_runtime: BTreeMap<(String, String), String>,
-    /// Code-cell starts whose model-visible `custom_tool_call` item has not
-    /// been reduced yet.
+    /// Code-cell starts whose model-visible source call item has not been
+    /// reduced yet.
     ///
     /// Core begins executing tools before the stream-completion hook records
     /// the response payload that requested them. Queueing keeps replay strict
@@ -122,7 +122,7 @@ struct TraceReducer {
     /// Initial/end events that arrived while the matching start was queued.
     ///
     /// Fast cells can return before the inference response payload that proves
-    /// the model-visible `exec` source item has been reduced. The start remains
+    /// the model-visible source call item has been reduced. The start remains
     /// queued for ownership validation; these lifecycle events wait with it and
     /// are replayed in raw sequence order once the cell materializes.
     pending_code_cell_lifecycle_events: BTreeMap<String, Vec<PendingCodeCellLifecycleEvent>>,
@@ -307,6 +307,7 @@ impl TraceReducer {
             RawTraceEventPayload::CodeCellStarted {
                 runtime_cell_id,
                 model_visible_call_id,
+                model_visible_call_kind,
                 source_js,
             } => {
                 let thread_id = self.code_cell_event_thread_id(
@@ -331,6 +332,7 @@ impl TraceReducer {
                         code_cell_id: reduced_code_cell_id,
                         runtime_cell_id,
                         model_visible_call_id,
+                        model_visible_call_kind,
                         source_js,
                     },
                 })?;
