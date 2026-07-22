@@ -5,13 +5,16 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use codex_file_system as fs;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use futures::stream;
 use pretty_assertions::assert_eq;
+use tempfile::TempDir;
 
 use crate::WorkflowLoadError;
 use crate::WorkflowMetadata;
+use crate::WorkflowRegistry;
 use crate::WorkflowRoot;
 use crate::WorkflowScope;
 use crate::load_workflows_from_roots;
@@ -205,6 +208,31 @@ fn walk_options() -> fs::WalkOptions {
     }
 }
 
+fn workflow_source(name: &str) -> Vec<Bytes> {
+    vec![Bytes::from(format!(
+        "export const meta = {{ name: '{name}', description: 'test', phases: [] }};"
+    ))]
+}
+
+fn workflow(path: PathUri, name: &str) -> WorkflowMetadata {
+    WorkflowMetadata {
+        name: name.to_string(),
+        description: "test".to_string(),
+        phases: Vec::new(),
+        path,
+        scope: WorkflowScope::Project,
+    }
+}
+
+fn assert_executor(
+    registry: &WorkflowRegistry,
+    workflow: &WorkflowMetadata,
+    expected: &Arc<dyn fs::ExecutorFileSystem>,
+) {
+    let actual = registry.executor_file_system_for(workflow).unwrap();
+    assert!(Arc::ptr_eq(&actual, expected));
+}
+
 #[tokio::test]
 async fn foreign_discovery_stays_on_executor_and_keeps_safe_neighbors() {
     let alias_root = foreign_root();
@@ -218,12 +246,9 @@ async fn foreign_discovery_stays_on_executor_and_keeps_safe_neighbors() {
         (alias_root.clone(), canonical_root.clone()),
         (escaped.clone(), outside.clone()),
     ]);
-    synthetic.files.insert(
-        good.clone(),
-        vec![Bytes::from_static(
-            b"export const meta = { name: 'good', description: 'test', phases: [] };",
-        )],
-    );
+    synthetic
+        .files
+        .insert(good.clone(), workflow_source("good"));
     synthetic.walk = fs::WalkOutcome {
         entries: vec![
             file(good.clone()),
@@ -244,13 +269,7 @@ async fn foreign_discovery_stays_on_executor_and_keeps_safe_neighbors() {
         Arc::clone(&file_system),
     )])
     .await;
-    let expected = WorkflowMetadata {
-        name: "good".to_string(),
-        description: "test".to_string(),
-        phases: Vec::new(),
-        path: good.clone(),
-        scope: WorkflowScope::Project,
-    };
+    let expected = workflow(good.clone(), "good");
     assert_eq!(registry.workflows(), std::slice::from_ref(&expected));
     assert_eq!(
         registry.errors(),
@@ -269,10 +288,7 @@ async fn foreign_discovery_stays_on_executor_and_keeps_safe_neighbors() {
             },
         ]
     );
-    assert!(Arc::ptr_eq(
-        &registry.executor_file_system_for(&expected).unwrap(),
-        &file_system,
-    ));
+    assert_executor(&registry, &expected, &file_system);
     assert_eq!(
         calls.lock().unwrap().clone(),
         vec![
@@ -283,6 +299,45 @@ async fn foreign_discovery_stays_on_executor_and_keeps_safe_neighbors() {
             FileSystemCall::Metadata(good.clone()),
             FileSystemCall::Canonicalize(good.clone()),
             FileSystemCall::Read(good),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn host_convertible_executor_root_stays_on_supplied_file_system() {
+    let temp_dir = TempDir::new().unwrap();
+    let native_root =
+        AbsolutePathBuf::from_absolute_path_checked(temp_dir.path().join("executor-only")).unwrap();
+    assert!(!native_root.as_path().exists());
+    let root = PathUri::from_abs_path(&native_root);
+    assert_eq!(root.to_abs_path().unwrap(), native_root);
+    let candidate = root.join("native.js").unwrap();
+    let mut synthetic = SyntheticFileSystem::new(root.clone());
+    synthetic
+        .files
+        .insert(candidate.clone(), workflow_source("native"));
+    synthetic.walk.entries.push(file(candidate.clone()));
+    let calls = Arc::clone(&synthetic.calls);
+    let file_system: Arc<dyn fs::ExecutorFileSystem> = Arc::new(synthetic);
+
+    let registry = load_workflows_from_roots([WorkflowRoot::project_on_executor(
+        root.clone(),
+        Arc::clone(&file_system),
+    )])
+    .await;
+    let expected = workflow(candidate.clone(), "native");
+
+    assert_eq!(registry.workflows(), std::slice::from_ref(&expected));
+    assert_eq!(registry.errors(), &[]);
+    assert_executor(&registry, &expected, &file_system);
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![
+            FileSystemCall::Canonicalize(root.clone()),
+            FileSystemCall::Walk(root, walk_options()),
+            FileSystemCall::Metadata(candidate.clone()),
+            FileSystemCall::Canonicalize(candidate.clone()),
+            FileSystemCall::Read(candidate),
         ]
     );
 }

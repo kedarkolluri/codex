@@ -131,5 +131,9 @@ impl WorkflowRegistry {
 }
 
 #[cfg(test)]
+#[path = "registry_authority_tests.rs"]
+mod authority_tests;
+
+#[cfg(test)]
 #[path = "registry_tests.rs"]
 mod tests;
