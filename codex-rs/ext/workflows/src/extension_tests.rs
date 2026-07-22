@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use codex_core_workflows::WorkflowScope;
+use codex_core_workflows::WorkflowSourceResolver;
 use codex_exec_server::EnvironmentManager;
 use codex_exec_server::ExecServerError;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
@@ -122,6 +123,14 @@ async fn first_selected_environment_keeps_executor_filesystem_authority() {
         &[selection(LOCAL_ENVIRONMENT_ID, &cwd)],
     )
     .await;
+    let source_snapshot = thread_store
+        .get::<WorkflowSourceResolver>()
+        .expect("workflow source resolver")
+        .source_snapshot_by_name("executor")
+        .await
+        .expect("capture workflow source")
+        .expect("executor workflow source");
+    assert_eq!(source_snapshot.metadata().description, "selected executor");
     let session_registry = workflow_session_registry(&thread_store)
         .await
         .expect("workflow state")
@@ -402,4 +411,5 @@ async fn disabled_feature_stores_no_discovery_state() {
     .await;
 
     assert!(workflow_session_registry(&thread_store).await.is_none());
+    assert!(thread_store.get::<WorkflowSourceResolver>().is_none());
 }
