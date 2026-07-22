@@ -126,7 +126,10 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string()));
             return true;
         }
-        let output_admission = RemoteOutputAdmission::new(request.output_policy);
+        let output_admission = RemoteOutputAdmission::with_terminal_echo_budget(
+            request.output_policy,
+            self.terminal_echo_budget.clone(),
+        );
         let request = match request.try_into() {
             Ok(request) => request,
             Err(err) => {
@@ -262,6 +265,14 @@ impl ConnectionDriver {
                 return true;
             }
         };
+        let output_admission = match self.sessions.cell_output(&session, &cell_id) {
+            Ok(Some(output_admission)) => output_admission,
+            Ok(None) => RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
+            Err(err) => {
+                let _ = response_tx.send(Err(err));
+                return true;
+            }
+        };
         let pending_cell_id = cell_id.clone();
         self.send_request(
             HostRequest::Terminate {
@@ -271,6 +282,7 @@ impl ConnectionDriver {
             PendingRequest::Terminate {
                 session,
                 cell_id: pending_cell_id,
+                output_admission,
                 response_tx,
             },
         )

@@ -20,6 +20,7 @@ use super::cell_ids::validate_host_cell_ids;
 use super::cell_ids::wait_outcome_cell_id;
 use super::output_admission::AdmissionOutcome;
 use super::output_admission::RemoteOutputAdmission;
+use super::output_admission::ResponseDelivery;
 use super::request_tracker::CancellationAction;
 use super::session_registry::CellAdmissionError;
 use super::types::DeliveredExecute;
@@ -172,20 +173,21 @@ impl ConnectionDriver {
                     );
                     let started = StartedCell::from_result_receiver(public_id, initial_response_rx);
                     if cancellation.is_cancelled() || response_tx.is_closed() {
-                        return self.terminate_abandoned_cell(session, remote_cell_id);
+                        return self.terminate_abandoned(session, remote_cell_id, output_admission);
                     }
                     let delivered = DeliveredExecute {
                         request_id: id,
                         started,
                     };
                     if response_tx.send(Ok(delivered)).is_err() {
-                        return self.terminate_abandoned_cell(session, remote_cell_id);
+                        return self.terminate_abandoned(session, remote_cell_id, output_admission);
                     }
                     self.requests.insert_unclaimed_execute(
                         id,
                         UnclaimedExecute {
                             session,
                             cell_id: remote_cell_id,
+                            output_admission,
                             cancellation,
                         },
                     );
@@ -217,11 +219,15 @@ impl ConnectionDriver {
                             return self.fail_admitted(response_tx, reason, &output_admission);
                         }
                         let mut outcome: WaitOutcome = outcome.into();
-                        let response = match &mut outcome {
-                            WaitOutcome::LiveCell(response)
-                            | WaitOutcome::MissingCell(response) => response,
+                        let (response, delivery) = match &mut outcome {
+                            WaitOutcome::LiveCell(response) => {
+                                (response, ResponseDelivery::Observer)
+                            }
+                            WaitOutcome::MissingCell(response) => {
+                                (response, ResponseDelivery::Uncorrelated)
+                            }
                         };
-                        let admission = output_admission.admit_response(response);
+                        let admission = output_admission.admit_response(response, delivery);
                         (
                             Ok(public_wait_outcome(session.generation, outcome)),
                             admission,
@@ -241,9 +247,10 @@ impl ConnectionDriver {
             PendingRequest::Terminate {
                 session,
                 cell_id,
+                output_admission,
                 response_tx,
             } => {
-                let result = match result {
+                let (response, admission) = match result {
                     Ok(HostResponse::WaitCompleted { outcome }) => {
                         if wait_outcome_cell_id(&outcome) != &cell_id {
                             let reason = format!(
@@ -251,24 +258,33 @@ impl ConnectionDriver {
                                 wait_outcome_cell_id(&outcome).as_str(),
                                 cell_id.as_str()
                             );
-                            let _ = response_tx.send(Err(reason.clone()));
-                            self.fail(reason);
-                            return false;
+                            return self.fail_admitted(response_tx, reason, &output_admission);
                         }
-                        public_wait_outcome(session.generation, outcome.into())
+                        let mut outcome: WaitOutcome = outcome.into();
+                        let (response, delivery) = match &mut outcome {
+                            WaitOutcome::LiveCell(response) => {
+                                (response, ResponseDelivery::Terminate)
+                            }
+                            WaitOutcome::MissingCell(response) => {
+                                (response, ResponseDelivery::Uncorrelated)
+                            }
+                        };
+                        let admission = output_admission.admit_response(response, delivery);
+                        (
+                            Ok(public_wait_outcome(session.generation, outcome)),
+                            admission,
+                        )
                     }
                     Ok(_) => {
                         let reason = "code-mode host returned an invalid cell response".to_string();
-                        let _ = response_tx.send(Err(reason.clone()));
-                        self.fail(reason);
-                        return false;
+                        return self.fail_admitted(response_tx, reason, &output_admission);
                     }
                     Err(err) => {
-                        let _ = response_tx.send(Err(err));
-                        return true;
+                        let (err, admission) = output_admission.admit_error(err);
+                        (Err(err), admission)
                     }
                 };
-                let _ = response_tx.send(Ok(result));
+                return self.deliver_admitted(response_tx, response, admission);
             }
             PendingRequest::ShutdownSession {
                 session,
@@ -322,7 +338,7 @@ impl ConnectionDriver {
                 if !self.send_cancel_request(request_id) {
                     return false;
                 }
-                self.terminate_abandoned_cell(execute.session, execute.cell_id)
+                self.terminate_abandoned(execute.session, execute.cell_id, execute.output_admission)
             }
         }
     }
@@ -364,7 +380,12 @@ impl ConnectionDriver {
         )
     }
 
-    fn terminate_abandoned_cell(&mut self, session: RemoteSession, cell_id: WireCellId) -> bool {
+    fn terminate_abandoned(
+        &mut self,
+        session: RemoteSession,
+        cell_id: WireCellId,
+        output_admission: RemoteOutputAdmission,
+    ) -> bool {
         let Some(is_closing) = self.sessions.is_closing(&session.id) else {
             self.fail(format!(
                 "code-mode host admitted an abandoned cell in unknown session {}",
@@ -385,6 +406,7 @@ impl ConnectionDriver {
             PendingRequest::Terminate {
                 session,
                 cell_id,
+                output_admission,
                 response_tx,
             },
         )
@@ -404,7 +426,9 @@ impl ConnectionDriver {
         let (response, admission) = match result {
             Ok(response) if runtime_response_cell_id(&response) == &initial.cell_id => {
                 let mut response: RuntimeResponse = response.into();
-                let admission = initial.output_admission.admit_response(&mut response);
+                let admission = initial
+                    .output_admission
+                    .admit_response(&mut response, ResponseDelivery::Observer);
                 (
                     Ok(public_runtime_response(initial.generation, response)),
                     admission,

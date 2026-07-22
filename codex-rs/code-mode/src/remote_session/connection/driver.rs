@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(in crate::remote_session) use self::cleanup::SessionCleanup;
 use self::delegate_runtime::DelegateRuntime;
+use self::output_admission::TerminalEchoBudget;
 use self::request_tracker::RequestTracker;
 use self::session_registry::SessionRegistry;
 pub(super) use self::types::DriverCommand;
@@ -43,6 +44,7 @@ pub(super) struct ConnectionDriver {
     requests: RequestTracker,
     sessions: SessionRegistry,
     delegates: DelegateRuntime,
+    terminal_echo_budget: TerminalEchoBudget,
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
@@ -68,6 +70,7 @@ impl ConnectionDriver {
                 requests: RequestTracker::new(),
                 sessions: SessionRegistry::new(),
                 delegates: DelegateRuntime::new(event_tx),
+                terminal_echo_budget: TerminalEchoBudget::new(),
                 alive: lifecycle.alive,
                 failure: lifecycle.failure,
                 cancellation: lifecycle.cancellation,
