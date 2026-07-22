@@ -399,6 +399,27 @@ impl Stream for FileSystemReadStream {
     }
 }
 
+/// Bounds an immutable, executor-verified file capture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedFileReadOptions {
+    /// Maximum number of bytes the captured file may contain.
+    pub max_bytes: u64,
+}
+
+/// Immutable bytes captured by an executor from one verified opened file object.
+///
+/// The stream must contain exactly [`Self::size`] bytes. Implementations must open the final entry
+/// without following a symlink or reparse point, require a regular file, and verify that the
+/// requested canonical path still names that same object after capture. Observed identity, file
+/// state, size, or content drift must fail closed. These portable checks do not claim a universal
+/// read transaction on every mutable filesystem.
+pub struct VerifiedFileRead {
+    /// Exact number of bytes in the immutable capture.
+    pub size: u64,
+    /// Stream over the immutable captured bytes.
+    pub stream: FileSystemReadStream,
+}
+
 /// Abstract filesystem access used by components that may operate locally or via
 /// a remote environment.
 pub trait ExecutorFileSystem: Send + Sync {
@@ -421,6 +442,28 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Captures one bounded file through the filesystem authority that owns `path`.
+    ///
+    /// This operation is deliberately separate from metadata inspection plus
+    /// [`Self::read_file_stream`]: implementations must not emulate it with those independently
+    /// mutable operations. The complete capture and reported size must not exceed
+    /// [`VerifiedFileReadOptions::max_bytes`]. Filesystems that cannot provide every guarantee fail
+    /// closed.
+    fn read_file_verified<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: VerifiedFileReadOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, VerifiedFileRead> {
+        let _ = (path, options, sandbox);
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified file reads are not supported by this filesystem",
+            ))
+        })
+    }
 
     /// Reads a file and decodes it as UTF-8 text.
     fn read_file_text<'a>(

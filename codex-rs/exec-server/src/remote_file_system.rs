@@ -15,6 +15,8 @@ use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::ReadDirectoryEntry;
 use crate::RemoveOptions;
+use crate::VerifiedFileRead;
+use crate::VerifiedFileReadOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::client::LazyRemoteExecServerClient;
@@ -98,6 +100,23 @@ impl RemoteFileSystem {
         trace!("remote fs read_file_stream");
         let client = self.client.get().await.map_err(map_remote_error)?;
         file_stream::open(client, path.clone(), remote_sandbox_context(sandbox)).await
+    }
+
+    async fn read_file_verified(
+        &self,
+        path: &PathUri,
+        options: VerifiedFileReadOptions,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<VerifiedFileRead> {
+        trace!("remote fs read_file_verified");
+        let client = self.client.get().await.map_err(map_remote_error)?;
+        file_stream::open_verified(
+            client,
+            path.clone(),
+            options,
+            remote_sandbox_context(sandbox),
+        )
+        .await
     }
 
     async fn write_file(
@@ -285,6 +304,17 @@ impl ExecutorFileSystem for RemoteFileSystem {
         Box::pin(RemoteFileSystem::read_file_stream(self, path, sandbox))
     }
 
+    fn read_file_verified<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: VerifiedFileReadOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, VerifiedFileRead> {
+        Box::pin(RemoteFileSystem::read_file_verified(
+            self, path, options, sandbox,
+        ))
+    }
+
     fn write_file<'a>(
         &'a self,
         path: &'a PathUri,
@@ -380,9 +410,26 @@ fn map_remote_error(error: ExecServerError) -> io::Error {
     }
 }
 
+fn map_verified_file_read_error(error: ExecServerError) -> io::Error {
+    match error {
+        ExecServerError::Server {
+            code: METHOD_NOT_FOUND_ERROR_CODE,
+            ..
+        } => io::Error::new(
+            io::ErrorKind::Unsupported,
+            "verified file reads are not supported by this executor",
+        ),
+        error => map_remote_error(error),
+    }
+}
+
 #[cfg(all(test, any(unix, windows)))]
 #[path = "remote_file_system_path_uri_tests.rs"]
 mod path_uri_tests;
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "remote_verified_file_system_tests.rs"]
+mod verified_tests;
 
 #[cfg(test)]
 mod tests {
