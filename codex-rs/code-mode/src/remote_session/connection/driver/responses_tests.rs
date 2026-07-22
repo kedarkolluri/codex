@@ -40,6 +40,7 @@ use super::super::DriverEvent;
 use super::super::DriverLifecycle;
 use super::super::RemoteSession;
 use super::super::SessionCleanup;
+use super::super::cell_ids::validate_host_cell_ids;
 use super::super::output_admission::AdmissionOutcome;
 use super::super::output_admission::RemoteOutputAdmission;
 use super::super::types::CancellableRequest;
@@ -47,7 +48,6 @@ use super::super::types::DeliveredExecute;
 use super::super::types::InitialResponse;
 use super::super::types::PendingRequest;
 use super::ConnectionDriver;
-use super::validate_host_cell_ids;
 
 fn direct_driver() -> (ConnectionDriver, Arc<AtomicBool>) {
     let (driver, alive, _outgoing_rx) = direct_driver_with_outgoing();

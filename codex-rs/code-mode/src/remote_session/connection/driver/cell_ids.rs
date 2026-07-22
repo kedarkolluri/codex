@@ -2,7 +2,12 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::DelegateRequest;
+use codex_code_mode_protocol::host::HostResponse;
+use codex_code_mode_protocol::host::HostToClient;
+use codex_code_mode_protocol::host::InvalidWireCellId;
 use codex_code_mode_protocol::host::WireCellId;
+use codex_code_mode_protocol::host::WireResult;
 use codex_code_mode_protocol::host::WireRuntimeResponse;
 use codex_code_mode_protocol::host::WireWaitOutcome;
 use codex_code_mode_protocol::host::WireWaitRequest;
@@ -107,6 +112,39 @@ pub(super) fn wait_outcome_cell_id(outcome: &WireWaitOutcome) -> &WireCellId {
         WireWaitOutcome::LiveCell(response) | WireWaitOutcome::MissingCell(response) => {
             runtime_response_cell_id(response)
         }
+    }
+}
+
+pub(super) fn validate_host_cell_ids(message: &HostToClient) -> Result<(), InvalidWireCellId> {
+    match message {
+        HostToClient::Response {
+            result: WireResult::Ok { value },
+            ..
+        } => match value {
+            HostResponse::ExecutionStarted { cell_id } => cell_id.validate(),
+            HostResponse::WaitCompleted { outcome } => wait_outcome_cell_id(outcome).validate(),
+            HostResponse::SessionReady { .. } | HostResponse::SessionClosed { .. } => Ok(()),
+        },
+        HostToClient::InitialResponse {
+            result: WireResult::Ok { value },
+            ..
+        } => runtime_response_cell_id(value).validate(),
+        HostToClient::DelegateRequest { request, .. } => match request {
+            DelegateRequest::InvokeTool { invocation } => invocation.cell_id.validate(),
+            DelegateRequest::Notify { cell_id, .. } => cell_id.validate(),
+        },
+        HostToClient::CellClosed { cell_id, .. } => cell_id.validate(),
+        HostToClient::HostHello(_)
+        | HostToClient::HandshakeRejected { .. }
+        | HostToClient::Response {
+            result: WireResult::Err { .. },
+            ..
+        }
+        | HostToClient::InitialResponse {
+            result: WireResult::Err { .. },
+            ..
+        }
+        | HostToClient::CancelDelegateRequest { .. } => Ok(()),
     }
 }
 

@@ -4,21 +4,19 @@ use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::host::ClientToHost;
-use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
-use codex_code_mode_protocol::host::InvalidWireCellId;
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::WireCellId;
-use codex_code_mode_protocol::host::WireResult;
 use tokio::sync::oneshot;
 
 use super::ConnectionDriver;
 use super::cell_ids::public_runtime_response;
 use super::cell_ids::public_wait_outcome;
 use super::cell_ids::runtime_response_cell_id;
+use super::cell_ids::validate_host_cell_ids;
 use super::cell_ids::wait_outcome_cell_id;
 use super::output_admission::AdmissionOutcome;
 use super::output_admission::RemoteOutputAdmission;
@@ -458,39 +456,6 @@ impl ConnectionDriver {
         let _ = response_tx.send(Err(visible_reason.clone()));
         self.fail(visible_reason);
         false
-    }
-}
-
-fn validate_host_cell_ids(message: &HostToClient) -> Result<(), InvalidWireCellId> {
-    match message {
-        HostToClient::Response {
-            result: WireResult::Ok { value },
-            ..
-        } => match value {
-            HostResponse::ExecutionStarted { cell_id } => cell_id.validate(),
-            HostResponse::WaitCompleted { outcome } => wait_outcome_cell_id(outcome).validate(),
-            HostResponse::SessionReady { .. } | HostResponse::SessionClosed { .. } => Ok(()),
-        },
-        HostToClient::InitialResponse {
-            result: WireResult::Ok { value },
-            ..
-        } => runtime_response_cell_id(value).validate(),
-        HostToClient::DelegateRequest { request, .. } => match request {
-            DelegateRequest::InvokeTool { invocation } => invocation.cell_id.validate(),
-            DelegateRequest::Notify { cell_id, .. } => cell_id.validate(),
-        },
-        HostToClient::CellClosed { cell_id, .. } => cell_id.validate(),
-        HostToClient::HostHello(_)
-        | HostToClient::HandshakeRejected { .. }
-        | HostToClient::Response {
-            result: WireResult::Err { .. },
-            ..
-        }
-        | HostToClient::InitialResponse {
-            result: WireResult::Err { .. },
-            ..
-        }
-        | HostToClient::CancelDelegateRequest { .. } => Ok(()),
     }
 }
 
