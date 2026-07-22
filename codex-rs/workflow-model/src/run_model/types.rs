@@ -1,5 +1,7 @@
 use std::fmt;
 
+use codex_protocol::ThreadId;
+
 /// Lifecycle of the workflow run represented by the workflow projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkflowRunState {
@@ -123,6 +125,46 @@ pub enum WorkflowModelError {
         phase_index: u64,
         parent_phase_index: u64,
     },
+    AgentPhaseMismatch {
+        node_id: u64,
+        expected: String,
+        actual: String,
+    },
+    UnknownAgent {
+        node_id: u64,
+    },
+    TopologyKindMismatch {
+        node_id: u64,
+        expected: &'static str,
+    },
+    UnexpectedAgentAttempt {
+        node_id: u64,
+        expected: u32,
+        actual: u32,
+    },
+    AgentRetryLimitExceeded {
+        node_id: u64,
+        maximum: u32,
+    },
+    AgentAttemptReasonMismatch {
+        node_id: u64,
+    },
+    AgentDefinitionMismatch {
+        node_id: u64,
+    },
+    InvalidChildThreadId {
+        node_id: u64,
+    },
+    ConflictingAgentBinding {
+        node_id: u64,
+        existing_child_thread_id: ThreadId,
+        child_thread_id: ThreadId,
+    },
+    ChildThreadAlreadyBound {
+        node_id: u64,
+        existing_node_id: u64,
+        child_thread_id: ThreadId,
+    },
     UnknownGroup {
         group_id: u64,
     },
@@ -202,6 +244,16 @@ impl fmt::Display for WorkflowModelError {
             | Self::MissingParent { .. }
             | Self::ParentNotActive { .. }
             | Self::ParentPhaseMismatch { .. }
+            | Self::AgentPhaseMismatch { .. }
+            | Self::UnknownAgent { .. }
+            | Self::TopologyKindMismatch { .. }
+            | Self::UnexpectedAgentAttempt { .. }
+            | Self::AgentRetryLimitExceeded { .. }
+            | Self::AgentAttemptReasonMismatch { .. }
+            | Self::AgentDefinitionMismatch { .. }
+            | Self::InvalidChildThreadId { .. }
+            | Self::ConflictingAgentBinding { .. }
+            | Self::ChildThreadAlreadyBound { .. }
             | Self::UnknownGroup { .. }
             | Self::GroupDefinitionMismatch { .. }
             | Self::ActiveChildAtGroupEnd { .. }

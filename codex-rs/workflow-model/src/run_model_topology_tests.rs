@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 
-use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AgentStatus;
 use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::WorkflowAgentBeginEvent;
-use codex_protocol::protocol::WorkflowAgentBoundEvent;
 use codex_protocol::protocol::WorkflowAgentEndEvent;
 use codex_protocol::protocol::WorkflowAgentUpdatedEvent;
 use codex_protocol::protocol::WorkflowEvent;
@@ -250,26 +247,9 @@ fn topology_cap_is_exact_and_transactional() {
 }
 
 #[test]
-fn deferred_agent_events_are_unhandled_without_mutation() {
+fn deferred_agent_terminal_events_are_unhandled_without_mutation() {
     let mut model = WorkflowRunModel::from_event(&run_begin(&[])).expect("run should begin");
     let events = [
-        WorkflowEvent::AgentBegin(WorkflowAgentBeginEvent {
-            run_id: RUN_ID.to_string(),
-            node_id: 0,
-            attempt: 0,
-            last_attempt_reason: None,
-            parent_node_id: None,
-            label: "review".to_string(),
-            phase: None,
-            model: "gpt-5".to_string(),
-            effort: ReasoningEffort::High,
-        }),
-        WorkflowEvent::AgentBound(WorkflowAgentBoundEvent {
-            run_id: RUN_ID.to_string(),
-            node_id: 0,
-            attempt: 0,
-            child_thread_id: "019b0214-7c3f-7d80-bd83-88cb759c24a7".to_string(),
-        }),
         WorkflowEvent::AgentUpdated(WorkflowAgentUpdatedEvent {
             run_id: RUN_ID.to_string(),
             node_id: 0,
