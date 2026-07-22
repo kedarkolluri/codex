@@ -8,6 +8,19 @@ use crate::WorkflowLoadError;
 use crate::WorkflowMetadata;
 use crate::WorkflowScope;
 
+fn host_registry(
+    workflows: Vec<WorkflowMetadata>,
+    errors: Vec<WorkflowLoadError>,
+) -> WorkflowRegistry {
+    WorkflowRegistry::from_discovery(
+        workflows
+            .into_iter()
+            .map(|workflow| (workflow, None))
+            .collect(),
+        errors,
+    )
+}
+
 fn path(root: &TempDir, relative: &str) -> PathUri {
     let path = AbsolutePathBuf::from_absolute_path_checked(root.path().join(relative)).unwrap();
     PathUri::from_abs_path(&path)
@@ -61,7 +74,7 @@ fn applies_scope_precedence_independently_of_discovery_order() {
         WorkflowScope::Personal,
     );
 
-    let registry = WorkflowRegistry::new(
+    let registry = host_registry(
         vec![codex_home, personal, personal_only.clone(), project.clone()],
         Vec::new(),
     );
@@ -115,7 +128,7 @@ fn deduplicates_identical_paths_before_names_with_deterministic_ties() {
         WorkflowScope::Personal,
     );
 
-    let registry = WorkflowRegistry::new(
+    let registry = host_registry(
         vec![
             lexically_later,
             shared_path_personal,
@@ -162,7 +175,7 @@ fn sorts_diagnostics_and_resolves_exact_case_sensitive_names() {
         message: "unreadable".to_string(),
     };
 
-    let registry = WorkflowRegistry::new(
+    let registry = host_registry(
         vec![lowercase.clone(), uppercase.clone()],
         vec![second_error.clone(), first_error.clone()],
     );

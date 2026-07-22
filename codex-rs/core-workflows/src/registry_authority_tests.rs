@@ -339,3 +339,28 @@ fn exact_cross_authority_tie_follows_root_order_without_stable_authority_id() {
     assert!(host_first.executor_file_system_for(&workflow).is_none());
     assert_executor(&executor_b_first, &workflow, &file_system_b);
 }
+
+#[tokio::test]
+async fn source_snapshot_fails_closed_for_executor_entry() {
+    let file_system = identity_file_system();
+    let authority = authority(&file_system);
+    let workflow = workflow(
+        "file:///remote/workflows/review.js",
+        "review",
+        "Review changes",
+        WorkflowScope::Project,
+    );
+    let registry =
+        WorkflowRegistry::from_discovery(vec![(workflow.clone(), Some(authority))], Vec::new());
+
+    assert_eq!(registry.source_snapshot_by_name("Review").await, Ok(None));
+    let error = registry
+        .source_snapshot_by_name("review")
+        .await
+        .unwrap_err();
+    assert_eq!(error.path(), &workflow.path);
+    assert_eq!(
+        error.message(),
+        "executor-backed workflow source capture is not supported"
+    );
+}

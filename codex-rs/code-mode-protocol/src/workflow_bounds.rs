@@ -35,6 +35,8 @@ pub const WORKFLOW_ARGS_MAX_DEPTH: usize = 64;
 /// The raw function-call arguments remain in parent model history, so this bound includes JSON
 /// whitespace and escaping that disappear when the nested `args` value is reserialized.
 pub const WORKFLOW_MODEL_CALL_MAX_BYTES: usize = 4 * 1024;
+/// Maximum UTF-8 byte length of one complete saved-workflow source snapshot.
+pub const WORKFLOW_SOURCE_MAX_BYTES: usize = 1024 * 1024;
 /// Maximum serialized byte length of model-authored workflow `args`.
 ///
 /// The smaller nested-value cap leaves room inside [`WORKFLOW_MODEL_CALL_MAX_BYTES`] for the saved
