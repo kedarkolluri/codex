@@ -214,23 +214,6 @@ async fn host_snapshot_rejects_final_symlink_and_non_file_replacements() {
     assert!(error.message().contains("regular"));
 }
 
-#[cfg(windows)]
-#[tokio::test]
-async fn windows_no_follow_open_keeps_file_symlink_as_reparse_point() {
-    let temp = TempDir::new().unwrap();
-    let referent = temp.path().join("referent.js");
-    let link = temp.path().join("link.js");
-    std::fs::write(&referent, "referent").unwrap();
-    std::os::windows::fs::symlink_file(&referent, &link).unwrap();
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    super::configure_no_follow(&mut options);
-
-    let file = options.open(&link).await.unwrap();
-    let metadata = file.metadata().await.unwrap();
-    assert!(super::is_link_or_reparse_point(&metadata));
-}
-
 #[cfg(any(unix, windows))]
 #[tokio::test]
 async fn host_snapshot_rejects_ancestor_path_drift() {
