@@ -23,6 +23,7 @@ use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_rollout::state_db::StateDbHandle;
 use codex_thread_store::ThreadStore;
+use codex_utils_absolute_path::AbsolutePathBuf;
 
 use crate::outgoing_message::OutgoingMessageSender;
 use crate::thread_state::ThreadListenerCommand;
@@ -74,6 +75,11 @@ where
     codex_guardian::install(&mut builder, guardian_agent_spawner);
     codex_memories_extension::install(&mut builder, codex_otel::global());
     codex_mcp_extension::install(&mut builder);
+    codex_workflows_extension::install(
+        &mut builder,
+        Arc::clone(&environment_manager),
+        workflow_extension_config,
+    );
     codex_mcp_extension::install_executor_plugins(&mut builder, environment_manager);
     codex_web_search_extension::install(&mut builder, auth_manager.clone());
     codex_image_generation_extension::install(&mut builder, auth_manager, |config: &Config| {
@@ -99,6 +105,21 @@ where
         },
     );
     Arc::new(builder.build())
+}
+
+fn workflow_extension_config(
+    config: &Config,
+) -> codex_workflows_extension::WorkflowExtensionConfig {
+    codex_workflows_extension::WorkflowExtensionConfig {
+        enabled: config.features.enabled(codex_features::Feature::Workflow),
+        codex_home: config.codex_home.clone(),
+        user_home: dirs::home_dir()
+            .and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok()),
+        fallback_cwd: config.cwd.clone(),
+        project_root_markers: codex_config::effective_project_root_markers(
+            &config.config_layer_stack,
+        ),
+    }
 }
 
 pub(crate) fn app_server_extension_event_sink(
