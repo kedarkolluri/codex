@@ -45,6 +45,7 @@ use super::RequestRegistry;
 use super::SeenSessionIds;
 use super::peer::HostPeer;
 use super::run;
+use super::workflow_cell_ids::WorkflowCellSequenceGuard;
 
 fn client_hello(
     versions: impl IntoIterator<Item = ProtocolVersion>,
@@ -401,7 +402,7 @@ async fn paired_saved_workflow_capabilities_preserve_exact_lifecycle_ids() {
             id: request_id(/*value*/ 2),
             request: HostRequest::Execute {
                 session_id: session_id.clone(),
-                request,
+                request: request.clone(),
             },
         })
         .await
@@ -484,6 +485,30 @@ async fn paired_saved_workflow_capabilities_preserve_exact_lifecycle_ids() {
             id: request_id(/*value*/ 3),
             request: HostRequest::Execute {
                 session_id: session_id.clone(),
+                request,
+            },
+        })
+        .await
+        .expect("replay saved workflow identity");
+    assert_eq!(
+        reader
+            .read::<HostToClient>()
+            .await
+            .expect("replay response"),
+        Some(HostToClient::Response {
+            id: request_id(/*value*/ 3),
+            result: WireResult::Err {
+                message: "invalid code-mode execute request: workflow cell identity was rejected"
+                    .to_string(),
+            },
+        })
+    );
+
+    writer
+        .write(&ClientToHost::Request {
+            id: request_id(/*value*/ 4),
+            request: HostRequest::Execute {
+                session_id: session_id.clone(),
                 request: execute_request(r#"text("ordinary");"#),
             },
         })
@@ -495,7 +520,7 @@ async fn paired_saved_workflow_capabilities_preserve_exact_lifecycle_ids() {
             .await
             .expect("ordinary execution started"),
         Some(HostToClient::Response {
-            id: request_id(/*value*/ 3),
+            id: request_id(/*value*/ 4),
             result: WireResult::Ok {
                 value: HostResponse::ExecutionStarted {
                     cell_id: WireCellId::try_new("1").expect("ordinary cell ID"),
@@ -616,6 +641,7 @@ async fn request_task_panic_disconnects_host() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        workflow_cell_sequence: Mutex::new(WorkflowCellSequenceGuard::default()),
         selected_capabilities: CapabilitySet::empty(),
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
@@ -646,6 +672,7 @@ async fn execute_request_id_remains_active_until_initial_response() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(MAX_ACTIVE_CELLS)),
+        workflow_cell_sequence: Mutex::new(WorkflowCellSequenceGuard::default()),
         selected_capabilities: CapabilitySet::empty(),
         closing: AtomicBool::new(false),
         peer,
@@ -706,6 +733,7 @@ async fn active_cell_limit_rejects_execute_without_disconnecting() {
         request_tasks: TaskTracker::new(),
         request_permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS)),
         active_cell_permits: Arc::new(Semaphore::new(/*permits*/ 0)),
+        workflow_cell_sequence: Mutex::new(WorkflowCellSequenceGuard::default()),
         selected_capabilities: CapabilitySet::empty(),
         closing: AtomicBool::new(false),
         peer: Arc::clone(&peer),
