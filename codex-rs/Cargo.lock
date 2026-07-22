@@ -2853,6 +2853,7 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
  "futures",
+ "libc",
  "pretty_assertions",
  "tempfile",
  "tokio",

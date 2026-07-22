@@ -23,7 +23,11 @@ impl WorkflowRegistry {
     /// scope: project entries win over personal entries, which win over Codex-home entries. Ties
     /// within one scope use the lexicographically smallest canonical `file:` URI. Exact
     /// cross-authority ties retain root order; all other output is deterministic.
-    pub fn new(workflows: Vec<WorkflowMetadata>, errors: Vec<WorkflowLoadError>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn from_host(
+        workflows: Vec<WorkflowMetadata>,
+        errors: Vec<WorkflowLoadError>,
+    ) -> Self {
         Self::from_discovery(
             workflows
                 .into_iter()

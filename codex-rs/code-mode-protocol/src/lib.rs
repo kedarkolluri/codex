@@ -62,6 +62,7 @@ pub use workflow_bounds::WORKFLOW_OUTPUT_MAX_ITEMS;
 pub use workflow_bounds::WORKFLOW_PHASE_MAX_EVENTS;
 pub use workflow_bounds::WORKFLOW_PHASE_TITLE_MAX_BYTES;
 pub use workflow_bounds::WORKFLOW_PHASES_MAX_ITEMS;
+pub use workflow_bounds::WORKFLOW_SOURCE_MAX_BYTES;
 pub use workflow_bounds::WORKFLOW_TOPOLOGY_MAX_NODES;
 pub use workflow_bounds::WorkflowOutputBounds;
 pub use workflow_bounds::ensure_workflow_agent_label;

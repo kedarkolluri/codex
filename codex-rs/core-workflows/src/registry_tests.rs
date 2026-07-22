@@ -61,7 +61,7 @@ fn applies_scope_precedence_independently_of_discovery_order() {
         WorkflowScope::Personal,
     );
 
-    let registry = WorkflowRegistry::new(
+    let registry = WorkflowRegistry::from_host(
         vec![codex_home, personal, personal_only.clone(), project.clone()],
         Vec::new(),
     );
@@ -115,7 +115,7 @@ fn deduplicates_identical_paths_before_names_with_deterministic_ties() {
         WorkflowScope::Personal,
     );
 
-    let registry = WorkflowRegistry::new(
+    let registry = WorkflowRegistry::from_host(
         vec![
             lexically_later,
             shared_path_personal,
@@ -162,7 +162,7 @@ fn sorts_diagnostics_and_resolves_exact_case_sensitive_names() {
         message: "unreadable".to_string(),
     };
 
-    let registry = WorkflowRegistry::new(
+    let registry = WorkflowRegistry::from_host(
         vec![lowercase.clone(), uppercase.clone()],
         vec![second_error.clone(), first_error.clone()],
     );

@@ -20,6 +20,9 @@ codex-utils-path-uri = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 bytes = { workspace = true }
 pretty_assertions = { workspace = true }
