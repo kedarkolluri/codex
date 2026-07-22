@@ -2842,6 +2842,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-core-workflows"
+version = "0.0.0"
+dependencies = [
+ "codex-utils-absolute-path",
+ "pretty_assertions",
+ "tempfile",
+]
+
+[[package]]
 name = "codex-exec"
 version = "0.0.0"
 dependencies = [
