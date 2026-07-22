@@ -1,8 +1,10 @@
 # Dynamic Workflows for OpenAI Codex — Implementation Plan
 
-Execution plan derived from `docs/dynamic-workflows-spec.md`. It turns the spec into a sequenced, dependency-aware task graph of **73 issue-ready tickets** across five milestones plus a cross-cutting testing track. Each milestone is independently shippable behind `Feature::Workflow` (Experimental). This plan is the *execution* view; the spec remains the design-of-record. Section anchors (§N) refer to the spec.
+Execution plan derived from `docs/dynamic-workflows-spec.md`. It turns the spec into a sequenced, dependency-aware task graph of **73 base issue-ready tickets** across five milestones plus a cross-cutting testing track, followed by six rescue/delivery stages discovered during implementation. Each milestone is independently shippable behind `Feature::Workflow` (Experimental). This plan is the *execution* view; the spec remains the design-of-record. Section anchors (§N) refer to the spec.
 
 > GitHub issues created from this plan reuse these ticket ids. Milestones M0–M1 are broken out as individual issues; M2–M4 and the testing track are tracked as epics whose bodies checklist their tickets.
+
+> **Rescue reconciliation (2026-07-19).** The ticket catalog preserves the original issue IDs and normative staged work, but the reconciled descriptions below supersede any older issue body or commit note. In the active rescue tree M0–M4, UAT-1 through UAT-10, and Codex Control-UAT are implemented and focused gates are green. Two independent judges returned PASS for primary-workhorse readiness with no demonstrated Codex P0/P1 blocker. That readiness result is distinct from exhaustive Claude parity: required matched rows remain `Missing`, so exact parity signoff stays open. The implementation uses a run-local hierarchical `WorkflowBudget` in `core-workflows`, cancellation-safe ancestor reservations, and a monotonic runtime mirror; it does **not** add getters to, reconfigure, or reset the session-wide `RolloutBudget`. Detached `workflow watch` polls bounded atomic `progress.json`. UI timing uses only event-supplied integer Unix seconds. The live monitor alone is not a complete control or release exit. The canonical comprehensive `/goal` and remaining delivery/platform gates live in `.github/DYNAMIC_WORKFLOWS_RESCUE.md`.
 
 ## 1. Milestones
 
@@ -10,10 +12,10 @@ Execution plan derived from `docs/dynamic-workflows-spec.md`. It turns the spec 
 |---|---|---|---|
 | **M0 · Foundations** | Feature flag, meta parser, saved-workflow loader, and a host tool that runs a workflow body once — the skeleton everything hangs off. | 7 | `core-workflows` loader unit tests pass (static-parse-without-eval; layered-root dedupe). *(Determinism-shim tests deferred to M3.)* |
 | **M1 · MVP orchestration** | The 80/20 value core: `agent()` fan-out via the registering spawn path, `parallel()`, structured output, opts overrides, and the concurrency scheduler. | 13 | Integration test asserts registering-spawn side effects + opts overrides; **UAT-1-min, UAT-3, UAT-4** pass on the hermetic fixture lane. |
-| **M2 · Scheduling & governance** | `pipeline()` no-barrier scheduling, the hard-ceiling budget governor, and one-level `workflow()` nesting. | 13 | Prelude barrier/no-barrier + cap units + depth-guard unit pass; **UAT-5, UAT-7, UAT-10** pass. |
+| **M2 · Scheduling & governance** | `pipeline()` no-barrier scheduling, the run-local hierarchical hard-ceiling governor, and one-level `workflow()` nesting. | 13 | Prelude barrier/no-barrier + reservation/cancellation + nested-budget + depth-guard units pass; **UAT-5, UAT-7, UAT-10** pass. |
 | **M3 · Determinism & resume** | The highest-novelty milestone: isolate determinism harden + `(prompt,opts)` journal + prefix-replay resume. | 14 | Determinism-shim units (Date/Math/WeakRef/FinalizationRegistry throw, setTimeout removed) + journal/replay determinism pass; **UAT-6** passes. Resume ships experimental until green. |
-| **M4 · Observability, entrypoints & isolation** | The three user-flagged observability features (live monitor, agent event-stream swap, per-agent session grouping) + worktree isolation + all three entrypoints + completion notification. | 20 | **UAT-1, UAT-2, UAT-8, UAT-9** pass on the in-process real-TUI gating lane; completion-notification unit + NDJSON twins pass. |
-| **MT · Testing & CI** | The shared test harnesses (fixture model, TUI snapshot, agent-driven UAT) and CI lanes that gate every milestone. | 6 | Harness + CI lanes green; every §12 capability tied to a named passing test; per-phase gates enforced. |
+| **M4 · Observability, controls, entrypoints & isolation** | Live monitor, agent event-stream swap, per-agent session grouping, worktree isolation, all entrypoints, completion notification, and staged workflow controls. | 20 + control stages | **UAT-1, UAT-2, UAT-8, UAT-9**, Control-UAT, completion notification, and NDJSON twins pass; no control-parity claim while a required control row is missing. |
+| **MT · Testing & CI** | Fixture model, snapshots, hermetic UAT, and human-style built-TUI/Claude parity evidence. | 6 + release evidence | Deterministic gates green; every §12 capability tied to a test; fresh fixed-size PTY driver and separate judge reports preserved. |
 
 ## 2. Milestone dependency graph
 
@@ -39,14 +41,29 @@ The longest chain to full parity runs through determinism/resume and the monitor
 
 `P0-meta-parser → P0-host-tool-skeleton → P1-agentcall-runtime-types → P1-agent-callback → P1-cellactor-spawn-dispatch → P3-resume-prefix-loop → P3-uat-resume-gate` (resume); and in parallel `… → P4-run-phase-model → P4-progress-cell → P4-agent-swap-wiring → P4-monitor-focus-stack → P4-uat-monitor-swap-isolation` (observability).
 
-**Start here (first 5 tickets, no blockers):** `P0-feature-flag`, `P0-meta-parser`, `P3-journal-crate-types`, `P2-budget-getters`, `P2-budget-resettable-cell`. The first two unblock the M0→M1 spine; the last three are dependency-free leaves of M2/M3 pickable immediately in parallel.
+**Historical starting point:** `P0-feature-flag`, `P0-meta-parser`, `P3-journal-crate-types`, `P2-budget-getters`, `P2-budget-resettable-cell`. The two budget IDs now name the reconciled run-local meter and reservation work below; do not revive their original shared-`RolloutBudget` design.
 
 ## 4. Risk-gated items (spec §13)
 
 - **R1 (determinism/resume):** resume tickets (`P3-resume-prefix-loop`, `P3-resume-entry`, `P3-uat-resume-gate`) stay **experimental** until the harden (`P3-determinism-native-deletes`, `P3-determinism-prelude`) **and** journal/replay (`P3-journal-*`) are green. R2 (isolate concurrency) is resolved — no ticket needed.
-- **R3 (budget soft→hard):** `P2-budget-pre-admission-throw` must land with `P2-budget-resettable-cell` (the `OnceLock` fix).
+- **R3 (budget admission races):** `P2-budget-pre-admission-throw` must land with `P2-budget-resettable-cell`'s reconciled cancellation-safe reservation work and nested ancestor tests.
 - **R4 (worktree isolation):** `P4-worktree-*` is an independent workstream with crash-safe cleanup; gate on UAT-8 before enabling by default.
 - **R7 (hash stability):** `P3-journal-key` must ship `key_algo_version` + canonical serialization.
+
+### Rescue completion stages
+
+These stages complete the parity and delivery work discovered during rescue. Keep each stage independently reviewable and below the repository's change-size limit; do not fold selected-agent control into the run-stop patch.
+
+Live tracking: `R4-script-save` is [#61](https://github.com/kedarkolluri/codex/issues/61), `R4-run-stop` is [#62](https://github.com/kedarkolluri/codex/issues/62), `R4-pause-resume` is [#63](https://github.com/kedarkolluri/codex/issues/63), `R4-agent-controls` is [#64](https://github.com/kedarkolluri/codex/issues/64), and `R4-control-uat` is [#65](https://github.com/kedarkolluri/codex/issues/65).
+
+| id | stage | depends on | exit evidence |
+|---|---|---|---|
+| `R4-run-stop` | Per-run cancellation state machine; experimental `workflow/stop`; explicit TUI selection + confirmation | detached task ownership, lifecycle cleanup | targeted/duplicate/wrong-thread/completion-race tests; stopped-state snapshots; built-TUI stop pass |
+| `R4-script-save` | Exact bounded `script.js` writer in `core-workflows`; experimental `workflow/save`; TUI scope/name/conflict/overwrite flow | durable run script | traversal/symlink/reparse/non-regular/race/mode tests; exact-byte comparison; built-TUI save pass |
+| `R4-pause-resume` | Durable `Paused`/`Stopped` statuses, owner thread, bounded private invocation data, pause API, new-run resume lineage | run stop, replay, lease/recovery | pause/stop/completion races; restart recovery; args/source/hash checks; built-TUI pause/resume pass |
+| `R4-agent-controls` | `(runId,nodeId)` selected-agent stop/skip and bounded retry | stable run-level controls, journal/budget semantics | retry cap, deterministic ordinal/null behavior, budget/worktree cleanup, selected-row snapshots |
+| `R4-control-uat` | Control-UAT across Codex and installed Claude | all control stages | separate no-context drivers/judges, exact version/hash/frames/actions, explicit divergence ledger |
+| `R5-delivery` | Stable→experimental→stable schemas, targeted/full authorized tests, platform lanes, rescue snapshot/bundle, semantic rebase rehearsal | all implementation/UAT | Linux + external x86_64 Windows/Wine + macOS evidence or exact blockers; verified rescue ref/bundle; isolated upstream-main rebase report |
 
 ## 5. Ticket catalog
 
@@ -73,17 +90,17 @@ The longest chain to full parity runs through determinism/resume and the monitor
 | `P1-args-injection` | args injection + workflow.runId global | M1 | S | `P0-host-tool-skeleton` |
 | `P1-uat-gates` | Phase-1 UAT gates: UAT-1-min, UAT-3, UAT-4 on the hermetic fixture lane | M1 | M | `P1-cellactor-spawn-dispatch`, `P1-spawn-await-helper`, `P1-opts-schema`, `P1-opts-model-effort`, `P1-opts-agenttype`, `P1-parallel-prelude` |
 | `P2-pipeline-prelude` | pipeline() no-barrier JS prelude — per-item promise chains + 4096 item cap | M2 | M | `P1-agent-callback`, `P1-scheduler-semaphore` |
-| `P2-budget-getters` | RolloutBudget public spent()/remaining() getters | M2 | S | — |
-| `P2-budget-output-weight-config` | Output-weight RolloutBudgetConfig for workflow budget | M2 | S | `P1-args-injection`, `P2-budget-resettable-cell` |
-| `P2-budget-resettable-cell` | Resettable budget cell replacing OnceLock in RolloutBudget::configure | M2 | M | — |
-| `P2-budget-js-global` | budget JS global — native-backed {total, spent(), remaining()} | M2 | S | `P0-host-tool-skeleton`, `P2-budget-getters`, `P2-budget-output-weight-config` |
-| `P2-budget-pre-admission-throw` | agent() pre-admission BudgetExceeded throw at remaining() <= 0 | M2 | S | `P1-cellactor-spawn-dispatch`, `P2-budget-getters`, `P2-budget-js-global` |
-| `P2-budget-thread-goal-reporting` | Budget reporting via ThreadGoal + BudgetLimited status | M2 | S | `P2-budget-getters` |
+| `P2-budget-getters` | Run-local WorkflowBudget snapshots and effective views | M2 | S | — |
+| `P2-budget-output-weight-config` | Nested workflow budget hierarchy and output-token accounting | M2 | S | `P1-args-injection`, `P2-budget-getters` |
+| `P2-budget-resettable-cell` | Cancellation-safe ancestor reservations (supersedes shared-budget reset) | M2 | M | `P2-budget-getters` |
+| `P2-budget-js-global` | budget JS global — native-backed live mirror | M2 | S | `P0-host-tool-skeleton`, `P2-budget-getters`, `P2-budget-output-weight-config` |
+| `P2-budget-pre-admission-throw` | agent() atomic reservation and WorkflowBudgetExceeded rejection | M2 | S | `P1-cellactor-spawn-dispatch`, `P2-budget-resettable-cell`, `P2-budget-js-global` |
+| `P2-budget-thread-goal-reporting` | Workflow progress budget snapshots, separate from session ThreadGoal | M2 | S | `P2-budget-getters` |
 | `P2-workflow-global-callback` | workflow() JS global + RuntimeEvent::WorkflowCall bridge | M2 | M | `P1-agent-callback`, `P0-host-tool-skeleton` |
-| `P2-workflow-registry-reenter` | workflow() host handler — registry load + re-enter runtime nested one level | M2 | L | `P0-core-workflows-loader`, `P0-host-tool-skeleton`, `P2-workflow-global-callback`, `P2-budget-resettable-cell` |
+| `P2-workflow-registry-reenter` | workflow() host handler — registry load + re-enter runtime nested one level | M2 | L | `P0-core-workflows-loader`, `P0-host-tool-skeleton`, `P2-workflow-global-callback`, `P2-budget-output-weight-config` |
 | `P2-workflow-depth-guard` | workflow() one-level depth guard via exceeds_thread_spawn_depth_limit | M2 | S | `P2-workflow-registry-reenter` |
 | `P2-test-pipeline-uat7` | Tests — pipeline() no-barrier unit + UAT-7 | M2 | S | `P2-pipeline-prelude` |
-| `P2-test-budget-uat5` | Tests — budget getters/config/ceiling unit + UAT-5 | M2 | S | `P2-budget-pre-admission-throw`, `P2-budget-thread-goal-reporting`, `P2-budget-resettable-cell` |
+| `P2-test-budget-uat5` | Tests — hierarchy/reservation/replay ceiling + UAT-5 | M2 | S | `P2-budget-pre-admission-throw`, `P2-budget-thread-goal-reporting`, `P2-budget-resettable-cell` |
 | `P2-test-workflow-nesting-uat10` | Tests — workflow() depth-guard unit + UAT-10 | M2 | S | `P2-workflow-registry-reenter`, `P2-workflow-depth-guard` |
 | `P3-determinism-native-deletes` | Harden workflow isolate globals: delete WeakRef/FinalizationRegistry, remove setTimeout/setInterval/clearTimeout | M3 | S | `P0-host-tool-skeleton` |
 | `P3-determinism-prelude` | Frozen JS determinism prelude: throw on Date.now/argless Date/Math.random, preserve arg'd Date/Date.parse | M3 | M | `P0-host-tool-skeleton`, `P1-args-injection`, `P3-determinism-native-deletes` |
@@ -91,11 +108,11 @@ The longest chain to full parity runs through determinism/resume and the monitor
 | `P3-journal-key` | key.rs: blake3 canonical (prompt,opts) cache key with key_algo_version, label/phase excluded | M3 | S | `P3-journal-crate-types` |
 | `P3-journal-recorder` | JournalRecorder: append-only journal.jsonl reusing RolloutRecorder machinery | M3 | M | `P3-journal-crate-types`, `P3-storage-layout` |
 | `P3-journal-replay-read` | replay.rs: tail-first prefix read of journal.jsonl via ReverseJsonlScanner + hash validation | M3 | M | `P3-journal-crate-types`, `P3-journal-key` |
-| `P3-storage-layout` | Workflow run storage layout: $CODEX_HOME/workflows/runs/<runId>/{journal.jsonl,script.js,meta.json} | M3 | S | `P1-args-injection` |
+| `P3-storage-layout` | Private run layout: journal, exact script, canonical invocation, metadata, bounded progress, and lease | M3 | S | `P1-args-injection` |
 | `P3-workflow-runs-index` | workflow_runs SQLite discovery index (codex-state migration + model) | M3 | M | `P3-storage-layout` |
 | `P3-runtime-replay-state` | RuntimeState: replay cache + budget accumulator + replay_active flag | M3 | S | `P1-agentcall-runtime-types` |
 | `P3-journal-write-integration` | Wire JournalRecorder into SpawnAgent dispatch: record agent_call/phase/log with child_thread_id + rollout_path | M3 | M | `P1-cellactor-spawn-dispatch`, `P0-phase-log-globals`, `P3-journal-recorder`, `P3-journal-key`, `P3-runtime-replay-state` |
-| `P3-budget-readd` | rollout_budget.rs: replay-only add_spent path for byte-identical resume budget | M3 | S | `P2-budget-getters` |
+| `P3-budget-readd` | WorkflowBudget replay-spend path for deterministic resume | M3 | S | `P2-budget-getters` |
 | `P3-resume-prefix-loop` | agent_callback prefix-replay branch: ordinal+key match, resolve-from-cache, budget re-add, first-divergence-goes-live | M3 | L | `P1-agentcall-runtime-types`, `P1-cellactor-spawn-dispatch`, `P3-runtime-replay-state`, `P3-journal-replay-read`, `P3-journal-key`, `P3-budget-readd`, `P3-journal-write-integration` |
 | `P3-resume-entry` | resumeFromRunId entrypoint: load prior journal, validate, mint fresh runId, seed replay state | M3 | M | `P0-host-tool-skeleton`, `P3-journal-replay-read`, `P3-storage-layout`, `P3-runtime-replay-state`, `P3-workflow-runs-index` |
 | `P3-uat-resume-gate` | UAT-6 + journal/replay determinism tests (Phase 3 exit gate) | M3 | M | `P3-resume-prefix-loop`, `P3-resume-entry`, `P3-budget-readd`, `P3-journal-write-integration`, `P3-determinism-prelude`, `P3-determinism-native-deletes` |
@@ -111,7 +128,7 @@ The longest chain to full parity runs through determinism/resume and the monitor
 | `P4-agent-swap-wiring` | Feature 2: wire workflow subagent threads into select_agent_thread / open_agent_picker | M4 | M | `P4-run-phase-model`, `P4-progress-cell` |
 | `P4-monitor-focus-stack` | Feature 2: monitor-scoped focus stack for background-run swap-back | M4 | M | `P4-agent-swap-wiring`, `P4-progress-cell` |
 | `P4-state-workflow-runs-index` | workflow_runs SQLite discovery index (codex-state migration) | M4 | S | `P0-feature-flag` |
-| `P4-run-agents-projection` | Feature 3: run_agents projection over list_thread_spawn_descendants | M4 | M | `P1-cellactor-spawn-dispatch`, `P3-journal-recorder` |
+| `P4-run-agents-projection` | Feature 3: run_agents projection rebuilt from authoritative journal bindings | M4 | M | `P1-cellactor-spawn-dispatch`, `P3-journal-recorder` |
 | `P4-spawn-cwd-override` | Worktree isolation: SpawnAgentOptions.cwd + respect override in runtime overrides | M4 | M | `P1-cellactor-spawn-dispatch` |
 | `P4-worktree-guard` | Worktree isolation: git-utils worktree_add + WorktreeGuard lifecycle | M4 | L | — |
 | `P4-worktree-scheduler` | Worktree isolation: deterministic worktree alloc + workspace_roots in scheduler | M4 | M | `P4-spawn-cwd-override`, `P4-worktree-guard`, `P1-scheduler-semaphore` |
@@ -123,7 +140,7 @@ The longest chain to full parity runs through determinism/resume and the monitor
 | `X-tui-snapshot-harness` | TUI snapshot test scaffolding for workflow cells | MT | M | `P4-progress-cell` |
 | `X-agent-driven-uat-harness` | Agent-driven TUI UAT harness (three planes) | MT | L | `X-fixture-model-harness`, `P4-cli-watch` |
 | `X-uat-scenarios` | Author the 10 UAT scenarios (UAT-1..UAT-10) | MT | L | `X-agent-driven-uat-harness` |
-| `X-ci-lanes` | CI lanes: hermetic gating + nightly non-gating | MT | M | `X-agent-driven-uat-harness` |
+| `X-ci-lanes` | Hermetic CI gates + built-TUI release evidence lane | MT | M | `X-agent-driven-uat-harness` |
 | `X-per-phase-gates` | Wire per-phase UAT exit gates | MT | S | `X-ci-lanes` |
 
 ## 6. Ticket detail
@@ -372,72 +389,71 @@ _Acceptance:_
 - items.length > 4096 throws before any dispatch
 - Total concurrent in-flight agents never exceeds the host scheduler semaphore cap (no per-stage concurrency multiplication)
 
-#### `P2-budget-getters` — RolloutBudget public spent()/remaining() getters  ·  _S_
-**Depends on:** none  ·  **Spec:** `§8 (Real-time aggregation; two public getters)`, `core/src/rollout_budget.rs`, `core/src/agent/control.rs:106-107`, `core/src/session/mod.rs:3696`
+#### `P2-budget-getters` — Run-local WorkflowBudget snapshots and effective views  ·  _S_
+**Depends on:** none  ·  **Spec:** `§8`, `core-workflows/src/budget.rs`
 
-Add two public getters on codex-rs/core/src/rollout_budget.rs::RolloutBudget: `pub fn spent(&self) -> i64` and `pub fn remaining(&self) -> i64`. Both read the live weighted_tokens_used counter under the EXISTING lock (do not add a new lock). `remaining = (limit_tokens - weighted_tokens_used).max(0)`. These are the native backing the JS `budget.spent()`/`budget.remaining()`/`total` forward to, and the pre-admission throw (P2-budget-pre-admission-throw) reads them. The counter is already a live, tree-wide sum because AgentControl.rollout_budget is an Arc shared by the root thread and every cloned sub-agent control handle (control.rs:106-107), updated by Session::record_rollout_budget_usage after every turn (session/mod.rs:3696) — so no aggregation logic is needed here, only the getters.
-
-_Acceptance:_
-- spent() returns the current weighted_tokens_used value read under the existing lock
-- remaining() returns (limit_tokens - weighted_tokens_used).max(0), never negative
-- Unit test: after recording usage across a shared Arc<RolloutBudget> from multiple cloned handles, spent() reflects the tree-wide sum
-- No new lock or field is introduced; getters reuse the existing lock
-
-#### `P2-budget-output-weight-config` — Output-weight RolloutBudgetConfig for workflow budget  ·  _S_
-**Depends on:** `P1-args-injection`, `P2-budget-resettable-cell`  ·  **Spec:** `§8 (RolloutBudgetConfig output weight)`, `core/src/rollout_budget.rs`, `core/src/agent/control.rs`
-
-Configure the workflow root AgentControl's RolloutBudget so weighted_tokens_used == pure output-token spend, matching the budget.total contract. Build a RolloutBudgetConfig with limit_tokens = args.budget.total, sampling_token_weight = 1.0 (count output tokens), prefill_token_weight = 0.0 (ignore input tokens), reminder_at_remaining_tokens = []. Wire this at workflow host setup so every subagent spawned through the shared Arc meters only output tokens against the ceiling. total from args (args injection lands in P1-args). Configuration goes through the resettable budget cell (P2-budget-resettable-cell), not the OnceLock path, so nested/reused sessions can re-set the limit.
+Introduce `WorkflowBudgetLimit::{Unmetered,Limited(u64)}`, a run-owned `WorkflowBudget`, and a copyable snapshot `{limit, spent, remaining}`. This is independent from `AgentControl`'s ambient session `RolloutBudget`. A local snapshot reports the run's own accounting; an effective snapshot inherits an unmetered parent's view or clamps an explicit child ceiling by every ancestor.
 
 _Acceptance:_
-- RolloutBudget for a workflow run is configured with sampling_token_weight=1.0, prefill_token_weight=0.0, reminder_at_remaining_tokens=[]
-- limit_tokens is sourced from args.budget.total
-- Unit test: recording a turn with N input + M output tokens increases weighted_tokens_used by exactly M (input ignored)
-- spent()/remaining() reflect pure output-token spend against args.budget.total
+- zero, finite, and unmetered limits are distinct and use saturating arithmetic
+- an unmetered child inherits its parent's effective view
+- an explicitly limited child reports local spend while remaining is clamped by the tightest ancestor
+- no session-wide `RolloutBudget` API or configuration changes
 
-#### `P2-budget-resettable-cell` — Resettable budget cell replacing OnceLock in RolloutBudget::configure  ·  _M_
-**Depends on:** none  ·  **Spec:** `§8 (RolloutBudget::configure OnceLock caveat)`, `core/src/agent/control.rs:120`, `core/src/rollout_budget.rs`
+#### `P2-budget-output-weight-config` — Nested workflow budget hierarchy and output-token accounting  ·  _S_
+**Depends on:** `P1-args-injection`, `P2-budget-getters`  ·  **Spec:** `§8`, `core-workflows/src/budget.rs`, `core/src/tools/code_mode/delegate`
 
-RolloutBudget::configure currently uses a OnceLock (core/src/agent/control.rs:120), so a reused AgentControl cannot re-set limit_tokens. This blocks nested workflow() runs and reused sessions from reconfiguring their budget. Replace the OnceLock with a resettable budget cell (e.g. a Mutex/RwLock-guarded Option or an atomically-swappable config) that permits re-setting limit_tokens and the weight config on an already-constructed AgentControl, while preserving the existing shared-Arc aggregation semantics and lock discipline. Ensure no accidental double-count or counter reset of weighted_tokens_used when the limit is re-set (reconfiguring the ceiling must not zero the live spend unless explicitly intended for a fresh nested run).
-
-_Acceptance:_
-- configure() (or its replacement) can be called more than once on the same AgentControl and the second call takes effect on limit_tokens/weights
-- Reconfiguring the limit does not corrupt or unintentionally reset weighted_tokens_used
-- Existing single-configure callers behave identically (no regression in current budget tests)
-- Unit test: configure with limit A, spend, reconfigure with limit B, assert remaining() reflects limit B
-
-#### `P2-budget-js-global` — budget JS global — native-backed {total, spent(), remaining()}  ·  _S_
-**Depends on:** `P0-host-tool-skeleton`, `P2-budget-getters`, `P2-budget-output-weight-config`  ·  **Spec:** `§4 (budget)`, `§8`, `code-mode/src/runtime/globals.rs`, `code-mode/src/runtime/value.rs`
-
-Register the `budget` isolate global as a native-backed object over the shared RolloutBudget. `budget.total` is a read-only number from args.budget.total; `budget.spent()` and `budget.remaining()` are native functions forwarding to the Rust getters (P2-budget-getters), reading the live weighted counter under the existing lock. Install in code-mode/src/runtime/globals.rs alongside args, following the install_globals pattern. Values are read live at call time (not snapshotted at install) so a workflow that awaits agents and re-reads budget.spent() sees updated spend.
+Give every workflow invocation its own meter. A nested `workflow()` receives a child meter pointing to its parent. Record completed child output-token usage into the local run and recursively into ancestors, while keeping sibling-local spend isolated. The independently configured session budget remains a second governor and is never reset by workflow startup.
 
 _Acceptance:_
-- A workflow script can read budget.total, budget.spent(), budget.remaining() from the isolate
-- budget.spent()/remaining() return live values that change after subagents complete turns (in-isolate test with fixture spend)
-- budget.total equals args.budget.total and is read-only (assignment is ignored or throws)
-- budget.spent() + budget.remaining() invariant holds relative to total (remaining clamped at 0)
+- live and replayed output spend roll up through all workflow ancestors exactly once
+- sibling-local snapshots do not include each other's local spend, while the parent snapshot includes both
+- nested runs cannot escape a tighter ancestor ceiling
+- starting or nesting a workflow cannot mutate the session's existing budget configuration or spend
 
-#### `P2-budget-pre-admission-throw` — agent() pre-admission BudgetExceeded throw at remaining() <= 0  ·  _S_
-**Depends on:** `P1-cellactor-spawn-dispatch`, `P2-budget-getters`, `P2-budget-js-global`  ·  **Spec:** `§5 (Admission order step 1)`, `§8 (Pre-admission hard ceiling)`, `core/src/tools/code_mode/delegate.rs`, `code-mode/src/runtime/callbacks.rs`
+#### `P2-budget-resettable-cell` — Cancellation-safe ancestor reservations  ·  _M_
+**Depends on:** `P2-budget-getters`  ·  **Spec:** `§8 (Cancellation-safe admission)`, `core-workflows/src/budget.rs`
 
-Add the pre-admission hard-ceiling gate to the host agent() path. Per the §5 admission order, step 1: BEFORE reserving a concurrency permit, incrementing the lifetime counter, or spawning the child, the host agent() handler checks `if budget.remaining() <= 0 { throw BudgetExceeded }`. This makes agent() throw synchronously and deterministically at the ceiling (distinct from the death-is-null contract — budget ceiling is the one case agent() throws rather than returning null). The existing in-flight backstop (record_usage returning true -> CodexErr::SessionBudgetExceeded -> TurnAbortReason::BudgetLimited) already handles a turn that overshoots mid-flight, resolving that subagent's agent() to null; this ticket only adds the pre-admission throw so the ceiling can overshoot by at most one in-flight turn and every subsequent agent() throws. The throw must occur at the exact invocation ordinal for resume determinism.
-
-_Acceptance:_
-- agent() throws BudgetExceeded synchronously when remaining() <= 0, before any slot reservation, lifetime increment, or spawn
-- The throw happens before the concurrency permit is acquired (admission-order step 1)
-- When budget has room, agent() proceeds to spawn normally
-- Integration test (fixture token counts summing past total mid-run): the throw lands at the exact ordinal where remaining() first hits <= 0; no further subagents spawn after the throw
-- Budget ceiling is the only condition under which agent() throws; agent death/abort still returns null
-
-#### `P2-budget-thread-goal-reporting` — Budget reporting via ThreadGoal + BudgetLimited status  ·  _S_
-**Depends on:** `P2-budget-getters`  ·  **Spec:** `§8 (Reporting)`, `protocol/src/protocol.rs:4006`, `protocol/src/protocol.rs:3988`, `core/src/tools/handlers/multi_agents_v2/thread.rs:734`
-
-Surface budget progress to clients through the EXISTING ThreadGoal channel so no new protocol types are needed. Emit ThreadGoal{token_budget: budget.total, tokens_used: budget.spent(), status} (protocol.rs:4006) as spend accrues, and set ThreadGoalStatus::BudgetLimited (protocol.rs:3988; v2/thread.rs:734) at the ceiling so clients (and the monitor tree) render budget state and the budget-limited condition. This is the reporting half of §8 governance; the actual live progress-tree rendering of this state is a Phase 4 concern, but the ThreadGoal emission originates here.
+This issue ID originally proposed resetting a shared `RolloutBudget`; that design is superseded. Implement an RAII reservation over the run-local hierarchy instead. Acquire ancestors before descendants under one lock order, reserve an estimate before spawn, and roll back all acquired reservations if any descendant rejects. Drop releases reservations on success, cancellation, spawn error, or panic; completed usage is recorded separately.
 
 _Acceptance:_
-- ThreadGoal is emitted carrying token_budget = budget.total and tokens_used = budget.spent()
-- ThreadGoalStatus::BudgetLimited is set when the ceiling is reached
-- No new protocol EventMsg/notification types are added (reuses ThreadGoal/ThreadGoalStatus)
-- Unit test asserts a ThreadGoal with BudgetLimited status is produced at the ceiling
+- parallel admissions cannot all pass from one stale remaining snapshot
+- ancestor rejection or child rejection rolls back every partial reservation
+- cancellation and panic release capacity without underflow
+- nested concurrent reservations have one deadlock-free lock order
+
+#### `P2-budget-js-global` — budget JS global backed by a live mirror  ·  _S_
+**Depends on:** `P0-host-tool-skeleton`, `P2-budget-getters`, `P2-budget-output-weight-config`  ·  **Spec:** `§4 (budget)`, `§8`, `code-mode/src/workflow_budget.rs`
+
+Install the read-only `budget` global from a bounded snapshot carried in `ExecuteRequest`. The isolate owns a monotonic atomic mirror; host callbacks refresh `spent` upward and `remaining` downward before resolving workflow promises. This keeps the same behavior in the in-process and stdio hosts without giving V8 direct access to core locks.
+
+_Acceptance:_
+- `budget.total`, `spent()`, and `remaining()` reflect the effective run/ancestor view
+- values update after host callbacks in both in-process and stdio-host parity tests
+- unmetered representation is explicit and cannot be confused with a zero ceiling
+- updates are monotonic and bounded
+
+#### `P2-budget-pre-admission-throw` — agent() atomic reservation and WorkflowBudgetExceeded rejection  ·  _S_
+**Depends on:** `P1-cellactor-spawn-dispatch`, `P2-budget-resettable-cell`, `P2-budget-js-global`  ·  **Spec:** `§5`, `§8`, `core/src/tools/code_mode/delegate`
+
+Reserve workflow capacity before the scheduler permit and spawn. If the local or any ancestor ceiling is exhausted, reject deterministically with `WorkflowBudgetExceeded`; do not mutate lifetime counters, acquire a worktree, or spawn a child. Hold the RAII reservation only for the in-flight call, reconcile actual completed output usage, refresh the runtime mirror, and then resolve the JS promise.
+
+_Acceptance:_
+- exhaustion rejects before scheduler, worktree, registry, or child-thread side effects
+- parallel and nested calls respect all local and ancestor ceilings
+- cancellation/error releases the reservation; completed usage is counted once
+- the ambient session budget can independently abort an agent without corrupting workflow accounting
+
+#### `P2-budget-thread-goal-reporting` — Workflow progress budget snapshots  ·  _S_
+**Depends on:** `P2-budget-getters`  ·  **Spec:** `§8 (Reporting)`, `protocol/src/workflow_events.rs`, `progress.json`
+
+Publish the effective workflow budget through workflow progress events and the bounded `progress.json` projection. Keep the session's existing `ThreadGoal`/budget status independent so clients can distinguish workflow-ceiling exhaustion from ambient session-governor exhaustion.
+
+_Acceptance:_
+- started/updated/terminal projections carry a consistent effective budget snapshot
+- monitor and CLI render unmetered, explicit zero, finite remaining, and exhausted states distinctly
+- workflow accounting never overwrites a session `ThreadGoal`
+- snapshot and UAT coverage exercises zero, unmetered, nested, replayed, and exhausted states
 
 #### `P2-workflow-global-callback` — workflow() JS global + RuntimeEvent::WorkflowCall bridge  ·  _M_
 **Depends on:** `P1-agent-callback`, `P0-host-tool-skeleton`  ·  **Spec:** `§4 (workflow())`, `code-mode/src/runtime/callbacks.rs`, `code-mode/src/runtime/globals.rs`, `code-mode/src/cell_actor/mod.rs`
@@ -451,15 +467,15 @@ _Acceptance:_
 - In-isolate test asserts the WorkflowCall event is emitted with the expected name/args and the promise resolves from a host response
 
 #### `P2-workflow-registry-reenter` — workflow() host handler — registry load + re-enter runtime nested one level  ·  _L_
-**Depends on:** `P0-core-workflows-loader`, `P0-host-tool-skeleton`, `P2-workflow-global-callback`, `P2-budget-resettable-cell`  ·  **Spec:** `§4 (workflow())`, `§6 (Depth)`, `core-workflows loader`, `core/src/tools/code_mode/execute_handler.rs`, `core/src/tools/code_mode/delegate.rs`
+**Depends on:** `P0-core-workflows-loader`, `P0-host-tool-skeleton`, `P2-workflow-global-callback`, `P2-budget-output-weight-config`  ·  **Spec:** `§4 (workflow())`, `§6 (Depth)`, `core-workflows loader`, `core/src/tools/code_mode/execute_handler.rs`, `core/src/tools/code_mode/delegate.rs`
 
-Build the host-side handler for RuntimeEvent::WorkflowCall that runs another SAVED workflow inline, one level deep. Steps: (1) resolve nameOrRef against the core-workflows loader (P0-workflows-loader) — load the named *.workflow.js script from the layered workflow roots by static-parsed meta name; (2) re-enter the runtime as a nested cell/subagent, submitting the loaded body to a fresh isolate execution via the workflow host tool (P0-host-tool), passing the caller-supplied args; (3) return the nested run's top-level result back through the WorkflowCall resolver as the workflow() promise value. The nested run spawns its agents with SubAgentSource::ThreadSpawn through the registering path so depth/registry accounting flows (depth enforcement is P2-workflow-depth-guard). Nested runs share or nest the concurrency/lifetime/budget caps per the resettable budget cell (P2-budget-resettable-cell) — reconfigure the nested budget through the resettable cell, not OnceLock. Set parent_run_id on the nested run's journal meta (journal itself is Phase 3, but thread the parent linkage now).
+Build the host-side handler for RuntimeEvent::WorkflowCall that runs another SAVED workflow inline, one level deep. Steps: (1) resolve nameOrRef against the core-workflows loader (P0-workflows-loader) — load the named *.workflow.js script from the layered workflow roots by static-parsed meta name; (2) re-enter the runtime as a nested cell/subagent, submitting the loaded body to a fresh isolate execution via the workflow host tool (P0-host-tool), passing the caller-supplied args; (3) return the nested run's top-level result back through the WorkflowCall resolver as the workflow() promise value. The nested run spawns its agents with SubAgentSource::ThreadSpawn through the registering path so depth/registry accounting flows (depth enforcement is P2-workflow-depth-guard). Give it a child `WorkflowBudget` whose spend rolls up to the parent; never reconfigure the shared session governor. Set parent_run_id on the nested run's journal meta (journal itself is Phase 3, but thread the parent linkage now).
 
 _Acceptance:_
 - workflow('name', args) loads the named saved workflow from the core-workflows registry and executes its body once in a nested runtime
 - The nested run receives the caller-supplied args and returns its top-level result to the parent workflow()'s awaited promise
 - A name that does not resolve in the registry produces a surfaced error (not a silent hang)
-- Nested run reconfigures its budget through the resettable cell (no OnceLock panic on reuse)
+- Nested run has an independent child ceiling clamped by its parent; session budget configuration is unchanged
 - Integration test (fixture model): a depth-1 nested workflow() runs and its child run is recorded with parent_run_id set
 
 #### `P2-workflow-depth-guard` — workflow() one-level depth guard via exceeds_thread_spawn_depth_limit  ·  _S_
@@ -487,12 +503,12 @@ _Acceptance:_
 #### `P2-test-budget-uat5` — Tests — budget getters/config/ceiling unit + UAT-5  ·  _S_
 **Depends on:** `P2-budget-pre-admission-throw`, `P2-budget-thread-goal-reporting`, `P2-budget-resettable-cell`  ·  **Spec:** `§14.1 (Budget ceiling)`, `§14.4 UAT-5`, `§14.3 (Phase 2 gates)`, `core/tests/common/responses.rs (ev_completed_with_tokens)`
 
-Add the Phase-2 budget exit gates. (1) Unit tests (rollout_budget): spent()/remaining() getters; output-weight config so weighted == pure output spend; pre-admission throw exactly at remaining() <= 0; one-turn overshoot bound; tree-wide Arc aggregation; resettable budget cell replaces OnceLock (reconfigure takes effect). (2) UAT-5 (§14.4): fixture token counts via ev_completed_with_tokens sum past budget.total mid-run; assert agent() throws BudgetExceeded at the exact ordinal, ThreadGoalStatus::BudgetLimited surfaces, and no further subagents spawn. Fixed fixture token counts make the ceiling-throw ordinal identical every run.
+Add the Phase-2 budget exit gates. (1) Unit/integration tests cover local/effective snapshots, zero versus unmetered, nested ancestor roll-up, sibling isolation, parallel reservation races, cancellation/panic release, replay spend, and proof that workflow startup leaves the ambient session governor unchanged. (2) UAT-5 (§14.4): fixture output-token counts exhaust `budget.total`; assert deterministic rejection at the expected ordinal, an exhausted workflow progress snapshot, and no further subagents spawn. Fixed fixture usage makes the boundary identical every run.
 
 _Acceptance:_
-- Unit tests cover spent()/remaining(), output-weight config, pre-admission throw at remaining()<=0, one-turn overshoot bound, and resettable-cell reconfigure
-- UAT-5 passes: agent() throws BudgetExceeded at the exact ordinal where spend crosses total
-- ThreadGoalStatus::BudgetLimited is asserted to surface at the ceiling
+- Tests cover nested/sibling accounting, reservations, cancellation, replay, zero/unmetered, and ambient-budget independence
+- UAT-5 passes: `agent()` rejects at the deterministic ordinal where effective workflow capacity is exhausted
+- The workflow progress budget snapshot, not a rewritten session ThreadGoal, surfaces exhaustion
 - No subagents spawn after the ceiling throw
 - Ceiling-throw ordinal is byte-identical across repeated runs (fixed ev_completed_with_tokens fixtures)
 
@@ -535,11 +551,11 @@ _Acceptance:_
 #### `P3-journal-crate-types` — New codex-workflow-journal crate: JournalLine envelope + WorkflowRunMeta types  ·  _S_
 **Depends on:** none  ·  **Spec:** `§7 (Journal format)`, `§10 codex-rs/workflow-journal/ (new crate)`, `§13 R8`, `protocol.rs:3141 (why NOT to extend RolloutItem)`
 
-Scaffold the new `codex-rs/workflow-journal` crate and define its serde types. Do NOT extend `RolloutItem` (`protocol.rs:3141`) — it is conversation-shaped and every rollout consumer would have to handle new variants. Instead define standalone types: `WorkflowRunMeta` for line 0 (`{type:run_meta, run_id, parent_run_id, script_hash, args_hash, name, budget_total, key_algo_version, created_at}`) and a `JournalLine` envelope `{timestamp, ordinal, type, ...}` with variants `agent_call` (`{ordinal, key, prompt_hash, opts:{model,effort,agentType,isolation,schema_hash}, phase, label, child_thread_id, rollout_path, status, return, tokens_spent, completion_seq}`), `phase` (`{ordinal:null, title}`), and `log` (`{ordinal:null, message}`). `status` is `completed|null|error`; `return` round-trips string, validated object, or null identically. Timestamps are host-supplied (never the isolate). Add the crate to the workspace `Cargo.toml` members.
+Scaffold the new `codex-rs/workflow-journal` crate and define its serde types. Do NOT extend `RolloutItem` (`protocol.rs:3141`) — it is conversation-shaped and every rollout consumer would have to handle new variants. Instead define standalone types: `WorkflowRunMeta` for line 0 (`{type:run_meta, run_id, parent_run_id, resumed_from_run_id, owner_thread_id, script_hash, args_hash, name, budget_total, key_algo_version, created_at, execution_fingerprint}`) and a `JournalLine` envelope `{timestamp, ordinal, type, ...}` with variants `agent_bound` (`{ordinal, child_thread_id, rollout_path}`), `agent_call` (`{ordinal, attempt, key, prompt_hash, opts:{model,effort,agentType,isolation,schema_hash}, phase, label, child_thread_id, rollout_path, status, control_reason, return, tokens_spent, completion_seq}`), `phase` (`{ordinal:null, title}`), and `log` (`{ordinal:null, message}`). `status` records the natural outcome; `attempt` and `control_reason` audit Skip/Retry without rewriting the logical ordinal. `return` round-trips string, validated object, or null identically. Timestamps are host-supplied (never the isolate). Add the crate to the workspace `Cargo.toml` members.
 
 _Acceptance:_
 - `workflow-journal` crate compiles and is a workspace member
-- `WorkflowRunMeta` and every `JournalLine` variant round-trip through serde_json byte-stably (serialize→deserialize→serialize equality)
+- `WorkflowRunMeta`, pre-turn `agent_bound`, and every terminal/control `JournalLine` variant round-trip through serde_json byte-stably (serialize→deserialize→serialize equality)
 - `return` field losslessly round-trips a string, a nested object, and `null`
 - No changes are made to `RolloutItem`/`protocol.rs`
 - Field names/casing match the §7 journal format sample exactly
@@ -570,30 +586,30 @@ _Acceptance:_
 #### `P3-journal-replay-read` — replay.rs: tail-first prefix read of journal.jsonl via ReverseJsonlScanner + hash validation  ·  _M_
 **Depends on:** `P3-journal-crate-types`, `P3-journal-key`  ·  **Spec:** `§7 (Resume algorithm step 1)`, `§7 (build a dedicated codex-workflow-journal crate)`, `§10 codex-rs/workflow-journal/ replay.rs`, `rollout/src/reverse_jsonl_scanner.rs`, `§14.1 Layer 1 (Journal read/replay)`
 
-Implement `replay.rs` in `workflow-journal`: load a prior run's `journal.jsonl` tail-first via `ReverseJsonlScanner` (`rollout/src/reverse_jsonl_scanner.rs`) into an ordered `entries[0..M]` vector indexed by ordinal, parse line 0 into `WorkflowRunMeta`, and validate `script_hash`/`args_hash`/`key_algo_version` against the current run (a structural change simply produces early divergence — it is not a hard error). Expose a lookup by ordinal returning the entry's `key`, `status`, `return`, and `tokens_spent` for the resume loop. This is the pure read/validation half; the live replay branch itself is P3-resume-prefix-loop.
+Implement `replay.rs` in `workflow-journal`: load a prior run's `journal.jsonl` tail-first via `ReverseJsonlScanner` (`rollout/src/reverse_jsonl_scanner.rs`) into an ordered `entries[0..M]` vector indexed by ordinal, parse line 0 into `WorkflowRunMeta`, and validate `script_hash`/`args_hash`/`key_algo_version` plus the effective non-secret `execution_fingerprint` against the current run (a structural or provider/router/model/role change produces early divergence, not a panic). A legacy run without the fingerprint diverges at ordinal 0. Expose a lookup by ordinal returning the entry's `key`, `status`, `return`, and `tokens_spent` for the resume loop. This is the pure read/validation half; the live replay branch itself is P3-resume-prefix-loop.
 
 _Acceptance:_
 - A journal with M entries loads into an ordinal-indexed `entries` structure with correct `run_meta`
-- `key_algo_version`/`script_hash`/`args_hash` mismatch is surfaced as a divergence flag (not a panic), so replay falls back to live at the right point
+- `key_algo_version`/`script_hash`/`args_hash`/`execution_fingerprint` mismatch is surfaced as a divergence flag (not a panic), so replay falls back to live at the right point; missing legacy fingerprints diverge at ordinal 0
 - Lookup by ordinal returns the recorded key/status/return/tokens_spent
 - Property/fuzz test over random parallel/pipeline shapes confirms entries reconstruct in deterministic ordinal order (§14.1 Layer 1)
 - Reads work correctly on a partially-written/truncated tail (last line ignored gracefully)
 
-#### `P3-storage-layout` — Workflow run storage layout: $CODEX_HOME/workflows/runs/<runId>/{journal.jsonl,script.js,meta.json}  ·  _S_
+#### `P3-storage-layout` — Private workflow run layout with journal, exact script/invocation, metadata, progress, and lease  ·  _S_
 **Depends on:** `P1-args-injection`  ·  **Spec:** `§7 (Storage layout)`, `§9 (Saved-workflow discovery / re-invoke by scriptPath)`, `§10 codex-rs/workflow-journal/`, `items.rs:414 (uuid now_v7 pattern)`
 
-Establish the per-run on-disk layout mirroring rollout's per-run file structure: `$CODEX_HOME/workflows/runs/<runId>/` containing `journal.jsonl` (source of truth for replay AND run→agent linkage), `script.js` (the executed program, so a run is re-invocable by scriptPath), and `meta.json`. `runId` is minted host-side in Rust with `uuid::Uuid::now_v7()` (the `items.rs:414` pattern — safe because it runs outside the isolate; the script never derives ids) and is the same id exposed via `workflow.runId` (T1.6). Provide path-resolution helpers the recorder, resume, and discovery index share, and create the directory tree at run start (persisting `script.js` + `meta.json` up front so resume can validate against them).
+Establish the private per-run layout under `$CODEX_HOME/workflows/runs/<runId>/`: authoritative `journal.jsonl`, exact `script.js`, bounded private canonical `invocation.json`, `meta.json`, hard-bounded atomic `progress.json`, and the live-owner `lease.lock`. Enforce private directory/file modes, mint the UUIDv7 host-side, and share path helpers across recorder, resume, discovery, detached watch, and recovery. Acquire the lease and durably publish script/invocation/meta before exposing the run as running.
 
 _Acceptance:_
-- Starting a workflow run creates `$CODEX_HOME/workflows/runs/<runId>/` with `script.js` and `meta.json` written before body execution
+- Starting a workflow creates a private run directory with exact `script.js`, canonical `invocation.json`, and `meta.json` durably published before body execution
 - `runId` is a `uuid now_v7` minted host-side and matches `workflow.runId` injected into the isolate
-- Path helpers resolve journal/script/meta paths from a `runId` and honour `CODEX_HOME` override (tempdir-isolatable for tests)
+- Path helpers resolve every private artifact from a `runId`, honor `CODEX_HOME`, reject unsafe path types, and enforce 0700/0600 Unix modes under a permissive umask
 - A completed run's `script.js` is byte-identical to the submitted program (re-invoke-by-scriptPath works)
 
 #### `P3-workflow-runs-index` — workflow_runs SQLite discovery index (codex-state migration + model)  ·  _M_
 **Depends on:** `P3-storage-layout`  ·  **Spec:** `§7 (Storage layout — workflow_runs SQLite index)`, `§9 (codex workflow ls)`, `§10 codex-rs/state/migrations/ + state/src/model/`, `state/src/model/agent_job.rs`, `state/src/lib.rs:99-103`, `§13 R8`
 
-Add a `workflow_runs` discovery index as a new `codex-state` migration (next number after `0040_*`, following the per-DB conventions in `state/src/lib.rs:99-103`) plus a model module modeled on `state/src/model/agent_job.rs`. Store `{runId, name, scriptHash, scriptPath, parentRunId, status, created_at}` PURELY for discovery-by-name and `codex workflow ls`. Replay NEVER needs SQLite — JSONL is authoritative; this table is a rebuildable projection (R8). Provide upsert on run start/finish (status transitions) and query-by-name/list APIs. Must be rebuildable from the on-disk `runs/<runId>/meta.json` set.
+Add a rebuildable `workflow_runs` discovery/control projection. Store run/name/script identity, `parentRunId`, `ownerThreadId`, `resumedFromRunId`, workflow-specific status, recovery attempts, publication state, and creation time. Replay never depends on SQLite: journal plus private invocation are authoritative. Provide transition-safe upsert/query/rebuild APIs and keep legacy nullable owners readable but uncontrollable.
 
 _Acceptance:_
 - New migration applies cleanly on a fresh DB and is idempotent under the migration test harness
@@ -616,7 +632,7 @@ _Acceptance:_
 #### `P3-journal-write-integration` — Wire JournalRecorder into SpawnAgent dispatch: record agent_call/phase/log with child_thread_id + rollout_path  ·  _M_
 **Depends on:** `P1-cellactor-spawn-dispatch`, `P0-phase-log-globals`, `P3-journal-recorder`, `P3-journal-key`, `P3-runtime-replay-state`  ·  **Spec:** `§7 (Journal format / authoritative run→agent link)`, `§5 (Admission order step 7)`, `§10 core/src/tools/code_mode/delegate.rs (journal read/write incl. child_thread_id + rollout_path)`, `§9 feature 3`, `§13 R8`
 
-Integrate `JournalRecorder` into the `agent()` host dispatch (`core/src/tools/code_mode/delegate.rs` `DispatchMessage::SpawnAgent`, built in T1.2) so every finalized `agent()` call appends an `agent_call` `JournalLine` recording `ordinal`, the `(prompt,opts)` `key` (P3-journal-key), `prompt_hash`, canonicalized `opts`, `phase`, `label`, the child's `child_thread_id` AND absolute `rollout_path`, `status` (`completed|null|error`), `return` (string/validated-object/null), `tokens_spent`, and `completion_seq`. Also route `phase()`/`log()` markers (T0.5) to `phase`/`log` journal lines. This makes the journal the AUTHORITATIVE run→agent link — a run is reconstructable from `journal.jsonl` alone, independent of `agent-graph-store` edges and the SQLite projection (R8). Append happens at admission-order step 7 (after reap, per §5).
+Integrate `JournalRecorder` into the logical `agent()` control loop so every finalized source ordinal records its attempt history, `(prompt,opts)` key, prompt hash, canonical options, phase/label, exact child identity and rollout path, natural/control terminal reason, return value, aggregate spend, and completion order. User Retry creates fresh attempt/child records while retaining the logical node and source ordinal; Skip and retry-cap exhaustion settle the logical call as audited `null`. Route `phase()`/`log()` markers to matching journal lines. The journal remains the authoritative run→agent link independent of graph and SQLite projections.
 
 _Acceptance:_
 - Each completed `agent()` writes exactly one `agent_call` line with a non-empty `child_thread_id` and an absolute `rollout_path` that points at an existing subagent rollout file
@@ -625,17 +641,17 @@ _Acceptance:_
 - `phase()`/`log()` emit matching `phase`/`log` journal lines
 - Integration test (fixture model) reconstructs the full run member-transcript set from `journal.jsonl` alone with the graph store absent
 
-#### `P3-budget-readd` — rollout_budget.rs: replay-only add_spent path for byte-identical resume budget  ·  _S_
-**Depends on:** `P2-budget-getters`  ·  **Spec:** `§8 (Resume determinism of budget)`, `§7 (Resume algorithm step 3 — re-add tokens_spent)`, `§10 core/src/rollout_budget.rs (replay-only add_spent)`, `§14.1 Layer 1 (Budget ceiling)`, `core/src/rollout_budget.rs`
+#### `P3-budget-readd` — WorkflowBudget replay-spend path for deterministic resume  ·  _S_
+**Depends on:** `P2-budget-getters`  ·  **Spec:** `§8 (Resume determinism of budget)`, `§7 (Resume algorithm step 3)`, `core-workflows/src/budget.rs`
 
-Add a replay-only `add_spent(tokens)` method to `RolloutBudget` (`core/src/rollout_budget.rs`) that increments the shared `weighted_tokens_used` counter under the existing lock WITHOUT running a live turn, so during prefix replay each journaled `tokens_spent` is re-added and `spent()`/`remaining()` and the ceiling-throw boundary land at the identical ordinal as the original run (§8). Depends on the Phase-2 `spent()`/`remaining()` getters. Distinct from live `record_usage`: `add_spent` is only invoked from the replay branch and must not double-count on the first live (post-divergence) call.
+Add journaled `tokens_spent` to the resumed run's `WorkflowBudget` hierarchy without running a live child. Refresh the isolate mirror before resolving each cached promise. This path is distinct from live completion accounting and must transition to live execution without double-counting at the divergence ordinal.
 
 _Acceptance:_
-- `add_spent(n)` increases `spent()` by exactly `n` under the existing lock and is not exposed on the live turn path
-- After replaying k cached entries, `spent()`/`remaining()` equal the values the original run had after its first k calls (byte-identical)
-- The pre-admission `remaining() <= 0` throw fires at the identical ordinal in an interrupted-then-resumed run as in the uninterrupted run
+- replayed spend charges the resumed run and each workflow ancestor exactly once
+- after replaying k cached entries, the effective snapshot equals the original run after its first k calls
+- admission rejects at the same ordinal in resumed and uninterrupted executions
 - No double-counting when replay transitions to live at the divergence ordinal
-- Unit test in `rollout_budget` covers replay re-add + throw-boundary equality
+- tests cover nested, zero-limited, unmetered, and cancellation-adjacent replay paths
 
 #### `P3-resume-prefix-loop` — agent_callback prefix-replay branch: ordinal+key match, resolve-from-cache, budget re-add, first-divergence-goes-live  ·  _L_
 **Depends on:** `P1-agentcall-runtime-types`, `P1-cellactor-spawn-dispatch`, `P3-runtime-replay-state`, `P3-journal-replay-read`, `P3-journal-key`, `P3-budget-readd`, `P3-journal-write-integration`  ·  **Spec:** `§7 (Resume algorithm step 3-4)`, `§7 (Invocation ordinal / cache key)`, `§5 (Admission order step 3)`, `module_loader.rs:66-101 (resolve_tool_response resolve path)`, `code-mode/src/runtime/callbacks.rs:61-62`
@@ -653,10 +669,10 @@ _Acceptance:_
 #### `P3-resume-entry` — resumeFromRunId entrypoint: load prior journal, validate, mint fresh runId, seed replay state  ·  _M_
 **Depends on:** `P0-host-tool-skeleton`, `P3-journal-replay-read`, `P3-storage-layout`, `P3-runtime-replay-state`, `P3-workflow-runs-index`  ·  **Spec:** `§7 (Resume algorithm step 1-2)`, `§2 (Resume)`, `§9 (codex workflow run --resume <runId>)`, `§10 core/src/tools/code_mode/execute_handler.rs / delegate.rs`
 
-Wire the `resumeFromRunId` host parameter through the workflow host tool (`execute_handler.rs`/`delegate.rs`, cloned in T0.4). On resume: load the prior run's `journal.jsonl` tail-first via P3-journal-replay-read into `entries[0..M]`, validate `script_hash`/`args_hash`/`key_algo_version` (mismatch → early divergence, not a hard failure), mint a FRESH `runId` (itself resumable, new `runs/<runId>/` dir and `workflow_runs` row), and seed `RuntimeState` with `replay_entries` + `replay_active = true` + prefix length `M` before evaluating the body. Expose it via the `codex workflow run --resume <runId>` CLI path and the `workflow_run` tool. The resumed run records `parent_run_id` = the source runId in its `run_meta`.
+Wire the `resumeFromRunId` host parameter through the workflow host tool (`execute_handler.rs`/`delegate.rs`, cloned in T0.4). On resume: load the prior run's `journal.jsonl` tail-first via P3-journal-replay-read into `entries[0..M]`, validate `script_hash`/`args_hash`/`key_algo_version` (mismatch → early divergence, not a hard failure), mint a FRESH `runId` (itself resumable, new `runs/<runId>/` dir and `workflow_runs` row), and seed `RuntimeState` with `replay_entries` + `replay_active = true` + prefix length `M` before evaluating the body. Expose it via the `codex workflow run --resume <runId>` CLI path and the `workflow_run` tool. The resumed run records `resumed_from_run_id` = the source runId in its `run_meta`; `parent_run_id` remains reserved for ordinary nested-`workflow()` ancestry.
 
 _Acceptance:_
-- `--resume <runId>` loads the prior journal and seeds a resumed run whose `run_meta.parent_run_id` = the source runId
+- `--resume <runId>` loads the prior journal and seeds a resumed run whose `run_meta.resumed_from_run_id` = the source runId without changing its nesting parent
 - A fresh `runId` and new `runs/<runId>/` dir + `workflow_runs` row are created for the resumed run (the resume is itself resumable)
 - `script_hash`/`args_hash`/`key_algo_version` mismatch produces early divergence (live from ordinal 0) rather than an error
 - A resumed run over an unchanged script/args replays the entire prefix from cache and completes with no new subagent spawns
@@ -680,11 +696,11 @@ _Acceptance:_
 #### `P4-protocol-eventmsg` — Add Workflow* EventMsg cluster to protocol.rs  ·  _M_
 **Depends on:** none  ·  **Spec:** `§9 New protocol events`, `§10 codex-rs/protocol/src/protocol.rs`, `protocol.rs:1457-1476`
 
-Add a workflow event cluster to the core `EventMsg` enum in `codex-rs/protocol/src/protocol.rs`, placed next to the `CollabAgent*` family (protocol.rs:1457-1476, the exact structural precedent), reusing `ReasoningEffortConfig` and `TokenUsage`. Variants: `WorkflowRunBegin{run_id, name, phases, args_digest}`, `WorkflowRunEnd{run_id, status, spent, total}`, `WorkflowPhaseBegin/End{run_id, phase_index, title}`, `WorkflowGroupBegin/End{run_id, group_id, kind: parallel|pipeline, item_count}`, `WorkflowAgentBegin{run_id, node_id, parent_node_id, label, phase, model, effort}`, `WorkflowAgentUpdated{run_id, node_id, token_usage, tool_call_count}`, `WorkflowAgentEnd{run_id, node_id, status, token_usage, tool_call_count, returned_null}`, `WorkflowLog{run_id, message}`. `node_id` MUST be a deterministic per-run counter (never Date.now/random) so it survives resume replay; `WorkflowRunBegin.phases` carries the full statically-declared `meta.phases` list up front. Add `From` impls as needed. This is the protocol foundation the app-server notifications and the TUI monitor consume.
+Add one stable `EventMsg::Workflow(WorkflowEvent)` seam in `codex-rs/protocol/src/protocol.rs`, placed next to the `CollabAgent*` family. Define the exhaustively tagged `WorkflowEvent` union in a focused private module, reusing `ReasoningEffortConfig` and `TokenUsage`. Payload variants: `RunBegin{run_id, name, phases, args_digest}`, `RunEnd{run_id, status, spent, total}`, `PhaseBegin/End{run_id, phase_index, title}`, `GroupBegin{run_id, group_id, parent_node_id, kind: parallel|pipeline, item_count}`, `GroupEnd{run_id, group_id, kind, item_count}`, `AgentBegin{run_id, node_id, parent_node_id, label, phase, model, effort}`, `AgentUpdated{run_id, node_id, token_usage, tool_call_count}`, `AgentEnd{run_id, node_id, status, token_usage, tool_call_count, returned_null}`, `Log{run_id, message}`. `node_id` and `group_id` share a deterministic per-run topology counter (never Date.now/random); explicit group parentage preserves topology when async group lifetimes overlap. `phase_index` is a separate deterministic phase ordinal; `RunBegin.phases` carries the full statically-declared `meta.phases` list up front. Add `From` impls as needed. This is the protocol foundation the app-server notifications and the TUI monitor consume while limiting upstream exhaustive-match churn to one top-level arm.
 
 _Acceptance:_
-- All eight Workflow* EventMsg variants compile with the fields specified in §9, reusing `ReasoningEffortConfig`/`TokenUsage`, and sit adjacent to the CollabAgent* family in protocol.rs
-- `node_id` and `phase_index` are integer counters with no dependency on wall-clock/random; a unit test constructs a run's events twice and asserts identical node_id sequences
+- The single top-level `EventMsg::Workflow(WorkflowEvent)` variant sits adjacent to the CollabAgent* family; its tagged nested union exhaustively covers all ten payload variants from §9 and reuses `ReasoningEffortConfig`/`TokenUsage`
+- `node_id`, `group_id`, and `phase_index` are platform-independent integer fields; deterministic allocation is owned and tested by `P4-run-phase-model`, not fabricated in the transport-only protocol crate
 - `WorkflowRunBegin.phases` round-trips the declared meta.phases list
 - serde round-trip (serialize+deserialize) unit test passes for every new variant
 - No existing EventMsg consumer breaks (protocol crate + downstream compile green)
@@ -692,21 +708,21 @@ _Acceptance:_
 #### `P4-appserver-workflow-notifs` — Add workflow/* ServerNotification payloads (v2/workflow.rs) + WorkflowsChanged  ·  _M_
 **Depends on:** `P4-protocol-eventmsg`  ·  **Spec:** `§9 App-server notifications`, `§10 app-server-protocol/src/protocol/v2/workflow.rs`, `§10 app-server-protocol/src/protocol/common.rs`, `common.rs:1613`
 
-Create `codex-rs/app-server-protocol/src/protocol/v2/workflow.rs` (modeled on `v2/notification.rs`) holding the `workflow/*` wire payload structs: `workflow/started`, `workflow/phase/changed`, `workflow/agent/started|updated|completed`, `workflow/log`, `workflow/completed`. Use `#[serde(rename_all="camelCase")]`, derive `JsonSchema`, and enable ts-rs TS export so the SDK gets typed progress for free. Reuse the generated `CollabAgentStatus` enum for node status. Add the corresponding `ServerNotification` variants (macro at `app-server-protocol/src/protocol/common.rs:1613`) and add a `WorkflowsChanged => "workflows/changed"` variant next to `SkillsChanged` for the saved-workflow file-watcher. Batch all workflow/* variants into this one PR to avoid repeated JSON+TS schema churn.
+Create `codex-rs/app-server-protocol/src/protocol/v2/workflow.rs` (modeled on `v2/notification.rs`) holding the `workflow/*` wire payload structs: `workflow/started`, `workflow/phase/changed`, `workflow/group/started|completed`, `workflow/agent/started|updated|completed`, `workflow/log`, `workflow/completed`. The group pair is required to preserve empty groups and nested/overlapping topology. Use `#[serde(rename_all="camelCase")]`, derive `JsonSchema`, and enable ts-rs TS export. Reuse the generated `CollabAgentStatus` enum for node status. Every payload carries `threadId`; lifecycle payloads carry app-server-observed integer Unix-seconds timestamps. Mark every workflow progress notification experimental so the fork can evolve it until M4/MT gates pass; opted-in SDK clients still receive typed progress from experimental schema generation. Add the corresponding `ServerNotification` variants (macro at `app-server-protocol/src/protocol/common.rs:1613`); the existing `WorkflowsChanged => "workflows/changed"` variant remains next to `SkillsChanged`. Batch all workflow/* variants into this one PR to avoid repeated JSON+TS schema churn.
 
 _Acceptance:_
-- `v2/workflow.rs` defines camelCase, JsonSchema-deriving payload structs for all seven workflow/* notifications and reuses `CollabAgentStatus` for status
+- `v2/workflow.rs` defines camelCase, JsonSchema-deriving payload structs for all nine workflow/* notifications and reuses `CollabAgentStatus` for status
 - New `ServerNotification` variants added under the workflow/* wire namespace and the `WorkflowsChanged => "workflows/changed"` variant added alongside `SkillsChanged`
 - Generated TS bindings (ts-rs) include the new workflow payload types; the schema-export test/regen passes
-- Notification wire names match §9 exactly (workflow/started, workflow/phase/changed, workflow/agent/{started,updated,completed}, workflow/log, workflow/completed)
+- Notification wire names match §9 exactly (workflow/started, workflow/phase/changed, workflow/group/{started,completed}, workflow/agent/{started,updated,completed}, workflow/log, workflow/completed)
 
 #### `P4-bespoke-event-mapping` — Map Workflow* EventMsg -> workflow/* ServerNotification in bespoke_event_handling.rs  ·  _S_
 **Depends on:** `P4-protocol-eventmsg`, `P4-appserver-workflow-notifs`  ·  **Spec:** `§9 App-server notifications`, `§10 app-server/src/bespoke_event_handling.rs`
 
-Add the EventMsg -> ServerNotification mapping arms for the Workflow* cluster in `codex-rs/app-server/src/bespoke_event_handling.rs`, translating each core `Workflow*` EventMsg (P4-protocol-eventmsg) into its `workflow/*` wire notification (P4-appserver-workflow-notifs). `WorkflowAgentUpdated{token_usage, tool_call_count}` rolls up the two numbers the tree needs from the subagent's own thread TokenCount/tool events. This is the seam that turns runtime events into client-facing notifications.
+Add one `EventMsg::Workflow(event)` arm in `codex-rs/app-server/src/bespoke_event_handling.rs` and map the nested `WorkflowEvent` union exhaustively into its `workflow/*` wire notifications (P4-appserver-workflow-notifs). `AgentUpdated{token_usage, tool_call_count}` rolls up the two numbers the tree needs from the subagent's own thread TokenCount/tool events. This is the seam that turns runtime events into client-facing notifications without repeated top-level match churn.
 
 _Acceptance:_
-- Every Workflow* EventMsg variant has a mapping arm producing the correct workflow/* ServerNotification
+- Every nested `WorkflowEvent` variant has an exhaustive mapping arm producing the correct workflow/* ServerNotification
 - A unit/integration test drives a synthetic Workflow* EventMsg through the handler and asserts the emitted ServerNotification payload fields match
 - Unmapped/unknown variants fail the compile (exhaustive match) so future Workflow* variants can't be silently dropped
 
@@ -721,17 +737,18 @@ _Acceptance:_
 - A `phase(title)` with no declared match appends a new phase node; a run with no phases collapses to one implicit root group
 - Run-scoping intersects the global running-turn count with the run's descendant set so counts reflect only this run
 - Model is renderer-agnostic (no ratatui/TUI imports) and unit-tested with synthetic Workflow* event sequences
+- Group and agent topology IDs come from one deterministic per-run source-order counter; constructing the same synthetic event sequence twice yields identical IDs, and `parent_node_id` resolves within that shared namespace
 
 #### `P4-progress-cell` — WorkflowProgressCell persistent in-place-redrawn monitor panel  ·  _L_
 **Depends on:** `P4-run-phase-model`, `P4-bespoke-event-mapping`  ·  **Spec:** `§9 TUI live progress tree`, `§9 Feature (1) Interactive`, `§10 tui/src/app/agent_status_feed.rs`, `§10 tui/src/app/thread_events.rs`, `§14.1 Layer 3`
 
-Add a `WorkflowProgressCell` in `codex-rs/tui/src/app/agent_status_feed.rs` as a persistent, in-place-redrawn monitor panel keyed by `run_id` (NOT the one-shot scrollback `AgentStatusHistoryCell`). It renders the P4-run-phase-model tree: workflow name -> phases (pending/active/done, with agent count, rolled-up token total, elapsed) -> (group nodes ->) agent leaves (status dot, label, live token count, tool-call count). Reuse `multi_agents.rs` helpers (`agent_picker_status_dot_spans`, `format_agent_picker_item_name`), `render/line_utils::prefix_lines` for indentation, and `AgentStatusThreadPreview::from_store` for per-agent leaf content sourced from the per-thread buffers in `tui/src/app/thread_events.rs` (`ThreadEventStore`/`ThreadEventChannel`). Bound height (constants like `AGENT_STATUS_PREVIEW_*`) by collapsing finished phases to one summary line. Re-render on each workflow/* notification via `request_redraw`. Any spinner/elapsed derives only from event-supplied `started_at_ms` (Date.now disabled). The panel can be attached to a background run at any time, including one started earlier in the session, because it is a pure consumer of the buffered per-thread stores and aggregate subscriptions.
+Add a `WorkflowProgressCell` in `codex-rs/tui/src/app/agent_status_feed.rs` as a persistent, in-place-redrawn monitor panel keyed by `run_id` (NOT the one-shot scrollback `AgentStatusHistoryCell`). It renders the P4-run-phase-model tree: workflow name -> phases (pending/active/done, with agent count, rolled-up token total, elapsed) -> (group nodes ->) agent leaves (status dot, label, live token count, tool-call count). Reuse `multi_agents.rs` helpers (`agent_picker_status_dot_spans`, `format_agent_picker_item_name`), `render/line_utils::prefix_lines` for indentation, and `AgentStatusThreadPreview::from_store` for per-agent leaf content sourced from the per-thread buffers in `tui/src/app/thread_events.rs` (`ThreadEventStore`/`ThreadEventChannel`). Bound height with four full projections plus compact overflow cards and an explicit saturation summary. Re-render on each workflow/* notification via `request_redraw`. Elapsed/duration derives only from event-supplied integer Unix seconds; the client does not consult a local wall clock. The panel can attach to a background run at any time from buffered state.
 
 _Acceptance:_
 - Insta snapshot test (extending `agent_status_feed_tests.rs`) shows the `meta.phases` skeleton rendering `pending` BEFORE any agent starts, then per-phase pending->active->done with per-agent rows (dot, label, live tokens, tool-call count)
 - Panel redraws in place on each workflow/* notification (frame N+1 mutates the same region; it is NOT appended to scrollback like AgentStatusHistoryCell)
 - Finished phases collapse to one summary line so total height stays bounded under a large agent count
-- Elapsed/spinner uses only event-supplied started_at_ms; no call to Date/Instant-derived wall clock in the cell
+- Elapsed/duration uses only event-supplied integer Unix seconds; no local Date/Instant wall-clock derivation in the cell
 - Attaching the panel to a run started earlier in the session renders its current tree from buffered stores
 
 #### `P4-tui-notification-arms` — Wire workflow/* notification match arms in tui/src/app.rs  ·  _S_
@@ -759,7 +776,7 @@ _Acceptance:_
 #### `P4-cli-watch` — codex workflow watch <runId> [--json] detached live monitor  ·  _L_
 **Depends on:** `P4-cli-run`, `P4-run-phase-model`, `P4-appserver-workflow-notifs`, `P3-journal-recorder`  ·  **Spec:** `§9 Feature (1) Invocation non-interactive`, `§9 Completed runs remain viewable`, `§10 cli/src/main.rs`, `common.rs:621-638`, `thread_processor.rs:2600,2628`
 
-Add `codex workflow watch <runId> [--json]` under the `codex workflow` subcommand (`cli/src/main.rs:124`) for non-interactive/CI/detached-terminal monitoring. It opens an app-server connection, enumerates the run's threads via `thread/list` / `thread/loaded/list` (`app-server-protocol/src/protocol/common.rs:621-638`) and `list_agents` (`core/src/tools/handlers/multi_agents_v2/list_agents.rs`), subscribes to `subscribe_thread_created` (`thread_processor.rs:2600`) and `subscribe_running_assistant_turn_count` (`thread_processor.rs:2628`) for aggregate lifecycle, builds the P4-run-phase-model tree, and renders it, redrawing on each workflow/* and per-thread Item*/Turn* notification. `--json` streams the same tree as newline-delimited JSON (the NDJSON twin used by CI/UAT). Completed runs remain viewable: reconstruct the tree from the run's `journal.jsonl` (authoritative `child_thread_id` + `rollout_path`, from P3-journal) + per-agent rollout files, independent of whether graph-store edges still exist.
+Add `codex workflow watch <runId> [--json]` under the `codex workflow` subcommand (`cli/src/main.rs:124`) for non-interactive/CI/detached-terminal monitoring. The workflow event boundary reduces every event into the hard-bounded atomic `runs/<runId>/progress.json` projection; a watcher in another process polls that file and redraws only changed frames. `--json` emits the same changed frames as newline-delimited JSON (the NDJSON twin used by CI/UAT), with no ANSI control sequences or text separators. Missing/corrupt projections fall back explicitly to terminal `meta.json`, the journal's authoritative `child_thread_id` + `rollout_path` bindings, and fixed-total-byte tails of child rollout files. The in-session TUI continues to consume typed `workflow/*` app-server notifications directly; both renderers share the same event-derived topology semantics. Completed runs therefore remain viewable independent of live graph-store edges.
 
 _Acceptance:_
 - `codex workflow watch <runId>` on a RUNNING run renders the live phase+agent tree and updates it as subagents progress
@@ -802,21 +819,21 @@ _Acceptance:_
 - Esc/back issues thread/unsubscribe for the child and the parent subscription survives
 - UAT-2 asserts background-run swap-back lands on the monitor panel (not the user's foreground thread)
 
-#### `P4-state-workflow-runs-index` — workflow_runs SQLite discovery index (codex-state migration)  ·  _S_
-**Depends on:** `P0-feature-flag`  ·  **Spec:** `§7 Storage layout workflow_runs`, `§10 state/migrations + state/src/model`, `state/src/lib.rs:99-103`
+#### `P4-state-workflow-runs-index` — Wire the Phase-3 workflow_runs projection into M4 discovery and controls  ·  _S_
+**Depends on:** `P3-workflow-runs-index`  ·  **Spec:** `§7 Storage layout workflow_runs`, `§9 entrypoints and controls`, `§10 state/src/model`, `state/src/lib.rs:99-103`
 
-Add the `workflow_runs` SQLite discovery index via a new `codex-state` migration (following `state/src/model/agent_job.rs` and `state/src/lib.rs:99-103` per-DB conventions). Stores `{runId, name, scriptHash, scriptPath, parentRunId, status, created_at}` purely for discovery-by-name (`codex workflow ls`, saved-workflow re-invocation). Replay never needs SQLite — JSONL is authoritative; this index is a rebuildable projection. Written on run start/finish by the workflow host.
+Reuse the single `workflow_runs` SQLite projection created by `P3-workflow-runs-index`; do not create a duplicate table or parallel model. This M4 ticket wires that projection into `workflow ls`, picker/history, recovery, and authenticated mutation, and adds only the transition-safe fields required by those consumers. New and nested runs use their current root thread; Resume retains the same authorized owner while recording lineage separately. Legacy null owners remain readable but uncontrollable. Replay never needs SQLite; the projection remains rebuildable from private durable runs.
 
 _Acceptance:_
-- Migration creates the workflow_runs table with the specified columns and applies cleanly forward
-- Inserting/updating a run row on start and on completion updates status/created_at correctly
-- A model + query API returns runs by name and newest-first for `codex workflow ls`
-- Index is rebuildable and not consulted on the replay path (documented + asserted by a test that replay works with the table empty)
+- No second `workflow_runs` table/model is introduced; any new columns extend the Phase-3 projection through forward migrations
+- Start, completion, recovery, and control transitions update status/owner/lineage/publication fields atomically
+- The shared query API returns runs newest-first for `codex workflow ls`, picker/history, and authenticated controls
+- The index remains rebuildable and absent from the replay authority path
 
 #### `P4-run-agents-projection` — Feature 3: run_agents projection over list_thread_spawn_descendants  ·  _M_
 **Depends on:** `P1-cellactor-spawn-dispatch`, `P3-journal-recorder`  ·  **Spec:** `§9 Feature (3) Topology + recoverability`, `§9 Layout`, `§10 agent-graph-store/src/local.rs`, `§10 state/migrations + state/src/model`, `§11 Phase 4c`
 
-Add the run-scoped `run_agents` projection (feature 3 completion / §11 Phase 4c) so tooling and `codex workflow watch` can enumerate all transcripts for a run. For each `runId` it records the member subagent `thread_id`s and the absolute path of each one's rollout file (`rollout-<date>-<thread_id>.jsonl`). Build it as a run-scoped grouping/index over `agent-graph-store` `upsert_thread_spawn_edge`/`list_thread_spawn_descendants` (`agent-graph-store/src/local.rs`) plus a SQLite projection (new `codex-state` migration + model). The run journal's per-call `child_thread_id` + `rollout_path` (P3-journal) remain AUTHORITATIVE — this projection is a rebuildable convenience index over the same facts. The per-agent rollout files themselves already ship in Phase 1 (each `agent()` spawns via `spawn_new_thread_with_source(ThreadSource::Subagent)` with its own RolloutRecorder); this ticket only adds the run-level grouping.
+Add the run-scoped `run_agents` projection (feature 3 completion / §11 Phase 4c) so tooling and `codex workflow watch` can enumerate all transcripts for a run. For each `runId` it records invocation ordinal, member subagent `thread_id`, and the absolute path of the rollout file (`rollout-<date>-<thread_id>.jsonl`). Rebuild the SQLite projection directly from the run journal's pre-turn `agent_bound` records and terminal `agent_call` linkage; `agent-graph-store` spawn edges may be cross-checked but are not required. The journal remains AUTHORITATIVE and the projection is a convenience index over the same facts. The per-agent rollout files themselves already ship in Phase 1 (each `agent()` spawns via `spawn_new_thread_with_source(ThreadSource::Subagent)` with its own RolloutRecorder); this ticket only adds the run-level grouping.
 
 _Acceptance:_
 - `run_agents` projection returns, for a given runId, every member subagent thread_id and its absolute rollout_path
@@ -862,12 +879,13 @@ _Acceptance:_
 #### `P4-workflow-run-tool` — Entrypoint: model-callable workflow_run tool  ·  _M_
 **Depends on:** `P0-host-tool-skeleton`, `P1-cellactor-spawn-dispatch`  ·  **Spec:** `§9 Entrypoint decision (1)`, `§10 core/src/tools/... multi_agents_v2`, `§4 workflow(nameOrRef, args)`
 
-Register a model-callable `workflow_run` tool alongside the `multi_agents_v2.rs` spawn/wait handlers. This is the primary, load-bearing entrypoint: the only surface that lets the authoring model launch/compose workflows mid-turn, and the native home of the JS `workflow(name, args)` hook. It resolves a saved workflow (or inline body) and submits it to the workflow host tool (P0-host-tool), running as a long-lived background app-server task that emits workflow/* events while the primary session stays interactive.
+Register a structured model-callable `workflow_run` tool alongside the code-mode spawn/wait handlers. This is the primary, load-bearing entrypoint that lets the authoring model launch workflows mid-turn. It resolves an exact statically discovered saved-workflow name, accepts bounded JSON args and an optional canonical resume run ID, and explicitly rejects inline source and arbitrary filesystem paths. The separate JS `workflow(name, args)` global remains the native composition hook inside a workflow isolate. Runs transfer to a session-owned background task that emits workflow/* events while the primary session stays interactive.
 
 _Acceptance:_
 - `workflow_run` tool is registered next to the multi_agents_v2 spawn/wait handlers and callable by the model mid-turn
-- Invoking it launches a workflow (by saved name or inline) that runs as a background app-server task emitting workflow/* events
-- The JS `workflow(name, args)` hook dispatches through this tool (one-level nesting; depth guard enforced upstream)
+- Invoking it launches an exact saved workflow as a background session task emitting workflow/* events and immediately returns a durable `{runId,status:"running"}` result
+- Inline source/path fields and non-canonical resume IDs are rejected before filesystem path construction
+- The JS `workflow(name, args)` hook composes saved workflows independently inside the isolate (one-level nesting; depth guard enforced upstream)
 - Integration test (fixture model) launches a fan-out workflow via workflow_run and asserts it completes and emits workflow/started..completed
 
 #### `P4-slash-workflow` — Entrypoint: SlashCommand::Workflow variant + runtime picker + monitor open  ·  _M_
@@ -928,12 +946,12 @@ _Acceptance:_
 #### `X-agent-driven-uat-harness` — Agent-driven TUI UAT harness (three planes)  ·  _L_
 **Depends on:** `X-fixture-model-harness`, `P4-cli-watch`  ·  **Spec:** `§14.2`
 
-The headline UAT harness: Plane 1 fixture SUT model, Plane 2 deterministic in-process driver (real App + embedded app-server + make_test_tui) plus optional codex-exec agent driver, Plane 3 verdict via exec --output-schema. Includes the scenario runner and isolation (per-scenario CODEX_HOME tempdir).
+The headline UAT harness has three evidence planes: a deterministic fixture SUT; the hermetic in-process real-App driver used as a merge gate; and a fresh fixed-size PTY/tmux run of the built `codex` binary operated by a no-context human-style agent. A separate judge agent receives only sanitized frames/transcript and the rubric. Equivalent disposable scenarios run against a pinned Claude build for the parity matrix.
 
 _Acceptance:_
 - Scenario runner drives a workflow via the real in-process TUI and emits a schema verdict
 - Gating lane is fully hermetic (no live model)
-- Agent-driver + LLM-judge lanes are separable and non-gating
+- Built-TUI driver and judge are separate roles; a fresh preserved pass is required release/parity evidence even if non-gating CI
 
 #### `X-uat-scenarios` — Author the 10 UAT scenarios (UAT-1..UAT-10)  ·  _L_
 **Depends on:** `X-agent-driven-uat-harness`  ·  **Spec:** `§14.2 UAT scenarios`
@@ -947,11 +965,11 @@ _Acceptance:_
 #### `X-ci-lanes` — CI lanes: hermetic gating + nightly non-gating  ·  _M_
 **Depends on:** `X-agent-driven-uat-harness`  ·  **Spec:** `§14.2`, `codex-rs/.config/nextest.toml`
 
-Wire the hermetic gating lane (fixture SUT + deterministic driver + deterministic-assertion judge) into required CI, and a nightly non-gating lane for the agent-driver + LLM-judge. Configure nextest test-groups/slow-timeout for serialization.
+Wire the hermetic gating lane (fixture SUT + deterministic driver + deterministic assertions) into required CI. Maintain a non-gating automation lane for the built-TUI driver/judge where practical, but require a fresh fixed-size Codex PTY pass and separate judge report before a Codex release/readiness handoff. Repeat matched scenarios against the pinned installed Claude build for exhaustive comparator signoff; a missing Claude row does not erase an independently evidenced Codex-readiness PASS. Configure nextest test-groups/slow-timeout for serialization.
 
 _Acceptance:_
 - Gating lane runs on every PR and is deterministic
-- Nightly lane runs the same scenarios with the agent/LLM-judge and is non-required
+- Codex release evidence records its version/hash, terminal dimensions, exact actions, frames, checkpoints, exit status, and separate driver/judge verdicts; exhaustive parity evidence adds the equivalent Claude record and permits no required `Missing` rows
 
 #### `X-per-phase-gates` — Wire per-phase UAT exit gates  ·  _S_
 **Depends on:** `X-ci-lanes`  ·  **Spec:** `§14.3`
