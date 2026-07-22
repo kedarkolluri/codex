@@ -33,6 +33,8 @@ use crate::protocol::FsGetMetadataParams;
 use crate::protocol::FsGetMetadataResponse;
 use crate::protocol::FsOpenParams;
 use crate::protocol::FsOpenResponse;
+use crate::protocol::FsOpenVerifiedParams;
+use crate::protocol::FsOpenVerifiedResponse;
 use crate::protocol::FsReadBlockParams;
 use crate::protocol::FsReadBlockResponse;
 use crate::protocol::FsReadDirectoryParams;
@@ -274,6 +276,14 @@ impl ExecServerHandler {
     ) -> Result<FsOpenResponse, JSONRPCErrorError> {
         self.require_initialized_for("filesystem")?;
         self.file_system.open(params).await
+    }
+
+    pub(crate) async fn fs_open_verified(
+        &self,
+        params: FsOpenVerifiedParams,
+    ) -> Result<FsOpenVerifiedResponse, JSONRPCErrorError> {
+        self.require_initialized_for("filesystem")?;
+        self.file_system.open_verified(params).await
     }
 
     pub(crate) async fn fs_read_block(

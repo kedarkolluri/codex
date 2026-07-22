@@ -29,6 +29,7 @@ use crate::protocol::FsReadFileParams;
 use crate::protocol::FsRemoveParams;
 use crate::protocol::FsWalkParams;
 use crate::protocol::FsWriteFileParams;
+use crate::rpc::UNSUPPORTED_OPERATION_ERROR_CODE;
 
 const INVALID_REQUEST_ERROR_CODE: i64 = -32600;
 const METHOD_NOT_FOUND_ERROR_CODE: i64 = -32601;
@@ -108,6 +109,12 @@ impl RemoteFileSystem {
         options: VerifiedFileReadOptions,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<VerifiedFileRead> {
+        if sandbox.is_some_and(FileSystemSandboxContext::should_run_in_sandbox) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "verified file reads do not support platform sandboxing",
+            ));
+        }
         trace!("remote fs read_file_verified");
         let client = self.client.get().await.map_err(map_remote_error)?;
         file_stream::open_verified(
@@ -402,6 +409,9 @@ fn map_remote_error(error: ExecServerError) -> io::Error {
         ExecServerError::Server { code, message } if code == INVALID_REQUEST_ERROR_CODE => {
             io::Error::new(io::ErrorKind::InvalidInput, message)
         }
+        ExecServerError::Server { code, message } if code == UNSUPPORTED_OPERATION_ERROR_CODE => {
+            io::Error::new(io::ErrorKind::Unsupported, message)
+        }
         ExecServerError::Server { message, .. } => io::Error::other(message),
         ExecServerError::Closed | ExecServerError::Disconnected(_) => {
             io::Error::new(io::ErrorKind::BrokenPipe, "exec-server transport closed")
@@ -514,6 +524,22 @@ mod tests {
                     "exec-server transport closed".to_string()
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn unsupported_server_errors_preserve_their_kind() {
+        let error = map_remote_error(ExecServerError::Server {
+            code: UNSUPPORTED_OPERATION_ERROR_CODE,
+            message: "verified reads are unsupported".to_string(),
+        });
+
+        assert_eq!(
+            (error.kind(), error.to_string()),
+            (
+                io::ErrorKind::Unsupported,
+                "verified reads are unsupported".to_string(),
+            )
         );
     }
 
