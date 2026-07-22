@@ -8,6 +8,7 @@ mod executor_loader;
 mod loader;
 mod model;
 mod registry;
+mod root_assembly;
 
 pub use loader::load_workflows_from_roots;
 pub use model::WorkflowLoadError;
@@ -15,3 +16,4 @@ pub use model::WorkflowMetadata;
 pub use model::WorkflowRoot;
 pub use model::WorkflowScope;
 pub use registry::WorkflowRegistry;
+pub use root_assembly::WorkflowRootAssembly;
