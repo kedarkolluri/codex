@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 codex-code-mode-protocol = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "rt"] }
 
 [dev-dependencies]

@@ -15,14 +15,14 @@ impl WorkflowRegistry {
     ///
     /// Duplicate script paths and names are resolved by scope, regardless of input order:
     /// project entries win over personal entries, which win over Codex-home entries. Ties within
-    /// one scope use the lexicographically smallest absolute path. Final entries and diagnostics
-    /// are sorted for deterministic consumers.
+    /// one scope use the lexicographically smallest canonical `file:` URI. Final entries and
+    /// diagnostics are sorted for deterministic consumers.
     pub fn new(mut workflows: Vec<WorkflowMetadata>, mut errors: Vec<WorkflowLoadError>) -> Self {
         workflows.sort_by(|left, right| {
             left.scope
                 .precedence_rank()
                 .cmp(&right.scope.precedence_rank())
-                .then_with(|| left.path.cmp(&right.path))
+                .then_with(|| left.path.to_string().cmp(&right.path.to_string()))
                 .then_with(|| left.name.cmp(&right.name))
                 .then_with(|| left.description.cmp(&right.description))
                 .then_with(|| left.phases.cmp(&right.phases))
@@ -36,7 +36,8 @@ impl WorkflowRegistry {
         workflows.sort_by(|left, right| left.name.cmp(&right.name));
         errors.sort_by(|left, right| {
             left.path
-                .cmp(&right.path)
+                .to_string()
+                .cmp(&right.path.to_string())
                 .then_with(|| left.message.cmp(&right.message))
         });
 

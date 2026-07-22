@@ -2847,6 +2847,7 @@ version = "0.0.0"
 dependencies = [
  "codex-code-mode-protocol",
  "codex-utils-absolute-path",
+ "codex-utils-path-uri",
  "pretty_assertions",
  "tempfile",
  "tokio",

@@ -1,4 +1,5 @@
 use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 
 /// Origin of a saved workflow, ordered by explicit registry precedence.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -32,13 +33,26 @@ impl WorkflowScope {
 /// An absolute host-local directory from which saved workflows can be discovered.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowRoot {
-    pub path: AbsolutePathBuf,
+    path: PathUri,
     pub scope: WorkflowScope,
+    host_path: AbsolutePathBuf,
 }
 
 impl WorkflowRoot {
     pub fn new(path: AbsolutePathBuf, scope: WorkflowScope) -> Self {
-        Self { path, scope }
+        Self {
+            path: PathUri::from_abs_path(&path),
+            scope,
+            host_path: path,
+        }
+    }
+
+    pub fn path(&self) -> &PathUri {
+        &self.path
+    }
+
+    pub(crate) fn host_path(&self) -> &AbsolutePathBuf {
+        &self.host_path
     }
 }
 
@@ -48,14 +62,14 @@ pub struct WorkflowMetadata {
     pub name: String,
     pub description: String,
     pub phases: Vec<String>,
-    /// Absolute host-local path to the script.
-    pub path: AbsolutePathBuf,
+    /// Absolute `file:` URI for the script.
+    pub path: PathUri,
     pub scope: WorkflowScope,
 }
 
 /// A candidate that discovery skipped without aborting the rest of the scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowLoadError {
-    pub path: AbsolutePathBuf,
+    pub path: PathUri,
     pub message: String,
 }
