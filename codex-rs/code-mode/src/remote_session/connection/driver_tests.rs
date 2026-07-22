@@ -49,12 +49,16 @@ struct DriverHarness {
 
 impl DriverHarness {
     fn start() -> Self {
+        Self::start_configured(|_| {})
+    }
+
+    fn start_configured(configure: impl FnOnce(&mut ConnectionDriver)) -> Self {
         let (command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
-        let (driver, execute_claim_tx) = ConnectionDriver::new(
+        let (mut driver, execute_claim_tx) = ConnectionDriver::new(
             command_rx,
             event_rx,
             event_tx.clone(),
@@ -65,6 +69,7 @@ impl DriverHarness {
                 cancellation: cancellation.clone(),
             },
         );
+        configure(&mut driver);
         let driver_task = tokio::spawn(driver.run());
         Self {
             command_tx,
@@ -1366,6 +1371,9 @@ async fn session_accepts_more_than_4096_cells_without_growing_a_tombstone_set() 
     .expect("cell close callbacks timeout");
     assert!(harness.alive.load(Ordering::Acquire));
 }
+
+#[path = "driver/terminal_echo_host_tests.rs"]
+mod terminal_echo_host;
 
 #[tokio::test]
 async fn connection_failure_closes_every_live_cell_once() {

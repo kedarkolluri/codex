@@ -781,3 +781,6 @@ async fn saved_deferred_wait_keeps_remote_output_ledger() {
     );
     assert!(!alive.load(Ordering::Acquire));
 }
+
+#[path = "terminal_echo_lifecycle_tests.rs"]
+mod terminal_echo_lifecycle;
