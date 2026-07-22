@@ -91,13 +91,13 @@ async fn handshake_and_multiple_session_lifecycles_are_ordered() {
     let mut writer = FramedWriter::new(client_writer);
 
     writer
-        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
+        .write(&client_hello([ProtocolVersion::V2], CapabilitySet::empty()))
         .await
         .expect("write hello");
     assert_eq!(
         reader.read::<HostToClient>().await.expect("read hello"),
         Some(HostToClient::HostHello(HostHello::new(
-            ProtocolVersion::V1,
+            ProtocolVersion::V2,
             CapabilitySet::empty(),
         )))
     );
@@ -167,17 +167,15 @@ async fn incompatible_or_invalid_handshake_is_rejected() {
     let host = tokio::spawn(run(host_reader, host_writer));
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
-    let version_two = ProtocolVersion::new(/*value*/ 2).expect("protocol version");
-
     writer
-        .write(&client_hello([version_two], CapabilitySet::empty()))
+        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
         .await
         .expect("write hello");
     assert_eq!(
         reader.read::<HostToClient>().await.expect("rejection"),
         Some(HostToClient::HandshakeRejected {
             reason: HandshakeRejectReason::NoCompatibleVersion {
-                supported_versions: SupportedProtocolVersions::try_new([ProtocolVersion::V1])
+                supported_versions: SupportedProtocolVersions::try_new([ProtocolVersion::V2])
                     .expect("host versions"),
             },
         })
@@ -222,7 +220,7 @@ async fn unsupported_required_capability_is_rejected() {
 
     writer
         .write(&client_hello(
-            [ProtocolVersion::V1],
+            [ProtocolVersion::V2],
             CapabilitySet::try_new([capability.clone()]).expect("capabilities"),
         ))
         .await
@@ -245,7 +243,7 @@ async fn session_id_cannot_be_reused_after_shutdown() {
     let mut reader = FramedReader::new(client_reader);
     let mut writer = FramedWriter::new(client_writer);
     writer
-        .write(&client_hello([ProtocolVersion::V1], CapabilitySet::empty()))
+        .write(&client_hello([ProtocolVersion::V2], CapabilitySet::empty()))
         .await
         .expect("write hello");
     reader

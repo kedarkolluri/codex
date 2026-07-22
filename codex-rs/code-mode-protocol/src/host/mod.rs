@@ -1,9 +1,9 @@
 //! Messages and local IPC framing for the code-mode host boundary.
 //!
-//! Protocol version 1 multiplexes session operations and delegate callbacks by
-//! request ID over one ordered connection. It defines no optional capabilities
-//! yet; capability names provide an extension point for later versions without
-//! weakening the v1 decoder.
+//! Protocol version 2 multiplexes session operations and delegate callbacks by
+//! request ID over one ordered connection and requires bounded cell identifiers
+//! in both directions. Capability names provide an extension point without
+//! weakening the versioned decoder contract.
 
 mod codec;
 mod error;
@@ -26,6 +26,8 @@ pub use message::HostRequest;
 pub use message::HostResponse;
 pub use message::HostToClient;
 pub use message::WireResult;
+pub use payload::InvalidWireCellId;
+pub use payload::WIRE_CELL_ID_MAX_BYTES;
 pub use payload::WireCellId;
 pub use payload::WireContentItem;
 pub use payload::WireExecuteRequest;

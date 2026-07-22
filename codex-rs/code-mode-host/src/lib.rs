@@ -182,10 +182,10 @@ where
         return Ok(false);
     };
 
-    let supported_versions = SupportedProtocolVersions::try_new([ProtocolVersion::V1])?;
+    let supported_versions = SupportedProtocolVersions::try_new([ProtocolVersion::V2])?;
     if !client_hello
         .supported_versions()
-        .contains(ProtocolVersion::V1)
+        .contains(ProtocolVersion::V2)
     {
         writer
             .write(&HostToClient::HandshakeRejected {
@@ -215,7 +215,7 @@ where
 
     writer
         .write(&HostToClient::HostHello(HostHello::new(
-            ProtocolVersion::V1,
+            ProtocolVersion::V2,
             host_capabilities,
         )))
         .await

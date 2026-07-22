@@ -31,7 +31,7 @@ pub(super) fn remote_cell_id(
                 "cell {cell_id} belongs to a stale code-mode host generation"
             ));
         }
-        return Ok(WireCellId::new(cell_id.as_str()));
+        return WireCellId::try_new(cell_id.as_str()).map_err(|err| err.to_string());
     }
     let prefix = format!("g{}:", session.generation);
     let Some(remote_id) = cell_id.as_str().strip_prefix(&prefix) else {
@@ -39,7 +39,7 @@ pub(super) fn remote_cell_id(
             "cell {cell_id} belongs to a stale code-mode host generation"
         ));
     };
-    Ok(WireCellId::new(remote_id))
+    WireCellId::try_new(remote_id).map_err(|err| err.to_string())
 }
 
 pub(super) fn remote_wait_request(
@@ -109,3 +109,7 @@ pub(super) fn wait_outcome_cell_id(outcome: &WireWaitOutcome) -> &WireCellId {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cell_ids_tests.rs"]
+mod tests;
