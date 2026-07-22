@@ -27,6 +27,12 @@ pub(super) struct NegotiatedCapabilities {
     selected: CapabilitySet,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NegotiatedWorkflowCellIdentity {
+    Unavailable,
+    V1,
+}
+
 impl NegotiatedCapabilities {
     pub(super) fn try_from_selected(selected: CapabilitySet) -> Result<Self, String> {
         let output = selected.contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
@@ -40,6 +46,20 @@ impl NegotiatedCapabilities {
 
     pub(super) fn selected(&self) -> &CapabilitySet {
         &self.selected
+    }
+
+    pub(super) fn workflow_cell_identity(&self) -> NegotiatedWorkflowCellIdentity {
+        let output = self
+            .selected
+            .contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
+        let identity = self
+            .selected
+            .contains_name(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY);
+        if output && identity {
+            NegotiatedWorkflowCellIdentity::V1
+        } else {
+            NegotiatedWorkflowCellIdentity::Unavailable
+        }
     }
 }
 

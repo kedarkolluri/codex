@@ -18,6 +18,7 @@ use self::session_registry::SessionRegistry;
 pub(super) use self::types::DriverCommand;
 pub(super) use self::types::DriverEvent;
 pub(in crate::remote_session) use self::types::RemoteSession;
+use self::workflow_cell_ids::WorkflowCellNamespace;
 
 mod cell_ids;
 mod cleanup;
@@ -28,6 +29,7 @@ mod request_tracker;
 mod responses;
 mod session_registry;
 mod types;
+mod workflow_cell_ids;
 
 pub(super) struct DriverLifecycle {
     pub(super) alive: Arc<AtomicBool>,
@@ -46,6 +48,7 @@ pub(super) struct ConnectionDriver {
     delegates: DelegateRuntime,
     terminal_echo_budget: TerminalEchoBudget,
     capabilities: super::handshake::NegotiatedCapabilities,
+    workflow_cell_ids: WorkflowCellNamespace,
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
@@ -62,6 +65,7 @@ impl ConnectionDriver {
         lifecycle: DriverLifecycle,
     ) -> (Self, mpsc::UnboundedSender<RequestId>) {
         let (execute_claim_tx, execute_claim_rx) = mpsc::unbounded_channel();
+        let workflow_cell_ids = WorkflowCellNamespace::new(capabilities.workflow_cell_identity());
         (
             Self {
                 command_rx,
@@ -74,6 +78,7 @@ impl ConnectionDriver {
                 delegates: DelegateRuntime::new(event_tx),
                 terminal_echo_budget: TerminalEchoBudget::new(),
                 capabilities,
+                workflow_cell_ids,
                 alive: lifecycle.alive,
                 failure: lifecycle.failure,
                 cancellation: lifecycle.cancellation,
