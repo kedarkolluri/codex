@@ -1,5 +1,7 @@
 use codex_protocol::ThreadId;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::protocol::AgentStatus;
+use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::WorkflowAgentAttemptReason;
 use codex_protocol::protocol::WorkflowGroupKind;
 
@@ -65,6 +67,11 @@ pub struct WorkflowAgent {
     pub(super) effort: ReasoningEffort,
     pub(super) child_thread_id: Option<ThreadId>,
     pub(super) state: WorkflowNodeState,
+    pub(super) status: AgentStatus,
+    pub(super) token_usage: TokenUsage,
+    pub(super) tool_call_count: u64,
+    pub(super) duration_ms: u64,
+    pub(super) returned_null: bool,
     pub(super) child_node_ids: Vec<u64>,
 }
 
@@ -107,6 +114,26 @@ impl WorkflowAgent {
 
     pub fn state(&self) -> WorkflowNodeState {
         self.state
+    }
+
+    pub fn status(&self) -> &AgentStatus {
+        &self.status
+    }
+
+    pub fn token_usage(&self) -> &TokenUsage {
+        &self.token_usage
+    }
+
+    pub fn tool_call_count(&self) -> u64 {
+        self.tool_call_count
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+
+    pub fn returned_null(&self) -> bool {
+        self.returned_null
     }
 
     pub fn child_node_ids(&self) -> &[u64] {

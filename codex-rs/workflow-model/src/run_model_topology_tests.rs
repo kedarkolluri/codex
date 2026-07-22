@@ -1,9 +1,5 @@
 use std::collections::BTreeMap;
 
-use codex_protocol::protocol::AgentStatus;
-use codex_protocol::protocol::TokenUsage;
-use codex_protocol::protocol::WorkflowAgentEndEvent;
-use codex_protocol::protocol::WorkflowAgentUpdatedEvent;
 use codex_protocol::protocol::WorkflowEvent;
 use codex_protocol::protocol::WorkflowGroupBeginEvent;
 use codex_protocol::protocol::WorkflowGroupEndEvent;
@@ -244,41 +240,6 @@ fn topology_cap_is_exact_and_transactional() {
             maximum: WORKFLOW_TOPOLOGY_MAX_NODES,
         },
     );
-}
-
-#[test]
-fn deferred_agent_terminal_events_are_unhandled_without_mutation() {
-    let mut model = WorkflowRunModel::from_event(&run_begin(&[])).expect("run should begin");
-    let events = [
-        WorkflowEvent::AgentUpdated(WorkflowAgentUpdatedEvent {
-            run_id: RUN_ID.to_string(),
-            node_id: 0,
-            attempt: 0,
-            last_attempt_reason: None,
-            token_usage: TokenUsage::default(),
-            tool_call_count: 0,
-            duration_ms: 0,
-        }),
-        WorkflowEvent::AgentEnd(WorkflowAgentEndEvent {
-            run_id: RUN_ID.to_string(),
-            node_id: 0,
-            attempt: 0,
-            last_attempt_reason: None,
-            status: AgentStatus::Completed(None),
-            token_usage: TokenUsage::default(),
-            tool_call_count: 0,
-            duration_ms: 0,
-            returned_null: false,
-        }),
-    ];
-    for event in events {
-        let before = model.clone();
-        assert_eq!(
-            model.reduce_event(&event),
-            Ok(ReductionDisposition::Unhandled)
-        );
-        assert_eq!(model, before);
-    }
 }
 
 fn run_begin(phases: &[&str]) -> WorkflowEvent {

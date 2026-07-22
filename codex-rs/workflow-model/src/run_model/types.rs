@@ -1,6 +1,7 @@
 use std::fmt;
 
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::AgentStatus;
 
 /// Lifecycle of the workflow run represented by the workflow projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,6 +153,34 @@ pub enum WorkflowModelError {
     AgentDefinitionMismatch {
         node_id: u64,
     },
+    AgentNotBound {
+        node_id: u64,
+    },
+    NegativeTokenUsage {
+        node_id: u64,
+        field: &'static str,
+        value: i64,
+    },
+    TokenCounterRegression {
+        node_id: u64,
+        field: &'static str,
+        previous: i64,
+        actual: i64,
+    },
+    UnsignedCounterRegression {
+        node_id: u64,
+        field: &'static str,
+        previous: u64,
+        actual: u64,
+    },
+    NonTerminalStatus {
+        node_id: Option<u64>,
+        status: AgentStatus,
+    },
+    ActiveChildAtAgentEnd {
+        node_id: u64,
+        child_node_id: u64,
+    },
     InvalidChildThreadId {
         node_id: u64,
     },
@@ -251,6 +280,12 @@ impl fmt::Display for WorkflowModelError {
             | Self::AgentRetryLimitExceeded { .. }
             | Self::AgentAttemptReasonMismatch { .. }
             | Self::AgentDefinitionMismatch { .. }
+            | Self::AgentNotBound { .. }
+            | Self::NegativeTokenUsage { .. }
+            | Self::TokenCounterRegression { .. }
+            | Self::UnsignedCounterRegression { .. }
+            | Self::NonTerminalStatus { .. }
+            | Self::ActiveChildAtAgentEnd { .. }
             | Self::InvalidChildThreadId { .. }
             | Self::ConflictingAgentBinding { .. }
             | Self::ChildThreadAlreadyBound { .. }
