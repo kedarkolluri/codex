@@ -4,7 +4,11 @@ use std::sync::Arc;
 
 use codex_core_workflows::WorkflowScope;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ExecServerError;
 use codex_exec_server::LOCAL_ENVIRONMENT_ID;
+use codex_exec_server::NoiseChannelPublicKey;
+use codex_exec_server::NoiseRendezvousConnectBundle;
+use codex_exec_server::NoiseRendezvousConnectProvider;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ThreadStartInput;
@@ -22,6 +26,17 @@ use crate::workflow_session_registry;
 
 #[derive(Clone)]
 struct TestHostConfig(WorkflowExtensionConfig);
+
+struct UnexpectedNoiseConnectProvider;
+
+impl NoiseRendezvousConnectProvider for UnexpectedNoiseConnectProvider {
+    fn connect_bundle(
+        &self,
+        _client_public_key: NoiseChannelPublicKey,
+    ) -> futures::future::BoxFuture<'_, Result<NoiseRendezvousConnectBundle, ExecServerError>> {
+        Box::pin(async { panic!("failed deferred provisioning must not connect") })
+    }
+}
 
 fn absolute(path: impl AsRef<Path>) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(path).expect("absolute test path")
@@ -217,6 +232,110 @@ async fn unknown_first_selection_is_cached_without_using_later_environment() {
         }
     );
     assert!(Arc::ptr_eq(&first, &second));
+}
+
+#[tokio::test]
+async fn deferred_first_selection_waits_without_falling_back() {
+    let temp = TempDir::new().expect("temp dir");
+    let cwd = absolute(temp.path().join("project"));
+    fs::create_dir_all(&cwd).expect("create cwd");
+    write_workflow(
+        &cwd.join(".codex").join("workflows"),
+        "host-only",
+        "must not be loaded through host fallback",
+    );
+    let manager = Arc::new(EnvironmentManager::without_environments());
+    let registration = manager
+        .register_deferred_noise_environment(
+            "deferred".to_string(),
+            Arc::new(UnexpectedNoiseConnectProvider),
+        )
+        .expect("register deferred environment");
+    let thread_store = start_thread(
+        Arc::clone(&manager),
+        config(&temp, cwd.clone()),
+        &[selection("deferred", &cwd)],
+    )
+    .await;
+    let mut registry = Box::pin(workflow_session_registry(&thread_store));
+
+    assert!(futures::poll!(&mut registry).is_pending());
+
+    registration
+        .complete(Err("provisioning failed".to_string()))
+        .expect("complete deferred environment with failure");
+    let error = registry
+        .await
+        .expect("workflow state")
+        .expect_err("failed deferred environment");
+    assert_eq!(
+        error.as_ref(),
+        &WorkflowSessionRegistryError::EnvironmentUnavailable {
+            environment_id: "deferred".to_string(),
+            message:
+                "exec-server connection attempt failed: environment unavailable: provisioning failed"
+                    .to_string(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn captured_filesystem_survives_environment_manager_replacement() {
+    let temp = TempDir::new().expect("temp dir");
+    let project = absolute(temp.path().join("project"));
+    let cwd = project.join("nested");
+    fs::create_dir_all(&cwd).expect("create cwd");
+    fs::write(project.join(".git"), "marker").expect("write marker");
+    write_workflow(
+        &project.join(".codex").join("workflows"),
+        "captured",
+        "original environment",
+    );
+    let manager = Arc::new(EnvironmentManager::default_for_tests());
+    let original_environment = manager
+        .get_environment(LOCAL_ENVIRONMENT_ID)
+        .expect("original environment");
+    let original_file_system = original_environment.get_filesystem();
+    let thread_store = start_thread(
+        Arc::clone(&manager),
+        config(&temp, cwd.clone()),
+        &[selection(LOCAL_ENVIRONMENT_ID, &cwd)],
+    )
+    .await;
+    let _replacement_registration = manager
+        .register_deferred_noise_environment(
+            LOCAL_ENVIRONMENT_ID.to_string(),
+            Arc::new(UnexpectedNoiseConnectProvider),
+        )
+        .expect("replace environment after thread start");
+    let replacement_environment = manager
+        .get_environment(LOCAL_ENVIRONMENT_ID)
+        .expect("replacement environment");
+    let replacement_file_system = replacement_environment.get_filesystem();
+
+    assert!(!Arc::ptr_eq(
+        &original_environment,
+        &replacement_environment
+    ));
+    assert!(!Arc::ptr_eq(
+        &original_file_system,
+        &replacement_file_system
+    ));
+
+    let session_registry = workflow_session_registry(&thread_store)
+        .await
+        .expect("workflow state")
+        .expect("workflow registry");
+    let workflow = session_registry
+        .registry()
+        .resolve_by_name("captured")
+        .expect("captured workflow");
+    let actual_file_system = session_registry
+        .registry()
+        .executor_file_system_for(workflow)
+        .expect("captured filesystem authority");
+
+    assert!(Arc::ptr_eq(&actual_file_system, &original_file_system));
 }
 
 #[tokio::test]
