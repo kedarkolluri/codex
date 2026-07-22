@@ -71,6 +71,7 @@ fn direct_driver_with_outgoing() -> (
         event_rx,
         event_tx,
         outgoing_tx,
+        crate::remote_session::connection::handshake::NegotiatedCapabilities::default(),
         DriverLifecycle {
             alive: Arc::clone(&alive),
             failure: Arc::new(StdMutex::new(None)),
@@ -445,6 +446,7 @@ async fn invalid_typed_host_cell_id_fails_connection_and_pending_request() {
         event_rx,
         event_tx.clone(),
         outgoing_tx,
+        crate::remote_session::connection::handshake::NegotiatedCapabilities::default(),
         DriverLifecycle {
             alive: Arc::clone(&alive),
             failure: Arc::clone(&failure),
@@ -783,7 +785,12 @@ async fn saved_initial_and_terminate_correlate_one_terminal_delivery() {
     let output_admission = saved_admission();
     let public_cell_id = driver
         .sessions
-        .admit_cell(&session, remote_cell_id.clone(), output_admission.clone())
+        .admit_cell(
+            &session,
+            remote_cell_id.clone(),
+            output_admission.clone(),
+            &driver.workflow_cell_ids,
+        )
         .unwrap_or_else(|_| panic!("live cell"));
     let initial_id = RequestId::new(/*value*/ 9);
     let initial_rx = insert_initial(&mut driver, initial_id, "cell", output_admission);

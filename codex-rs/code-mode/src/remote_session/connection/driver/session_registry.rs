@@ -6,10 +6,10 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
 
-use super::cell_ids::public_cell_id;
 use super::cleanup::SessionCleanup;
 use super::output_admission::RemoteOutputAdmission;
 use super::types::RemoteSession;
+use super::workflow_cell_ids::WorkflowCellNamespace;
 
 pub(super) struct CellOwner {
     pub(super) session_id: SessionId,
@@ -134,6 +134,7 @@ impl SessionRegistry {
         session: &RemoteSession,
         cell_id: WireCellId,
         output_admission: RemoteOutputAdmission,
+        workflow_cell_ids: &WorkflowCellNamespace,
     ) -> Result<CellId, CellAdmissionError> {
         let Some(record) = self.records.get_mut(&session.id) else {
             return Err(CellAdmissionError::MissingSession);
@@ -141,7 +142,7 @@ impl SessionRegistry {
         if record.cells.contains_key(&cell_id) {
             return Err(CellAdmissionError::DuplicateCell);
         }
-        let public_id = public_cell_id(session.generation, &cell_id);
+        let public_id = workflow_cell_ids.public_cell_id(session.generation, &cell_id);
         record.cells.insert(
             cell_id,
             LiveCell {
