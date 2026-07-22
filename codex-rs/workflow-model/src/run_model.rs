@@ -1,5 +1,7 @@
 //! Renderer-neutral projection of the stable workflow progress event stream.
 
+use codex_code_mode_protocol::WORKFLOW_LOG_MAX_EVENTS;
+use codex_code_mode_protocol::WORKFLOW_LOG_MESSAGE_MAX_BYTES;
 use codex_code_mode_protocol::WORKFLOW_NAME_MAX_BYTES;
 use codex_code_mode_protocol::WORKFLOW_PHASE_MAX_EVENTS;
 use codex_code_mode_protocol::WORKFLOW_PHASE_TITLE_MAX_BYTES;
@@ -8,6 +10,7 @@ use codex_protocol::protocol::WorkflowEvent;
 use codex_protocol::protocol::WorkflowRunBeginEvent;
 use codex_protocol::protocol::WorkflowRunTerminalReason;
 
+mod phase_lifecycle;
 mod types;
 
 pub use types::WorkflowModelError;
@@ -36,6 +39,13 @@ pub struct WorkflowRunModel {
     phases: Vec<WorkflowPhase>,
     active_phase_index: Option<u64>,
     next_phase_index: u64,
+    log_event_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReductionDisposition {
+    Applied,
+    Unhandled,
 }
 
 impl WorkflowRunModel {
@@ -77,6 +87,64 @@ impl WorkflowRunModel {
 
     pub fn phases(&self) -> &[WorkflowPhase] {
         &self.phases
+    }
+
+    /// Staging seam for the ordered reducer. Stage 05d makes the reducer public only after every
+    /// current `WorkflowEvent` variant has a fail-closed implementation.
+    #[allow(dead_code)]
+    fn reduce_event(
+        &mut self,
+        event: &WorkflowEvent,
+    ) -> Result<ReductionDisposition, WorkflowModelError> {
+        if matches!(event, WorkflowEvent::RunBegin(_)) {
+            return Err(WorkflowModelError::DuplicateRunBegin);
+        }
+        let run_id = match event {
+            WorkflowEvent::RunBegin(_) => unreachable!("run begin rejected above"),
+            WorkflowEvent::RunEnd(event) => &event.run_id,
+            WorkflowEvent::PhaseBegin(event) => &event.run_id,
+            WorkflowEvent::PhaseEnd(event) => &event.run_id,
+            WorkflowEvent::GroupBegin(event) => &event.run_id,
+            WorkflowEvent::GroupEnd(event) => &event.run_id,
+            WorkflowEvent::AgentBegin(event) => &event.run_id,
+            WorkflowEvent::AgentBound(event) => &event.run_id,
+            WorkflowEvent::AgentUpdated(event) => &event.run_id,
+            WorkflowEvent::AgentEnd(event) => &event.run_id,
+            WorkflowEvent::Log(event) => &event.run_id,
+        };
+        validate_text("run_id", run_id, WORKFLOW_RUN_ID_MAX_BYTES)?;
+        if run_id != &self.run_id {
+            return Err(WorkflowModelError::RunIdMismatch {
+                expected: self.run_id.clone(),
+                actual: run_id.to_string(),
+            });
+        }
+        if self.state == WorkflowRunState::Completed {
+            return Err(WorkflowModelError::RunAlreadyCompleted);
+        }
+
+        match event {
+            WorkflowEvent::PhaseBegin(event) => {
+                self.reduce_phase_begin(event)?;
+                Ok(ReductionDisposition::Applied)
+            }
+            WorkflowEvent::PhaseEnd(event) => {
+                self.reduce_phase_end(event)?;
+                Ok(ReductionDisposition::Applied)
+            }
+            WorkflowEvent::Log(event) => {
+                self.reduce_log(event)?;
+                Ok(ReductionDisposition::Applied)
+            }
+            WorkflowEvent::RunBegin(_) => unreachable!("run begin rejected above"),
+            WorkflowEvent::RunEnd(_)
+            | WorkflowEvent::GroupBegin(_)
+            | WorkflowEvent::GroupEnd(_)
+            | WorkflowEvent::AgentBegin(_)
+            | WorkflowEvent::AgentBound(_)
+            | WorkflowEvent::AgentUpdated(_)
+            | WorkflowEvent::AgentEnd(_) => Ok(ReductionDisposition::Unhandled),
+        }
     }
 
     fn from_run_begin(event: &WorkflowRunBeginEvent) -> Result<Self, WorkflowModelError> {
@@ -142,6 +210,7 @@ impl WorkflowRunModel {
             phases,
             active_phase_index,
             next_phase_index: 0,
+            log_event_count: 0,
         })
     }
 }
@@ -167,3 +236,7 @@ fn validate_text(
 #[cfg(test)]
 #[path = "run_model_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "run_model_phase_lifecycle_tests.rs"]
+mod phase_lifecycle_tests;
