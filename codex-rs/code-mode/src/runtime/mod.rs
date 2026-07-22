@@ -15,6 +15,7 @@ use std::thread;
 use codex_code_mode_protocol::EnabledToolMetadata;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::enabled_tool_metadata;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -45,8 +46,10 @@ pub(crate) fn spawn_runtime(
     ),
     String,
 > {
-    ensure_v8_initialized()?;
     let output_admission = RuntimeOutputAdmission::new(request.output_policy);
+    if let Err(error_text) = ensure_v8_initialized() {
+        return Err(redact_startup_error(&output_admission, error_text));
+    }
 
     let (command_tx, command_rx) = std_mpsc::channel();
     let (control_tx, control_rx) = std_mpsc::channel();
@@ -62,31 +65,40 @@ pub(crate) fn spawn_runtime(
         enabled_tools,
         source: request.source,
         output_policy: request.output_policy,
-        output_admission,
+        output_admission: output_admission.clone(),
         stored_values,
     };
 
-    spawn_supervised_runtime_thread(event_tx.clone(), task_failure_handler, move || {
-        run_runtime(
-            config,
-            event_tx,
-            command_rx,
-            control_rx,
-            pending_mode,
-            isolate_handle_tx,
-            runtime_command_tx,
-        );
-    });
+    spawn_supervised_runtime_thread(
+        event_tx.clone(),
+        task_failure_handler,
+        output_admission.clone(),
+        move || {
+            run_runtime(
+                config,
+                event_tx,
+                command_rx,
+                control_rx,
+                pending_mode,
+                isolate_handle_tx,
+                runtime_command_tx,
+            );
+        },
+    );
 
-    let isolate_handle = isolate_handle_rx
-        .recv()
-        .map_err(|_| "failed to initialize code mode runtime".to_string())?;
+    let isolate_handle = isolate_handle_rx.recv().map_err(|_| {
+        redact_startup_error(
+            &output_admission,
+            "failed to initialize code mode runtime".to_string(),
+        )
+    })?;
     Ok((command_tx, control_tx, isolate_handle))
 }
 
 fn spawn_supervised_runtime_thread(
     event_tx: mpsc::UnboundedSender<RuntimeEvent>,
     task_failure_handler: Option<TaskFailureHandler>,
+    output_admission: RuntimeOutputAdmission,
     runtime: impl FnOnce() + Send + 'static,
 ) {
     thread::spawn(move || {
@@ -94,9 +106,25 @@ fn spawn_supervised_runtime_thread(
             if let Some(task_failure_handler) = task_failure_handler {
                 task_failure_handler("code-mode V8 runtime thread panicked".to_string());
             }
-            let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
+            match &output_admission {
+                RuntimeOutputAdmission::Ordinary => {
+                    let _ = event_tx.send(RuntimeEvent::ThreadPanicked);
+                }
+                RuntimeOutputAdmission::SavedWorkflow(_) => {
+                    let (error_text, _) = output_admission
+                        .terminal_error(Some("code-mode V8 runtime thread panicked".to_string()));
+                    send_result(&event_tx, HashMap::new(), error_text);
+                }
+            }
         }
     });
+}
+
+fn redact_startup_error(output_admission: &RuntimeOutputAdmission, error_text: String) -> String {
+    output_admission
+        .terminal_error(Some(error_text))
+        .0
+        .unwrap_or_else(|| SAVED_WORKFLOW_EXECUTION_FAILED.to_string())
 }
 
 #[derive(Clone)]
@@ -304,15 +332,21 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tokio::sync::mpsc;
 
+    use super::AdmissionOutcome;
     use super::ExecuteOutputPolicy;
     use super::ExecuteRequest;
     use super::PendingRuntimeMode;
     use super::RuntimeCommand;
     use super::RuntimeControlCommand;
     use super::RuntimeEvent;
+    use super::RuntimeOutputAdmission;
+    use super::redact_startup_error;
     use super::spawn_runtime;
     use super::spawn_supervised_runtime_thread;
     use crate::FunctionCallOutputContentItem;
+    use crate::SAVED_WORKFLOW_EXECUTION_FAILED;
+    use crate::SAVED_WORKFLOW_OUTPUT_REJECTED;
+    use crate::WORKFLOW_OUTPUT_ITEM_MAX_BYTES;
 
     fn execute_request(source: &str) -> ExecuteRequest {
         ExecuteRequest {
@@ -325,6 +359,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn startup_errors_preserve_ordinary_details_and_bound_saved_workflow_details() {
+        let private_error = "private startup failure";
+        let ordinary = RuntimeOutputAdmission::new(ExecuteOutputPolicy::Ordinary);
+        let saved = RuntimeOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+        let oversized_saved = RuntimeOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+
+        assert_eq!(
+            [
+                redact_startup_error(&ordinary, private_error.to_string()),
+                redact_startup_error(&saved, private_error.to_string()),
+                redact_startup_error(&oversized_saved, "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES),),
+            ],
+            [
+                private_error,
+                SAVED_WORKFLOW_EXECUTION_FAILED,
+                SAVED_WORKFLOW_OUTPUT_REJECTED,
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn runtime_thread_panic_before_initialization_is_reported_directly() {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -335,6 +390,7 @@ mod tests {
             Some(std::sync::Arc::new(move |reason| {
                 let _ = failure_tx.send(reason);
             })),
+            RuntimeOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
             || panic!("runtime thread panic probe"),
         );
 
@@ -353,6 +409,7 @@ mod tests {
         spawn_supervised_runtime_thread(
             event_tx,
             /*task_failure_handler*/ None,
+            RuntimeOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
             || panic!("runtime thread panic probe"),
         );
 
@@ -362,6 +419,44 @@ mod tests {
                 .expect("runtime panic event timeout"),
             Some(RuntimeEvent::ThreadPanicked)
         ));
+    }
+
+    #[tokio::test]
+    async fn saved_runtime_thread_panic_uses_shared_output_budget_and_fixed_errors() {
+        let available = RuntimeOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+        let full = RuntimeOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+        let full_items: [FunctionCallOutputContentItem; 4] =
+            std::array::from_fn(|_| FunctionCallOutputContentItem::InputText {
+                text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 2),
+            });
+        assert_eq!(full.admit_items(&full_items), AdmissionOutcome::Admitted);
+
+        for (output_admission, expected_error) in [
+            (available, SAVED_WORKFLOW_EXECUTION_FAILED),
+            (full, SAVED_WORKFLOW_OUTPUT_REJECTED),
+        ] {
+            let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+            spawn_supervised_runtime_thread(
+                event_tx,
+                /*task_failure_handler*/ None,
+                output_admission,
+                || panic!("saved runtime thread panic probe"),
+            );
+
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("saved runtime panic event timeout")
+                .expect("saved runtime panic event");
+            let RuntimeEvent::Result {
+                stored_value_writes,
+                error_text,
+            } = event
+            else {
+                panic!("saved runtime panic must produce a terminal result");
+            };
+            assert_eq!(stored_value_writes, HashMap::new());
+            assert_eq!(error_text.as_deref(), Some(expected_error));
+        }
     }
 
     #[tokio::test]
