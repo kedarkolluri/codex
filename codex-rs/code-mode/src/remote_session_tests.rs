@@ -1,16 +1,20 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use codex_code_mode_protocol::CodeModeSessionProvider;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::RuntimeResponse;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use pretty_assertions::assert_eq;
 
+use super::OwnedProcessHost;
 use super::ProcessOwnedCodeModeSession;
 use super::ProcessOwnedCodeModeSessionProvider;
+use super::SessionState;
 use super::resolve_host_program;
 use crate::NoopCodeModeSessionDelegate;
 
@@ -128,4 +132,36 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
         .expect("shutdown session should reject execution");
 
     assert_eq!(error, "code mode session is shutting down");
+}
+
+#[tokio::test]
+async fn saved_execute_is_rejected_before_opening_the_host() {
+    let process_host = Arc::new(OwnedProcessHost::new("host-must-not-start".into()));
+    let session = ProcessOwnedCodeModeSession::with_process_host(
+        Arc::new(NoopCodeModeSessionDelegate),
+        Arc::clone(&process_host),
+    );
+    let error = session
+        .execute(ExecuteRequest {
+            tool_call_id: "call-saved".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('unreachable')".to_string(),
+            output_policy: ExecuteOutputPolicy::SavedWorkflow,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+        .await
+        .err()
+        .expect("saved execute should be rejected");
+
+    assert_eq!(error, SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE);
+    assert_eq!(process_host.next_session_id.load(Ordering::Relaxed), 1);
+    assert!(matches!(
+        *session
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        SessionState::New
+    ));
 }
