@@ -5,7 +5,7 @@ use std::sync::Arc;
 use codex_code_mode_protocol::WORKFLOW_SOURCE_MAX_BYTES;
 use codex_code_mode_protocol::parse_workflow_meta;
 use codex_file_system::ExecutorFileSystem;
-use codex_file_system::FileMetadata;
+use codex_file_system::VerifiedFileReadOptions;
 use codex_utils_path_uri::PathUri;
 use futures::StreamExt;
 
@@ -90,7 +90,8 @@ impl WorkflowRegistry {
     /// Captures the source for the exact case-sensitive registry winner named by `name`.
     ///
     /// Executor-backed entries stay on their retained filesystem even when their URI could be
-    /// represented on this host. Host capture binds the bytes to one opened object and checks
+    /// represented on this host. They require the verified-read capability and never fall back to
+    /// ordinary or host reads. Host capture binds the bytes to one opened object and checks
     /// observed file state and bytes for stability; portable mutable filesystems do not provide a
     /// universal read transaction. Observed I/O, file-kind, identity, path, size, UTF-8, or
     /// metadata drift fails closed.
@@ -137,18 +138,28 @@ async fn read_executor_source(
     file_system: &dyn ExecutorFileSystem,
     path: &PathUri,
 ) -> Result<Vec<u8>, WorkflowSourceLoadError> {
-    let before = validate_executor_source(file_system, path).await?;
-    let mut stream = file_system
-        .read_file_stream(path, /*sandbox*/ None)
+    let capture = file_system
+        .read_file_verified(
+            path,
+            VerifiedFileReadOptions {
+                max_bytes: WORKFLOW_SOURCE_MAX_BYTES as u64,
+            },
+            /*sandbox*/ None,
+        )
         .await
-        .map_err(|error| source_io_error(path, "read source", error))?;
-    let mut bytes = Vec::new();
+        .map_err(|error| source_io_error(path, "capture source", error))?;
+    if capture.size > WORKFLOW_SOURCE_MAX_BYTES as u64 {
+        return Err(source_too_large(path));
+    }
+    let expected_size = usize::try_from(capture.size).map_err(|_| source_too_large(path))?;
+    let mut stream = capture.stream;
+    let mut bytes = Vec::with_capacity(expected_size);
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| source_io_error(path, "read source", error))?;
+        let chunk = chunk.map_err(|error| source_io_error(path, "read captured source", error))?;
         if chunk.is_empty() {
             return Err(WorkflowSourceLoadError::new(
                 path.clone(),
-                "source stream returned an empty chunk",
+                "verified source stream returned an empty chunk",
             ));
         }
         let Some(next_len) = bytes.len().checked_add(chunk.len()) else {
@@ -157,52 +168,22 @@ async fn read_executor_source(
         if next_len > WORKFLOW_SOURCE_MAX_BYTES {
             return Err(source_too_large(path));
         }
+        if next_len > expected_size {
+            return Err(verified_size_mismatch(path));
+        }
         bytes.extend_from_slice(&chunk);
     }
-    let after = validate_executor_source(file_system, path).await?;
-    if before != after || bytes.len() as u64 != after.size {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            "workflow source changed while being read",
-        ));
+    if bytes.len() != expected_size {
+        return Err(verified_size_mismatch(path));
     }
     Ok(bytes)
 }
 
-async fn validate_executor_source(
-    file_system: &dyn ExecutorFileSystem,
-    path: &PathUri,
-) -> Result<FileMetadata, WorkflowSourceLoadError> {
-    let metadata = file_system
-        .get_metadata(path, /*sandbox*/ None)
-        .await
-        .map_err(|error| source_io_error(path, "inspect source", error))?;
-    if metadata.is_symlink {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            "workflow source is a symlink",
-        ));
-    }
-    if !metadata.is_file {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            "workflow source is not a regular file",
-        ));
-    }
-    if metadata.size > WORKFLOW_SOURCE_MAX_BYTES as u64 {
-        return Err(source_too_large(path));
-    }
-    let canonical = file_system
-        .canonicalize(path, /*sandbox*/ None)
-        .await
-        .map_err(|error| source_io_error(path, "resolve source", error))?;
-    if canonical != *path {
-        return Err(WorkflowSourceLoadError::new(
-            path.clone(),
-            format!("workflow source now resolves to {canonical}"),
-        ));
-    }
-    Ok(metadata)
+fn verified_size_mismatch(path: &PathUri) -> WorkflowSourceLoadError {
+    WorkflowSourceLoadError::new(
+        path.clone(),
+        "verified source stream did not match its declared size",
+    )
 }
 
 fn source_too_large(path: &PathUri) -> WorkflowSourceLoadError {
