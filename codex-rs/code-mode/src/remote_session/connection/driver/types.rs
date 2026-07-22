@@ -130,6 +130,7 @@ pub(in crate::remote_session::connection) struct DeliveredExecute {
 pub(super) struct UnclaimedExecute {
     pub(super) session: RemoteSession,
     pub(super) cell_id: WireCellId,
+    pub(super) output_admission: RemoteOutputAdmission,
     pub(super) cancellation: CancellableRequest,
 }
 
@@ -159,6 +160,7 @@ pub(super) enum PendingRequest {
     Terminate {
         session: RemoteSession,
         cell_id: WireCellId,
+        output_admission: RemoteOutputAdmission,
         response_tx: oneshot::Sender<Result<WaitOutcome, String>>,
     },
     ShutdownSession {
@@ -206,7 +208,12 @@ impl PendingRequest {
                 let reason = output_admission.visible_connection_failure(reason);
                 let _ = response_tx.send(Err(reason));
             }
-            Self::Terminate { response_tx, .. } => {
+            Self::Terminate {
+                response_tx,
+                output_admission,
+                ..
+            } => {
+                let reason = output_admission.visible_connection_failure(reason);
                 let _ = response_tx.send(Err(reason));
             }
         }

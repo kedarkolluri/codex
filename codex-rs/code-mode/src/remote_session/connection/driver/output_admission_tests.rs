@@ -9,13 +9,34 @@ use codex_code_mode_protocol::WORKFLOW_OUTPUT_MAX_BYTES;
 use pretty_assertions::assert_eq;
 
 use super::AdmissionOutcome;
+use super::MAX_UNMATCHED_TERMINAL_ECHOES;
 use super::RemoteOutputAdmission;
+use super::ResponseDelivery;
+use super::TerminalEchoBudget;
 
 fn response(cell: &str, text: String) -> RuntimeResponse {
     RuntimeResponse::Yielded {
         cell_id: CellId::new(cell.to_string()),
         content_items: vec![FunctionCallOutputContentItem::InputText { text }],
     }
+}
+
+fn terminal_response(cell: &str, error_text: Option<&str>) -> RuntimeResponse {
+    RuntimeResponse::Result {
+        cell_id: CellId::new(cell.to_string()),
+        content_items: Vec::new(),
+        error_text: error_text.map(str::to_string),
+    }
+}
+
+fn admit(
+    admission: &RemoteOutputAdmission,
+    response: &RuntimeResponse,
+    delivery: ResponseDelivery,
+) -> (AdmissionOutcome, RuntimeResponse) {
+    let mut visible = response.clone();
+    let outcome = admission.admit_response(&mut visible, delivery);
+    (outcome, visible)
 }
 
 #[test]
@@ -25,7 +46,7 @@ fn ordinary_output_is_preserved_above_saved_limits() {
     let mut actual = response("ordinary", oversized.clone());
     let expected = actual.clone();
     assert_eq!(
-        admission.admit_response(&mut actual),
+        admission.admit_response(&mut actual, ResponseDelivery::Uncorrelated),
         AdmissionOutcome::Admitted
     );
     assert_eq!(actual, expected);
@@ -52,7 +73,8 @@ fn saved_clones_share_one_cumulative_chunk_ledger() {
     for index in 0..WORKFLOW_OUTPUT_MAX_BYTES / WORKFLOW_OUTPUT_ITEM_MAX_BYTES {
         let mut actual = response(&index.to_string(), chunk.clone());
         assert_eq!(
-            admissions[index % admissions.len()].admit_response(&mut actual),
+            admissions[index % admissions.len()]
+                .admit_response(&mut actual, ResponseDelivery::Observer),
             AdmissionOutcome::Admitted
         );
     }
@@ -65,7 +87,7 @@ fn saved_clones_share_one_cumulative_chunk_ledger() {
     );
     let mut overflow = response("overflow", String::new());
     assert_eq!(
-        first.admit_response(&mut overflow),
+        first.admit_response(&mut overflow, ResponseDelivery::Observer),
         AdmissionOutcome::Rejected
     );
     assert_eq!(
@@ -87,7 +109,7 @@ fn saved_errors_are_redacted_bounded_and_sticky() {
         error_text: Some("private terminal detail".to_string()),
     };
     assert_eq!(
-        admission.admit_response(&mut terminal),
+        admission.admit_response(&mut terminal, ResponseDelivery::Observer),
         AdmissionOutcome::Admitted
     );
     assert_eq!(
@@ -108,7 +130,7 @@ fn saved_errors_are_redacted_bounded_and_sticky() {
     let mut continued = response("continued", "ok".to_string());
     let expected = continued.clone();
     assert_eq!(
-        admission.admit_response(&mut continued),
+        admission.admit_response(&mut continued, ResponseDelivery::Observer),
         AdmissionOutcome::Admitted
     );
     assert_eq!(continued, expected);
@@ -148,7 +170,7 @@ fn saved_fatal_error_is_accounted_once_and_shared_as_fixed_failure() {
         ],
     };
     assert_eq!(
-        admission.admit_response(&mut near_full),
+        admission.admit_response(&mut near_full, ResponseDelivery::Observer),
         AdmissionOutcome::Admitted
     );
     assert_eq!(
@@ -167,7 +189,7 @@ fn saved_fatal_error_is_accounted_once_and_shared_as_fixed_failure() {
 
     let mut late = response("late", "must not escape".to_string());
     assert_eq!(
-        sibling.admit_response(&mut late),
+        sibling.admit_response(&mut late, ResponseDelivery::Observer),
         AdmissionOutcome::ExecutionFailed
     );
     assert_eq!(
@@ -177,5 +199,115 @@ fn saved_fatal_error_is_accounted_once_and_shared_as_fixed_failure() {
             content_items: Vec::new(),
             error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
         }
+    );
+}
+
+#[test]
+fn saved_terminal_echo_is_admitted_once_in_both_orders() {
+    let full_item = || FunctionCallOutputContentItem::InputText {
+        text: "x".repeat(WORKFLOW_OUTPUT_ITEM_MAX_BYTES - 2),
+    };
+    let raw = RuntimeResponse::Terminated {
+        cell_id: CellId::new("terminal".to_string()),
+        content_items: vec![
+            full_item();
+            WORKFLOW_OUTPUT_MAX_BYTES / WORKFLOW_OUTPUT_ITEM_MAX_BYTES
+        ],
+    };
+    for roles in [
+        [ResponseDelivery::Observer, ResponseDelivery::Terminate],
+        [ResponseDelivery::Terminate, ResponseDelivery::Observer],
+    ] {
+        let admission = RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+        for role in roles {
+            assert_eq!(
+                admit(&admission, &raw, role),
+                (AdmissionOutcome::Admitted, raw.clone())
+            );
+        }
+    }
+}
+
+#[test]
+fn saved_terminal_echo_compares_raw_errors_before_redaction() {
+    let admission = RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+    let raw = terminal_response("terminal", Some("private detail"));
+    let visible = terminal_response("terminal", Some(SAVED_WORKFLOW_EXECUTION_FAILED));
+    assert_eq!(
+        [ResponseDelivery::Observer, ResponseDelivery::Terminate]
+            .map(|role| admit(&admission, &raw, role)),
+        [
+            (AdmissionOutcome::Admitted, visible.clone()),
+            (AdmissionOutcome::Admitted, visible),
+        ]
+    );
+    let distinct = terminal_response("terminal", Some("different private detail"));
+    for (second, role) in [
+        (&raw, ResponseDelivery::Observer),
+        (&distinct, ResponseDelivery::Terminate),
+    ] {
+        let mismatched = RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+        let outcomes = [
+            admit(&mismatched, &raw, ResponseDelivery::Observer).0,
+            admit(&mismatched, second, role).0,
+        ];
+        let expected = [
+            AdmissionOutcome::Admitted,
+            AdmissionOutcome::ExecutionFailed,
+        ];
+        assert_eq!(outcomes, expected);
+    }
+}
+
+#[test]
+fn saved_late_yield_is_admitted_without_claiming_a_terminal_role() {
+    let admission = RemoteOutputAdmission::new(ExecuteOutputPolicy::SavedWorkflow);
+    let raw = terminal_response("terminal", /*error_text*/ None);
+    let late = response("terminal", "late output".to_string());
+    assert_eq!(
+        [
+            admit(&admission, &raw, ResponseDelivery::Observer).0,
+            admit(&admission, &late, ResponseDelivery::Observer).0,
+            admit(&admission, &raw, ResponseDelivery::Terminate).0,
+        ],
+        [AdmissionOutcome::Admitted; 3]
+    );
+}
+
+#[test]
+fn saved_terminal_snapshot_budget_is_released_on_match() {
+    let budget = TerminalEchoBudget::new();
+    let mut admissions = Vec::new();
+    let raw = terminal_response("terminal", /*error_text*/ None);
+    for _ in 0..MAX_UNMATCHED_TERMINAL_ECHOES {
+        let admission = RemoteOutputAdmission::with_terminal_echo_budget(
+            ExecuteOutputPolicy::SavedWorkflow,
+            budget.clone(),
+        );
+        assert_eq!(
+            admit(&admission, &raw, ResponseDelivery::Observer).0,
+            AdmissionOutcome::Admitted
+        );
+        admissions.push(admission);
+    }
+
+    let rejected = RemoteOutputAdmission::with_terminal_echo_budget(
+        ExecuteOutputPolicy::SavedWorkflow,
+        budget.clone(),
+    );
+    assert_eq!(
+        admit(&rejected, &raw, ResponseDelivery::Observer).0,
+        AdmissionOutcome::ExecutionFailed
+    );
+
+    let released = admit(&admissions[0], &raw, ResponseDelivery::Terminate).0;
+    assert_eq!(released, AdmissionOutcome::Admitted);
+    let replacement = RemoteOutputAdmission::with_terminal_echo_budget(
+        ExecuteOutputPolicy::SavedWorkflow,
+        budget,
+    );
+    assert_eq!(
+        admit(&replacement, &raw, ResponseDelivery::Observer).0,
+        AdmissionOutcome::Admitted
     );
 }

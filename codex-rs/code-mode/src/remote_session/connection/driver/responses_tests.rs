@@ -43,6 +43,7 @@ use super::super::SessionCleanup;
 use super::super::cell_ids::validate_host_cell_ids;
 use super::super::output_admission::AdmissionOutcome;
 use super::super::output_admission::RemoteOutputAdmission;
+use super::super::output_admission::ResponseDelivery;
 use super::super::types::CancellableRequest;
 use super::super::types::DeliveredExecute;
 use super::super::types::InitialResponse;
@@ -124,7 +125,7 @@ fn full_saved_admission() -> RemoteOutputAdmission {
         content_items: full_wire_items().into_iter().map(Into::into).collect(),
     };
     assert_eq!(
-        admission.admit_response(&mut response),
+        admission.admit_response(&mut response, ResponseDelivery::Observer),
         super::super::output_admission::AdmissionOutcome::Admitted
     );
     admission
@@ -620,6 +621,68 @@ async fn saved_initial_and_wait_share_one_remote_output_ledger() {
         }))
     );
     assert!(!alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn saved_initial_and_terminate_correlate_one_terminal_delivery() {
+    let (mut driver, alive, _outgoing_rx) = direct_driver_with_outgoing();
+    let session = ready_session(&mut driver);
+    let remote_cell_id = WireCellId::try_new("cell").expect("cell ID");
+    let output_admission = saved_admission();
+    let public_cell_id = driver
+        .sessions
+        .admit_cell(&session, remote_cell_id.clone(), output_admission.clone())
+        .unwrap_or_else(|_| panic!("live cell"));
+    let initial_id = RequestId::new(/*value*/ 9);
+    let initial_rx = insert_initial(&mut driver, initial_id, "cell", output_admission);
+    let raw = WireRuntimeResponse::Terminated {
+        cell_id: remote_cell_id.clone(),
+        content_items: Vec::new(),
+    };
+    let public = RuntimeResponse::Terminated {
+        cell_id: public_cell_id.clone(),
+        content_items: Vec::new(),
+    };
+    assert!(driver.handle_host_message(HostToClient::InitialResponse {
+        id: initial_id,
+        result: WireResult::Ok { value: raw.clone() },
+    }));
+    assert_eq!(
+        initial_rx.await.expect("initial response"),
+        Ok(public.clone())
+    );
+    let replay_failure = RuntimeResponse::Result {
+        cell_id: public_cell_id.clone(),
+        content_items: Vec::new(),
+        error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
+    };
+    for (request_id, keep_running, expected) in [
+        (RequestId::new(/*value*/ 1), true, public),
+        (RequestId::new(/*value*/ 2), false, replay_failure),
+    ] {
+        let (response_tx, response_rx) = oneshot::channel();
+        assert!(driver.handle_command(DriverCommand::Terminate {
+            session: session.clone(),
+            cell_id: public_cell_id.clone(),
+            response_tx,
+        }));
+        assert_eq!(
+            driver.handle_host_message(HostToClient::Response {
+                id: request_id,
+                result: WireResult::Ok {
+                    value: HostResponse::WaitCompleted {
+                        outcome: WireWaitOutcome::LiveCell(raw.clone()),
+                    },
+                },
+            }),
+            keep_running
+        );
+        assert_eq!(
+            response_rx.await.expect("terminate response"),
+            Ok(WaitOutcome::LiveCell(expected))
+        );
+        assert_eq!(alive.load(Ordering::Acquire), keep_running);
+    }
 }
 
 #[tokio::test]
