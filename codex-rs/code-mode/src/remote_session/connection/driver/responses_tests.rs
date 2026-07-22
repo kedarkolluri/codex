@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeToolKind;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
+use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_REJECTED;
@@ -80,9 +81,13 @@ fn direct_driver_with_outgoing() -> (
 }
 
 fn ready_session(driver: &mut ConnectionDriver) -> RemoteSession {
+    ready_session_with_generation(driver, /*generation*/ 1)
+}
+
+fn ready_session_with_generation(driver: &mut ConnectionDriver, generation: u64) -> RemoteSession {
     let session = RemoteSession {
         id: SessionId::new("session").expect("session ID"),
-        generation: 1,
+        generation,
     };
     driver.sessions.insert_ready(
         session.clone(),
@@ -136,16 +141,30 @@ fn insert_execute(
     request_id: RequestId,
     output_admission: RemoteOutputAdmission,
 ) -> oneshot::Receiver<Result<DeliveredExecute, String>> {
+    insert_execute_for_session(
+        driver,
+        request_id,
+        RemoteSession {
+            id: SessionId::new("session").expect("session ID"),
+            generation: 1,
+        },
+        output_admission,
+    )
+}
+
+fn insert_execute_for_session(
+    driver: &mut ConnectionDriver,
+    request_id: RequestId,
+    session: RemoteSession,
+    output_admission: RemoteOutputAdmission,
+) -> oneshot::Receiver<Result<DeliveredExecute, String>> {
     let (response_tx, response_rx) = oneshot::channel();
     let (initial_response_tx, initial_response_rx) = oneshot::channel();
     let event_tx = driver.event_tx.clone();
     driver.requests.insert_pending(
         request_id,
         PendingRequest::Execute {
-            session: RemoteSession {
-                id: SessionId::new("session").expect("session ID"),
-                generation: 1,
-            },
+            session,
             response_tx,
             initial_response_tx,
             initial_response_rx,
@@ -163,11 +182,27 @@ fn insert_initial(
     cell_id: &str,
     output_admission: RemoteOutputAdmission,
 ) -> oneshot::Receiver<Result<RuntimeResponse, String>> {
+    insert_initial_for_public(
+        driver,
+        request_id,
+        cell_id,
+        CellId::new(cell_id.to_string()),
+        output_admission,
+    )
+}
+
+fn insert_initial_for_public(
+    driver: &mut ConnectionDriver,
+    request_id: RequestId,
+    cell_id: &str,
+    public_id: CellId,
+    output_admission: RemoteOutputAdmission,
+) -> oneshot::Receiver<Result<RuntimeResponse, String>> {
     let (response_tx, response_rx) = oneshot::channel();
     driver.requests.insert_initial_response(
         request_id,
         InitialResponse {
-            generation: 1,
+            public_id,
             cell_id: WireCellId::try_new(cell_id).expect("cell ID"),
             output_admission,
             response_tx,
@@ -190,6 +225,7 @@ fn insert_wait(
                 id: SessionId::new("session").expect("session ID"),
                 generation: 1,
             },
+            public_id: CellId::new("cell".to_string()),
             cell_id: WireCellId::try_new("cell").expect("cell ID"),
             output_admission,
             cancellation: CancellableRequest::new(CancellationToken::new()),
@@ -285,6 +321,115 @@ fn every_typed_host_cell_id_shape_is_validated() {
     for message in invalid_host_cell_id_messages() {
         assert_eq!(validate_host_cell_ids(&message), Err(InvalidWireCellId));
     }
+}
+
+#[tokio::test]
+async fn commands_and_responses_preserve_the_generation_prefixed_cell_id() {
+    let (mut driver, alive, mut outgoing_rx) = direct_driver_with_outgoing();
+    let session = ready_session_with_generation(&mut driver, /*generation*/ 2);
+    let wire_id = WireCellId::try_new("wire-cell").expect("wire cell ID");
+    let public_id = CellId::new("g2:wire-cell".to_string());
+    let (execute_tx, execute_rx) = oneshot::channel();
+    assert!(driver.handle_command(DriverCommand::Execute {
+        session: session.clone(),
+        request: ExecuteRequest {
+            tool_call_id: "execute".to_string(),
+            enabled_tools: Vec::new(),
+            source: "await new Promise(() => {})".to_string(),
+            output_policy: ExecuteOutputPolicy::Ordinary,
+            yield_time_ms: Some(1),
+            max_output_tokens: None,
+        },
+        caller_cancellation: CancellationToken::new(),
+        response_tx: execute_tx,
+    }));
+    outgoing_rx.recv().await.expect("execute frame");
+    assert!(driver.handle_host_message(HostToClient::Response {
+        id: RequestId::new(/*value*/ 1),
+        result: WireResult::Ok {
+            value: HostResponse::ExecutionStarted {
+                cell_id: wire_id.clone(),
+            },
+        },
+    }));
+    let delivered = execute_rx
+        .await
+        .expect("execute response")
+        .expect("started cell");
+    driver.requests.claim_execute(delivered.request_id);
+    let started = delivered.started;
+    assert_eq!(started.cell_id, public_id);
+    assert!(driver.handle_host_message(HostToClient::InitialResponse {
+        id: RequestId::new(/*value*/ 1),
+        result: WireResult::Ok {
+            value: WireRuntimeResponse::Result {
+                cell_id: wire_id.clone(),
+                content_items: Vec::new(),
+                error_text: None,
+            },
+        },
+    }));
+    assert_eq!(
+        started.initial_response().await,
+        Ok(RuntimeResponse::Result {
+            cell_id: public_id.clone(),
+            content_items: Vec::new(),
+            error_text: None,
+        })
+    );
+
+    let wait_rx = queue_wait(
+        &mut driver,
+        session.clone(),
+        public_id.clone(),
+        CancellationToken::new(),
+    );
+    outgoing_rx.recv().await.expect("wait frame");
+    assert!(driver.handle_host_message(HostToClient::Response {
+        id: RequestId::new(/*value*/ 2),
+        result: WireResult::Ok {
+            value: HostResponse::WaitCompleted {
+                outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Yielded {
+                    cell_id: wire_id.clone(),
+                    content_items: Vec::new(),
+                }),
+            },
+        },
+    }));
+    assert_eq!(
+        wait_rx.await.expect("wait response"),
+        Ok(WaitOutcome::LiveCell(RuntimeResponse::Yielded {
+            cell_id: public_id.clone(),
+            content_items: Vec::new(),
+        }))
+    );
+
+    let (terminate_tx, terminate_rx) = oneshot::channel();
+    assert!(driver.handle_command(DriverCommand::Terminate {
+        session,
+        cell_id: public_id.clone(),
+        response_tx: terminate_tx,
+    }));
+    outgoing_rx.recv().await.expect("terminate frame");
+    assert!(driver.handle_host_message(HostToClient::Response {
+        id: RequestId::new(/*value*/ 3),
+        result: WireResult::Ok {
+            value: HostResponse::WaitCompleted {
+                outcome: WireWaitOutcome::MissingCell(WireRuntimeResponse::Terminated {
+                    cell_id: wire_id,
+                    content_items: Vec::new(),
+                }),
+            },
+        },
+    }));
+    assert_eq!(
+        terminate_rx.await.expect("terminate response"),
+        Ok(WaitOutcome::MissingCell(RuntimeResponse::Terminated {
+            cell_id: public_id,
+            content_items: Vec::new(),
+        }))
+    );
+    assert!(alive.load(Ordering::Acquire));
 }
 
 #[tokio::test]
@@ -447,7 +592,14 @@ async fn rejected_saved_initial_response_is_delivered_before_connection_failure(
     let (mut driver, alive) = direct_driver();
     let request_id = RequestId::new(/*value*/ 1);
     let cell_id = WireCellId::try_new("cell").expect("cell ID");
-    let response_rx = insert_initial(&mut driver, request_id, "cell", saved_admission());
+    let public_id = CellId::new("g2:cell".to_string());
+    let response_rx = insert_initial_for_public(
+        &mut driver,
+        request_id,
+        "cell",
+        public_id.clone(),
+        saved_admission(),
+    );
     assert!(!driver.handle_host_message(HostToClient::InitialResponse {
         id: request_id,
         result: WireResult::Ok {
@@ -462,7 +614,7 @@ async fn rejected_saved_initial_response_is_delivered_before_connection_failure(
     assert_eq!(
         response_rx.await.expect("initial response"),
         Ok(RuntimeResponse::Result {
-            cell_id: CellId::new("cell".to_string()),
+            cell_id: public_id,
             content_items: Vec::new(),
             error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
         })
@@ -688,10 +840,15 @@ async fn saved_initial_and_terminate_correlate_one_terminal_delivery() {
 #[tokio::test]
 async fn saved_deferred_wait_keeps_remote_output_ledger() {
     let (mut driver, alive, mut outgoing_rx) = direct_driver_with_outgoing();
-    let session = ready_session(&mut driver);
+    let session = ready_session_with_generation(&mut driver, /*generation*/ 2);
     let cell_id = WireCellId::try_new("cell").expect("cell ID");
     let execute_id = driver.requests.allocate_id().expect("execute request ID");
-    let execute_rx = insert_execute(&mut driver, execute_id, full_saved_admission());
+    let execute_rx = insert_execute_for_session(
+        &mut driver,
+        execute_id,
+        session.clone(),
+        full_saved_admission(),
+    );
     assert!(driver.handle_host_message(HostToClient::Response {
         id: execute_id,
         result: WireResult::Ok {
@@ -703,6 +860,7 @@ async fn saved_deferred_wait_keeps_remote_output_ledger() {
         .expect("execute response")
         .expect("started cell")
         .started;
+    let public_id = started.cell_id.clone();
 
     let first_cancellation = CancellationToken::new();
     first_cancellation.cancel();
@@ -732,7 +890,7 @@ async fn saved_deferred_wait_keeps_remote_output_ledger() {
     assert_eq!(
         wait_rx.await.expect("first wait response"),
         Ok(WaitOutcome::LiveCell(RuntimeResponse::Yielded {
-            cell_id: CellId::new("cell".to_string()),
+            cell_id: public_id.clone(),
             content_items: Vec::new(),
         }))
     );
@@ -764,7 +922,7 @@ async fn saved_deferred_wait_keeps_remote_output_ledger() {
     assert_eq!(
         second_rx.await.expect("second wait response"),
         Ok(WaitOutcome::LiveCell(RuntimeResponse::Result {
-            cell_id: CellId::new("cell".to_string()),
+            cell_id: public_id,
             content_items: Vec::new(),
             error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
         }))

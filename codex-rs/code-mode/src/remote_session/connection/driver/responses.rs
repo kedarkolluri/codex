@@ -9,7 +9,6 @@ use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
-use codex_code_mode_protocol::host::WireCellId;
 use tokio::sync::oneshot;
 
 use super::ConnectionDriver;
@@ -48,6 +47,7 @@ impl ConnectionDriver {
             }
             if !self.start_wait(
                 wait.session,
+                wait.public_id,
                 wait.request,
                 wait.output_admission,
                 wait.caller_cancellation,
@@ -165,32 +165,32 @@ impl ConnectionDriver {
                     self.requests.insert_initial_response(
                         id,
                         InitialResponse {
-                            generation: session.generation,
+                            public_id: public_id.clone(),
                             cell_id: remote_cell_id.clone(),
                             output_admission: output_admission.clone(),
                             response_tx: initial_response_tx,
                         },
                     );
-                    let started = StartedCell::from_result_receiver(public_id, initial_response_rx);
-                    if cancellation.is_cancelled() || response_tx.is_closed() {
-                        return self.terminate_abandoned(session, remote_cell_id, output_admission);
+                    let started =
+                        StartedCell::from_result_receiver(public_id.clone(), initial_response_rx);
+                    let execute = UnclaimedExecute {
+                        session,
+                        public_id,
+                        cell_id: remote_cell_id,
+                        output_admission,
+                        cancellation,
+                    };
+                    if execute.cancellation.is_cancelled() || response_tx.is_closed() {
+                        return self.terminate_abandoned(execute);
                     }
                     let delivered = DeliveredExecute {
                         request_id: id,
                         started,
                     };
                     if response_tx.send(Ok(delivered)).is_err() {
-                        return self.terminate_abandoned(session, remote_cell_id, output_admission);
+                        return self.terminate_abandoned(execute);
                     }
-                    self.requests.insert_unclaimed_execute(
-                        id,
-                        UnclaimedExecute {
-                            session,
-                            cell_id: remote_cell_id,
-                            output_admission,
-                            cancellation,
-                        },
-                    );
+                    self.requests.insert_unclaimed_execute(id, execute);
                 }
                 Ok(_) => {
                     let reason = "code-mode host returned an invalid execute response".to_string();
@@ -202,7 +202,8 @@ impl ConnectionDriver {
                 }
             },
             PendingRequest::Wait {
-                session,
+                session: _,
+                public_id,
                 cell_id,
                 output_admission,
                 response_tx,
@@ -228,10 +229,7 @@ impl ConnectionDriver {
                             }
                         };
                         let admission = output_admission.admit_response(response, delivery);
-                        (
-                            Ok(public_wait_outcome(session.generation, outcome)),
-                            admission,
-                        )
+                        (Ok(public_wait_outcome(public_id, outcome)), admission)
                     }
                     Ok(_) => {
                         let reason = "code-mode host returned an invalid cell response".to_string();
@@ -245,7 +243,7 @@ impl ConnectionDriver {
                 return self.deliver_admitted(response_tx, response, admission);
             }
             PendingRequest::Terminate {
-                session,
+                public_id,
                 cell_id,
                 output_admission,
                 response_tx,
@@ -270,10 +268,7 @@ impl ConnectionDriver {
                             }
                         };
                         let admission = output_admission.admit_response(response, delivery);
-                        (
-                            Ok(public_wait_outcome(session.generation, outcome)),
-                            admission,
-                        )
+                        (Ok(public_wait_outcome(public_id, outcome)), admission)
                     }
                     Ok(_) => {
                         let reason = "code-mode host returned an invalid cell response".to_string();
@@ -338,7 +333,7 @@ impl ConnectionDriver {
                 if !self.send_cancel_request(request_id) {
                     return false;
                 }
-                self.terminate_abandoned(execute.session, execute.cell_id, execute.output_admission)
+                self.terminate_abandoned(execute)
             }
         }
     }
@@ -380,12 +375,14 @@ impl ConnectionDriver {
         )
     }
 
-    fn terminate_abandoned(
-        &mut self,
-        session: RemoteSession,
-        cell_id: WireCellId,
-        output_admission: RemoteOutputAdmission,
-    ) -> bool {
+    fn terminate_abandoned(&mut self, execute: UnclaimedExecute) -> bool {
+        let UnclaimedExecute {
+            session,
+            public_id,
+            cell_id,
+            output_admission,
+            ..
+        } = execute;
         let Some(is_closing) = self.sessions.is_closing(&session.id) else {
             self.fail(format!(
                 "code-mode host admitted an abandoned cell in unknown session {}",
@@ -400,11 +397,11 @@ impl ConnectionDriver {
         drop(response_rx);
         self.send_request(
             HostRequest::Terminate {
-                session_id: session.id.clone(),
+                session_id: session.id,
                 cell_id: cell_id.clone(),
             },
             PendingRequest::Terminate {
-                session,
+                public_id,
                 cell_id,
                 output_admission,
                 response_tx,
@@ -430,7 +427,7 @@ impl ConnectionDriver {
                     .output_admission
                     .admit_response(&mut response, ResponseDelivery::Observer);
                 (
-                    Ok(public_runtime_response(initial.generation, response)),
+                    Ok(public_runtime_response(initial.public_id, response)),
                     admission,
                 )
             }

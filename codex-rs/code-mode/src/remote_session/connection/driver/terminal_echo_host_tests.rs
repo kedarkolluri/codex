@@ -10,11 +10,16 @@ use pretty_assertions::assert_eq;
 
 use super::super::output_admission::RemoteOutputAdmission;
 
-fn saved_harness() -> (DriverHarness, RemoteSession, Arc<RecordingDelegate>) {
-    let session = remote_session();
+fn saved_harness() -> (DriverHarness, RemoteSession, Arc<RecordingDelegate>, CellId) {
+    let session = RemoteSession {
+        generation: 2,
+        ..remote_session()
+    };
+    let public_cell_id = CellId::new("g2:1".to_string());
     let delegate = Arc::new(RecordingDelegate::default());
     let configured_session = session.clone();
     let configured_delegate = Arc::clone(&delegate);
+    let configured_public_cell_id = public_cell_id.clone();
     let harness = DriverHarness::start_configured(move |driver| {
         driver.sessions.insert_ready(
             configured_session.clone(),
@@ -25,7 +30,7 @@ fn saved_harness() -> (DriverHarness, RemoteSession, Arc<RecordingDelegate>) {
             ExecuteOutputPolicy::SavedWorkflow,
             driver.terminal_echo_budget.clone(),
         );
-        driver
+        let admitted = driver
             .sessions
             .admit_cell(
                 &configured_session,
@@ -33,13 +38,15 @@ fn saved_harness() -> (DriverHarness, RemoteSession, Arc<RecordingDelegate>) {
                 admission,
             )
             .unwrap_or_else(|_| panic!("live cell"));
+        assert_eq!(admitted, configured_public_cell_id);
     });
-    (harness, session, delegate)
+    (harness, session, delegate, public_cell_id)
 }
 
 async fn queue_wait(
     harness: &mut DriverHarness,
     session: &RemoteSession,
+    cell_id: &CellId,
     caller_cancellation: CancellationToken,
 ) -> oneshot::Receiver<Result<WaitOutcome, String>> {
     let (response_tx, response_rx) = oneshot::channel();
@@ -48,7 +55,7 @@ async fn queue_wait(
         .send(DriverCommand::Wait {
             session: session.clone(),
             request: WaitRequest {
-                cell_id: CellId::new("1".to_string()),
+                cell_id: cell_id.clone(),
                 yield_time_ms: 1,
             },
             caller_cancellation,
@@ -63,13 +70,14 @@ async fn queue_wait(
 async fn queue_terminate(
     harness: &mut DriverHarness,
     session: &RemoteSession,
+    cell_id: &CellId,
 ) -> oneshot::Receiver<Result<WaitOutcome, String>> {
     let (response_tx, response_rx) = oneshot::channel();
     harness
         .command_tx
         .send(DriverCommand::Terminate {
             session: session.clone(),
-            cell_id: CellId::new("1".to_string()),
+            cell_id: cell_id.clone(),
             response_tx,
         })
         .await
@@ -156,8 +164,8 @@ async fn close_cell(harness: &DriverHarness, session: &RemoteSession) {
 
 #[tokio::test]
 async fn saved_terminate_transport_error_does_not_claim_terminal_role() {
-    let (mut harness, session, _delegate) = saved_harness();
-    let error_rx = queue_terminate(&mut harness, &session).await;
+    let (mut harness, session, _delegate, cell_id) = saved_harness();
+    let error_rx = queue_terminate(&mut harness, &session, &cell_id).await;
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::Response {
@@ -173,13 +181,13 @@ async fn saved_terminate_transport_error_does_not_claim_terminal_role() {
         Err(SAVED_WORKFLOW_EXECUTION_FAILED.to_string())
     );
 
-    let wait_rx = queue_wait(&mut harness, &session, CancellationToken::new()).await;
-    let terminate_rx = queue_terminate(&mut harness, &session).await;
+    let wait_rx = queue_wait(&mut harness, &session, &cell_id, CancellationToken::new()).await;
+    let terminate_rx = queue_terminate(&mut harness, &session, &cell_id).await;
     let raw = private_terminal_result();
     send_live_response(&harness, /*request_id*/ 2, raw.clone()).await;
     send_live_response(&harness, /*request_id*/ 3, raw).await;
     let expected = Ok(WaitOutcome::LiveCell(RuntimeResponse::Result {
-        cell_id: CellId::new("1".to_string()),
+        cell_id,
         content_items: Vec::new(),
         error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
     }));
@@ -196,32 +204,43 @@ enum CellCloseOrder {
 }
 
 async fn assert_saved_echo_survives_cell_close(order: CellCloseOrder) {
-    let (mut harness, session, delegate) = saved_harness();
-    let wait_rx = queue_wait(&mut harness, &session, CancellationToken::new()).await;
-    let terminate_rx = queue_terminate(&mut harness, &session).await;
+    let (mut harness, session, delegate, cell_id) = saved_harness();
+    let wait_rx = queue_wait(&mut harness, &session, &cell_id, CancellationToken::new()).await;
+    let terminate_rx = queue_terminate(&mut harness, &session, &cell_id).await;
     let raw = full_terminal_response();
+    let content_items = match RuntimeResponse::from(raw.clone()) {
+        RuntimeResponse::Terminated { content_items, .. } => content_items,
+        RuntimeResponse::Yielded { .. } | RuntimeResponse::Result { .. } => {
+            panic!("terminal response")
+        }
+    };
+    let expected = Ok(WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+        cell_id: cell_id.clone(),
+        content_items,
+    }));
 
-    match order {
+    let actual = match order {
         CellCloseOrder::BeforeResponses => {
             drop(wait_rx);
             close_cell(&harness, &session).await;
             send_live_response(&harness, /*request_id*/ 1, raw.clone()).await;
             send_live_response(&harness, /*request_id*/ 2, raw).await;
-            assert!(terminate_rx.await.expect("terminate response").is_ok());
+            terminate_rx.await.expect("terminate response")
         }
         CellCloseOrder::BetweenTerminateAndObserver => {
             drop(terminate_rx);
             send_live_response(&harness, /*request_id*/ 2, raw.clone()).await;
             close_cell(&harness, &session).await;
             send_live_response(&harness, /*request_id*/ 1, raw).await;
-            assert!(wait_rx.await.expect("observer response").is_ok());
+            wait_rx.await.expect("observer response")
         }
-    }
+    };
+    assert_eq!(actual, expected);
 
     assert!(harness.alive.load(Ordering::Acquire));
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
-        vec![CellId::new("1".to_string())]
+        vec![cell_id]
     );
 }
 
@@ -237,11 +256,11 @@ async fn saved_echo_survives_cell_close_before_and_between_responses() {
 
 #[tokio::test]
 async fn cancelled_saved_observer_still_admits_the_terminal_echo() {
-    let (mut harness, session, _delegate) = saved_harness();
+    let (mut harness, session, _delegate, cell_id) = saved_harness();
     let cancellation = CancellationToken::new();
-    let wait_rx = queue_wait(&mut harness, &session, cancellation.clone()).await;
+    let wait_rx = queue_wait(&mut harness, &session, &cell_id, cancellation.clone()).await;
     drop(wait_rx);
-    let terminate_rx = queue_terminate(&mut harness, &session).await;
+    let terminate_rx = queue_terminate(&mut harness, &session, &cell_id).await;
     cancellation.cancel();
     harness
         .outgoing_rx
@@ -255,7 +274,7 @@ async fn cancelled_saved_observer_still_admits_the_terminal_echo() {
     assert_eq!(
         terminate_rx.await.expect("terminate response"),
         Ok(WaitOutcome::LiveCell(RuntimeResponse::Result {
-            cell_id: CellId::new("1".to_string()),
+            cell_id,
             content_items: Vec::new(),
             error_text: Some(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()),
         }))
@@ -265,14 +284,14 @@ async fn cancelled_saved_observer_still_admits_the_terminal_echo() {
 
 #[tokio::test]
 async fn saved_missing_cell_output_does_not_clear_the_pending_terminal() {
-    let (mut harness, session, _delegate) = saved_harness();
-    let observer_rx = queue_wait(&mut harness, &session, CancellationToken::new()).await;
-    let terminate_rx = queue_terminate(&mut harness, &session).await;
+    let (mut harness, session, _delegate, cell_id) = saved_harness();
+    let observer_rx = queue_wait(&mut harness, &session, &cell_id, CancellationToken::new()).await;
+    let terminate_rx = queue_terminate(&mut harness, &session, &cell_id).await;
     let raw = private_terminal_result();
     send_live_response(&harness, /*request_id*/ 1, raw).await;
     assert!(observer_rx.await.expect("observer response").is_ok());
 
-    let missing_rx = queue_wait(&mut harness, &session, CancellationToken::new()).await;
+    let missing_rx = queue_wait(&mut harness, &session, &cell_id, CancellationToken::new()).await;
     send_missing_response(
         &harness,
         /*request_id*/ 3,

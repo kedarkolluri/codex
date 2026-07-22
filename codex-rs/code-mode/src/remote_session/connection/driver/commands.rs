@@ -190,6 +190,7 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
+        let public_id = request.cell_id.clone();
         let request = match remote_wait_request(&session, request) {
             Ok(request) => request,
             Err(err) => {
@@ -208,6 +209,7 @@ impl ConnectionDriver {
         if self.requests.has_cancelled_wait(&session, &request.cell_id) {
             self.requests.push_deferred_wait(DeferredWait {
                 session,
+                public_id,
                 request,
                 output_admission,
                 caller_cancellation,
@@ -217,6 +219,7 @@ impl ConnectionDriver {
         }
         self.start_wait(
             session,
+            public_id,
             request,
             output_admission,
             caller_cancellation,
@@ -227,6 +230,7 @@ impl ConnectionDriver {
     pub(super) fn start_wait(
         &mut self,
         session: RemoteSession,
+        public_id: CellId,
         request: WireWaitRequest,
         output_admission: RemoteOutputAdmission,
         caller_cancellation: CancellationToken,
@@ -240,6 +244,7 @@ impl ConnectionDriver {
             },
             PendingRequest::Wait {
                 session,
+                public_id,
                 cell_id,
                 output_admission,
                 cancellation: CancellableRequest::new(caller_cancellation),
@@ -258,6 +263,7 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
+        let public_id = cell_id.clone();
         let cell_id = match remote_cell_id(&session, &cell_id) {
             Ok(cell_id) => cell_id,
             Err(err) => {
@@ -276,11 +282,11 @@ impl ConnectionDriver {
         let pending_cell_id = cell_id.clone();
         self.send_request(
             HostRequest::Terminate {
-                session_id: session.id.clone(),
+                session_id: session.id,
                 cell_id,
             },
             PendingRequest::Terminate {
-                session,
+                public_id,
                 cell_id: pending_cell_id,
                 output_admission,
                 response_tx,
