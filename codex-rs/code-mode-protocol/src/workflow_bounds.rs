@@ -61,18 +61,33 @@ pub const WORKFLOW_AGENT_SCHEMA_MAX_BYTES: usize = 8 * 1024;
 pub const WORKFLOW_AGENT_SCHEMA_MAX_DEPTH: usize = 64;
 /// Maximum number of content items a workflow run may return across all runtime yields.
 pub const WORKFLOW_OUTPUT_MAX_ITEMS: usize = 256;
+/// Maximum serialized payload bytes for one workflow-authored output item or execution error.
+///
+/// Text, image URL, audio URL, and terminal error strings are serialized as JSON strings and
+/// capped independently before they enter aggregate workflow output accounting.
+pub const WORKFLOW_OUTPUT_ITEM_MAX_BYTES: usize = 8 * 1024;
 /// Maximum aggregate serialized payload bytes a workflow run may return across all runtime yields.
 ///
-/// This intentionally matches the durable workflow return cap. Text, image URL, and audio URL
-/// payloads all count toward it, including `data:` URLs, while the separate item cap bounds
-/// envelope overhead.
+/// This intentionally matches the durable workflow return cap. Text, image URL, audio URL, and
+/// terminal error payloads all count toward it, including `data:` URLs, while the separate item
+/// cap bounds envelope overhead.
 pub const WORKFLOW_OUTPUT_MAX_BYTES: usize = 32 * 1024;
+/// Fixed failure returned when saved-workflow output exceeds any admission bound.
+///
+/// This runtime-owned sentinel is emitted after admission closes and is exempt from authored
+/// output accounting; callers must not pass it to [`WorkflowOutputBounds::admit_response`].
+pub const SAVED_WORKFLOW_OUTPUT_REJECTED: &str = "saved workflow output exceeded its safety limit";
+/// Fixed failure returned when a saved workflow cannot complete execution.
+///
+/// This runtime-owned sentinel is emitted after admission closes and is exempt from authored
+/// output accounting; callers must not pass it to [`WorkflowOutputBounds::admit_response`].
+pub const SAVED_WORKFLOW_EXECUTION_FAILED: &str = "saved workflow execution failed";
 
 /// Incremental, transactional accounting for workflow runtime output across yield boundaries.
 ///
-/// [`Self::admit`] validates a prospective chunk without cloning it or serializing the already
-/// accumulated output. State changes only after every item in the chunk fits, so callers can fail
-/// closed without partially appending an oversized response.
+/// [`Self::admit_response`] validates a prospective response without cloning it or serializing the
+/// already accumulated output. State changes only after every item and the optional terminal error
+/// fit, so callers can fail closed without partially appending an oversized response.
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct WorkflowOutputBounds {
     item_count: usize,
@@ -82,28 +97,48 @@ pub struct WorkflowOutputBounds {
 impl WorkflowOutputBounds {
     /// Admit one runtime-response chunk against the aggregate workflow output caps.
     pub fn admit(&mut self, items: &[FunctionCallOutputContentItem]) -> Result<(), String> {
+        self.admit_response(items, /*error_text*/ None)
+    }
+
+    /// Admit one complete runtime response, including its optional terminal error.
+    pub fn admit_response(
+        &mut self,
+        items: &[FunctionCallOutputContentItem],
+        error_text: Option<&str>,
+    ) -> Result<(), String> {
+        let response_item_count = items
+            .len()
+            .checked_add(usize::from(error_text.is_some()))
+            .ok_or_else(output_limit_error)?;
         let item_count = self
             .item_count
-            .checked_add(items.len())
-            .ok_or_else(output_item_limit_error)?;
+            .checked_add(response_item_count)
+            .ok_or_else(output_limit_error)?;
         if item_count > WORKFLOW_OUTPUT_MAX_ITEMS {
-            return Err(output_item_limit_error());
+            return Err(output_limit_error());
         }
 
         let mut serialized_bytes = self.serialized_bytes;
+        let mut admit_payload = |payload: &str| -> Result<(), String> {
+            let payload_bytes = serialized_payload_len(payload)?;
+            serialized_bytes = serialized_bytes
+                .checked_add(payload_bytes)
+                .ok_or_else(output_limit_error)?;
+            if serialized_bytes > WORKFLOW_OUTPUT_MAX_BYTES {
+                return Err(output_limit_error());
+            }
+            Ok(())
+        };
         for item in items {
             let payload = match item {
                 FunctionCallOutputContentItem::InputText { text } => text,
                 FunctionCallOutputContentItem::InputImage { image_url, .. } => image_url,
                 FunctionCallOutputContentItem::InputAudio { audio_url } => audio_url,
             };
-            let remaining = WORKFLOW_OUTPUT_MAX_BYTES
-                .checked_sub(serialized_bytes)
-                .ok_or_else(output_byte_limit_error)?;
-            let payload_bytes = serialized_payload_len(payload, remaining)?;
-            serialized_bytes = serialized_bytes
-                .checked_add(payload_bytes)
-                .ok_or_else(output_byte_limit_error)?;
+            admit_payload(payload)?;
+        }
+        if let Some(error_text) = error_text {
+            admit_payload(error_text)?;
         }
 
         self.item_count = item_count;
@@ -112,13 +147,14 @@ impl WorkflowOutputBounds {
     }
 }
 
-fn serialized_payload_len(payload: &str, max_bytes: usize) -> Result<usize, String> {
+fn serialized_payload_len(payload: &str) -> Result<usize, String> {
     bounded_serialized_len(
         payload,
-        max_bytes,
-        output_byte_limit_error,
+        WORKFLOW_OUTPUT_ITEM_MAX_BYTES,
+        output_limit_error,
         "workflow output",
     )
+    .map_err(|_| output_limit_error())
 }
 
 fn bounded_serialized_len<T: Serialize + ?Sized>(
@@ -173,12 +209,8 @@ impl Write for BoundedCountingWriter {
     }
 }
 
-fn output_item_limit_error() -> String {
-    format!("workflow output item cap exceeded (maximum {WORKFLOW_OUTPUT_MAX_ITEMS})")
-}
-
-fn output_byte_limit_error() -> String {
-    format!("workflow output byte cap exceeded (maximum {WORKFLOW_OUTPUT_MAX_BYTES})")
+fn output_limit_error() -> String {
+    SAVED_WORKFLOW_OUTPUT_REJECTED.to_string()
 }
 
 /// Validate a saved or nested workflow name.
