@@ -4544,6 +4544,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-workflows-extension"
+version = "0.0.0"
+dependencies = [
+ "codex-core-workflows",
+ "codex-exec-server",
+ "codex-extension-api",
+ "codex-file-system",
+ "codex-protocol",
+ "codex-utils-absolute-path",
+ "codex-utils-path-uri",
+ "pretty_assertions",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "color-eyre"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

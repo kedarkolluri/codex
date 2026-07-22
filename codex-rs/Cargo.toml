@@ -61,6 +61,7 @@ members = [
     "ext/mcp",
     "ext/skills",
     "ext/web-search",
+    "ext/workflows",
     "external-agent-migration",
     "keyring-store",
     "file-search",
@@ -231,6 +232,7 @@ codex-secrets = { path = "secrets" }
 codex-shell-command = { path = "shell-command" }
 codex-shell-escalation = { path = "shell-escalation" }
 codex-skills-extension = { path = "ext/skills" }
+codex-workflows-extension = { path = "ext/workflows" }
 codex-skills = { path = "skills" }
 codex-state = { path = "state" }
 codex-stdio-to-uds = { path = "stdio-to-uds" }

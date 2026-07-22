@@ -1,0 +1,29 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-workflows-extension"
+version.workspace = true
+
+[lib]
+name = "codex_workflows_extension"
+path = "src/lib.rs"
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codex-core-workflows = { workspace = true }
+codex-exec-server = { workspace = true }
+codex-extension-api = { workspace = true }
+codex-file-system = { workspace = true }
+codex-utils-absolute-path = { workspace = true }
+codex-utils-path-uri = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+codex-protocol = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
