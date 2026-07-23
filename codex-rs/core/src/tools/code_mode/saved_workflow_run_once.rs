@@ -1,15 +1,14 @@
 //! One-shot execution of an immutable saved-workflow source snapshot.
 
 use codex_code_mode::CellId;
-use codex_code_mode::CodeModeSession;
 use codex_code_mode::ExecuteOutputPolicy;
 use codex_code_mode::ExecuteRequest;
 use codex_code_mode::RuntimeResponse;
 use codex_code_mode::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode::StartedCell;
+use codex_code_mode::StartedCellBinding;
 use codex_code_mode::WaitOutcome;
-use codex_code_mode::WaitRequest;
 use codex_core_workflows::WorkflowSourceResolver;
 use codex_features::Feature;
 use codex_rollout_trace::CodeCellTraceContext;
@@ -71,12 +70,6 @@ pub(crate) async fn run_saved_workflow_once(
     }
 
     let source = snapshot.source().to_string();
-    let runtime_task = exec
-        .session
-        .services
-        .code_mode_service
-        .reserve_runtime_task()
-        .map_err(|error| runtime_error("reserve owner", error))?;
     let runtime_session = exec
         .session
         .services
@@ -84,18 +77,32 @@ pub(crate) async fn run_saved_workflow_once(
         .session()
         .await
         .map_err(|error| runtime_error("initialize", error))?;
+    let runtime_task = exec
+        .session
+        .services
+        .code_mode_service
+        .reserve_runtime_task()
+        .map_err(|error| runtime_error("reserve owner", error))?;
+    let cancellation = runtime_task.cancellation_token();
     let dispatch_broker = Arc::clone(&exec.session.services.code_mode_service.dispatch_broker);
-    let started_cell = runtime_session
-        .execute(ExecuteRequest {
-            tool_call_id: call_id.to_string(),
-            enabled_tools: Vec::new(),
-            source: source.clone(),
-            output_policy: ExecuteOutputPolicy::SavedWorkflow,
-            yield_time_ms: None,
-            max_output_tokens: None,
-        })
-        .await
-        .map_err(|error| runtime_error("start", error))?;
+    let execute = Arc::clone(&runtime_session).execute_bound(ExecuteRequest {
+        tool_call_id: call_id.to_string(),
+        enabled_tools: Vec::new(),
+        source: source.clone(),
+        output_policy: ExecuteOutputPolicy::SavedWorkflow,
+        yield_time_ms: None,
+        max_output_tokens: None,
+    });
+    tokio::pin!(execute);
+    let bound_started_cell = tokio::select! {
+        // Claim a delivered cell before honoring shutdown so its exact owner can clean it up.
+        biased;
+        result = &mut execute => result.map_err(|error| runtime_error("start", error))?,
+        _ = cancellation.cancelled() => {
+            return Err(respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED));
+        }
+    };
+    let (started_cell, binding) = bound_started_cell.into_parts();
     let cell_id = started_cell.cell_id.clone();
     let trace = exec
         .session
@@ -108,7 +115,7 @@ pub(crate) async fn run_saved_workflow_once(
             source,
         );
     let owner = RuntimeCellOwner {
-        runtime_session,
+        binding,
         dispatch_broker,
         cell_id: cell_id.clone(),
         trace,
@@ -118,7 +125,6 @@ pub(crate) async fn run_saved_workflow_once(
     owner.dispatch_broker.mark_cell_ready_for_dispatch(&cell_id);
 
     let (result_tx, result_rx) = oneshot::channel();
-    let cancellation = runtime_task.cancellation_token();
     tokio::spawn(async move {
         let _runtime_task = runtime_task;
         let mut owner = owner;
@@ -126,16 +132,13 @@ pub(crate) async fn run_saved_workflow_once(
             // Session shutdown wins simultaneous completion so a closed runtime cannot report
             // a newly successful workflow result.
             biased;
-            _ = cancellation.cancelled() => {
-                owner.record_ended(&RuntimeResponse::Result {
-                    cell_id: owner.cell_id.clone(),
-                    content_items: Vec::new(),
-                    error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
-                });
-                Err(respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED))
-            }
+            _ = cancellation.cancelled() => Err(respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED)),
             result = observe_to_terminal(&mut owner, started_cell) => result,
         };
+        if result.is_err() {
+            owner.terminate_after_failure().await;
+            owner.record_failed();
+        }
         drop(owner);
         let _ = result_tx.send(result);
     });
@@ -152,7 +155,11 @@ async fn observe_to_terminal(
     let mut response = started_cell
         .initial_response()
         .await
-        .map_err(|error| runtime_error("initial response", error))?;
+        .map_err(|error| post_start_runtime_error("initial response", error))?;
+    if response_cell_id(&response) != &owner.cell_id {
+        warn!("saved workflow runtime returned a mismatched cell identity");
+        return Err(respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED));
+    }
     owner.trace.record_initial_response(&response);
 
     loop {
@@ -167,17 +174,18 @@ async fn observe_to_terminal(
             } => {
                 owner.content_items.extend(content_items);
                 response = match owner
-                    .runtime_session
-                    .wait(WaitRequest {
-                        cell_id: owner.cell_id.clone(),
-                        yield_time_ms: DEFAULT_WAIT_YIELD_TIME_MS,
-                    })
+                    .binding
+                    .wait(DEFAULT_WAIT_YIELD_TIME_MS)
                     .await
-                    .map_err(|error| runtime_error("wait", error))?
+                    .map_err(|error| post_start_runtime_error("wait", error))?
                 {
                     WaitOutcome::LiveCell(response) => response,
-                    WaitOutcome::MissingCell(_) => {
-                        warn!("saved workflow runtime cell disappeared before completion");
+                    WaitOutcome::MissingCell(response) => {
+                        if response_cell_id(&response) != &owner.cell_id {
+                            warn!("saved workflow runtime returned a mismatched cell identity");
+                        } else {
+                            warn!("saved workflow runtime cell disappeared before completion");
+                        }
                         return Err(respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED));
                     }
                 };
@@ -191,7 +199,7 @@ async fn observe_to_terminal(
 }
 
 struct RuntimeCellOwner {
-    runtime_session: Arc<dyn CodeModeSession>,
+    binding: Arc<dyn StartedCellBinding>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
     cell_id: CellId,
     trace: CodeCellTraceContext,
@@ -200,6 +208,32 @@ struct RuntimeCellOwner {
 }
 
 impl RuntimeCellOwner {
+    async fn terminate_after_failure(&self) {
+        match self.binding.terminate().await {
+            Ok(WaitOutcome::LiveCell(response) | WaitOutcome::MissingCell(response)) => {
+                if response_cell_id(&response) != &self.cell_id {
+                    warn!("saved workflow cleanup returned a mismatched cell identity");
+                } else if matches!(response, RuntimeResponse::Yielded { .. }) {
+                    warn!("saved workflow cleanup did not reach a terminal state");
+                }
+            }
+            Err(error) => {
+                warn!(
+                    diagnostic = %error,
+                    "failed to terminate saved workflow runtime cell"
+                );
+            }
+        }
+    }
+
+    fn record_failed(&mut self) {
+        self.record_ended(&RuntimeResponse::Result {
+            cell_id: self.cell_id.clone(),
+            content_items: Vec::new(),
+            error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
+        });
+    }
+
     fn record_ended(&mut self, response: &RuntimeResponse) {
         self.trace.record_ended(response);
         self.ended = true;
@@ -261,6 +295,11 @@ fn runtime_error(stage: &'static str, error: String) -> FunctionCallError {
     if error == SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE {
         return respond_to_model(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE);
     }
+    warn!(stage, diagnostic = %error, "saved workflow runtime failed");
+    respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED)
+}
+
+fn post_start_runtime_error(stage: &'static str, error: String) -> FunctionCallError {
     warn!(stage, diagnostic = %error, "saved workflow runtime failed");
     respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED)
 }
