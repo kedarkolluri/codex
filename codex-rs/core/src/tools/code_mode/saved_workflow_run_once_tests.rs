@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
+use codex_code_mode::BoundStartedCell;
 use codex_code_mode::CellId;
 use codex_code_mode::CodeModeSession;
 use codex_code_mode::CodeModeSessionDelegate;
@@ -19,7 +20,9 @@ use codex_code_mode::ExecuteRequest;
 use codex_code_mode::FunctionCallOutputContentItem;
 use codex_code_mode::RuntimeResponse;
 use codex_code_mode::SAVED_WORKFLOW_EXECUTION_FAILED;
+use codex_code_mode::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode::StartedCell;
+use codex_code_mode::StartedCellBinding;
 use codex_code_mode::WaitOutcome;
 use codex_code_mode::WaitRequest;
 use codex_core_workflows::WorkflowRoot;
@@ -60,9 +63,14 @@ struct RecordingState {
     shutdown_result: Mutex<Result<(), String>>,
     requests: Mutex<Vec<ExecuteRequest>>,
     wait_requests: Mutex<Vec<WaitRequest>>,
+    terminate_requests: Mutex<Vec<CellId>>,
+    execute_error: Mutex<Option<String>>,
     initial_response: Mutex<Option<Result<RuntimeResponse, String>>>,
     wait_responses: Mutex<VecDeque<Result<WaitOutcome, String>>>,
+    terminate_response: Mutex<Option<Result<WaitOutcome, String>>>,
+    execute_block: Option<(Arc<Notify>, Arc<Notify>)>,
     wait_block: Option<(Arc<Notify>, Arc<Notify>)>,
+    terminate_block: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl RecordingState {
@@ -76,9 +84,14 @@ impl RecordingState {
             shutdown_result: Mutex::new(Ok(())),
             requests: Mutex::new(Vec::new()),
             wait_requests: Mutex::new(Vec::new()),
+            terminate_requests: Mutex::new(Vec::new()),
+            execute_error: Mutex::new(None),
             initial_response: Mutex::new(Some(initial_response)),
             wait_responses: Mutex::new(wait_responses.into_iter().collect()),
+            terminate_response: Mutex::new(Some(Ok(WaitOutcome::LiveCell(completed(CELL_ID))))),
+            execute_block: None,
             wait_block: None,
+            terminate_block: None,
         })
     }
 
@@ -121,51 +134,59 @@ struct RecordingSession {
 impl CodeModeSession for RecordingSession {
     fn execute<'a>(
         &'a self,
-        request: ExecuteRequest,
+        _request: ExecuteRequest,
     ) -> CodeModeSessionResultFuture<'a, StartedCell> {
-        self.state
-            .requests
-            .lock()
-            .expect("request lock")
-            .push(request);
-        let response = self
-            .state
-            .initial_response
-            .lock()
-            .expect("initial response lock")
-            .take()
-            .expect("one execute request");
-        let cell_id = CellId::new(CELL_ID.to_string());
-        let (response_tx, response_rx) = oneshot::channel();
-        let _ = response_tx.send(response);
-        Box::pin(async move { Ok(StartedCell::from_result_receiver(cell_id, response_rx)) })
+        panic!("saved workflow runner must use execute_bound")
     }
 
-    fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        self.state
-            .wait_requests
-            .lock()
-            .expect("wait request lock")
-            .push(request);
-        let wait_block = self.state.wait_block.clone();
-        let response = self
-            .state
-            .wait_responses
-            .lock()
-            .expect("wait response lock")
-            .pop_front()
-            .expect("queued wait response");
+    fn execute_bound(
+        self: Arc<Self>,
+        request: ExecuteRequest,
+    ) -> CodeModeSessionResultFuture<'static, BoundStartedCell> {
         Box::pin(async move {
-            if let Some((started, release)) = wait_block {
+            self.state
+                .requests
+                .lock()
+                .expect("request lock")
+                .push(request);
+            if let Some((started, release)) = self.state.execute_block.clone() {
                 started.notify_one();
                 release.notified().await;
             }
-            response
+            if let Some(error) = self
+                .state
+                .execute_error
+                .lock()
+                .expect("execute error lock")
+                .take()
+            {
+                return Err(error);
+            }
+            let response = self
+                .state
+                .initial_response
+                .lock()
+                .expect("initial response lock")
+                .take()
+                .expect("one execute request");
+            let cell_id = CellId::new(CELL_ID.to_string());
+            let (response_tx, response_rx) = oneshot::channel();
+            let _ = response_tx.send(response);
+            let started_cell = StartedCell::from_result_receiver(cell_id.clone(), response_rx);
+            let binding: Arc<dyn StartedCellBinding> = Arc::new(RecordingBinding {
+                cell_id,
+                session_owner: self,
+            });
+            BoundStartedCell::new(started_cell, binding)
         })
     }
 
+    fn wait<'a>(&'a self, _request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        panic!("saved workflow runner must use its exact started-cell binding")
+    }
+
     fn terminate<'a>(&'a self, _cell_id: CellId) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(async { Err("terminate is not expected".to_string()) })
+        panic!("saved workflow runner must use its exact started-cell binding")
     }
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
@@ -177,6 +198,59 @@ impl CodeModeSession for RecordingSession {
             .expect("shutdown result lock")
             .clone();
         Box::pin(async move { result })
+    }
+}
+
+struct RecordingBinding {
+    cell_id: CellId,
+    session_owner: Arc<RecordingSession>,
+}
+
+impl StartedCellBinding for RecordingBinding {
+    fn cell_id(&self) -> &CellId {
+        &self.cell_id
+    }
+
+    fn wait<'a>(&'a self, yield_time_ms: u64) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        let request = WaitRequest {
+            cell_id: self.cell_id.clone(),
+            yield_time_ms,
+        };
+        Box::pin(async move {
+            let state = &self.session_owner.state;
+            state.wait_requests.lock().expect("wait lock").push(request);
+            if let Some((started, release)) = state.wait_block.clone() {
+                started.notify_one();
+                release.notified().await;
+            }
+            state
+                .wait_responses
+                .lock()
+                .expect("wait response lock")
+                .pop_front()
+                .expect("queued wait response")
+        })
+    }
+
+    fn terminate<'a>(&'a self) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
+        Box::pin(async move {
+            let state = &self.session_owner.state;
+            state
+                .terminate_requests
+                .lock()
+                .expect("terminate lock")
+                .push(self.cell_id.clone());
+            if let Some((started, release)) = state.terminate_block.clone() {
+                started.notify_one();
+                release.notified().await;
+            }
+            state
+                .terminate_response
+                .lock()
+                .expect("terminate response lock")
+                .take()
+                .expect("one terminate response")
+        })
     }
 }
 
@@ -272,6 +346,7 @@ async fn exact_snapshot_executes_once_and_is_observed_to_terminal() -> anyhow::R
             yield_time_ms: DEFAULT_WAIT_YIELD_TIME_MS,
         }]
     );
+    assert!(terminate_requests(&state).is_empty());
 
     let events = raw_trace_events(trace_temp.path())?;
     let started_sources = events
@@ -304,7 +379,7 @@ async fn caller_cancellation_does_not_drop_the_runtime_owner() -> anyhow::Result
     let trace_temp = TempDir::new()?;
     let resolver = snapshot_resolver(snapshot, Arc::new(AtomicUsize::new(/*v*/ 0)));
     let exec = test_exec(
-        state,
+        Arc::clone(&state),
         /*workflow_enabled*/ true,
         /*resolver*/ Some(resolver),
         trace_temp.path(),
@@ -335,6 +410,7 @@ async fn caller_cancellation_does_not_drop_the_runtime_owner() -> anyhow::Result
         }
     })
     .await?;
+    assert!(terminate_requests(&state).is_empty());
     drop(session_owner);
 
     Ok(())
@@ -354,7 +430,7 @@ async fn detached_runtime_owner_does_not_retain_the_session() -> anyhow::Result<
     let trace_temp = TempDir::new()?;
     let resolver = snapshot_resolver(snapshot, Arc::new(AtomicUsize::new(/*v*/ 0)));
     let exec = test_exec(
-        state,
+        Arc::clone(&state),
         /*workflow_enabled*/ true,
         /*resolver*/ Some(resolver),
         trace_temp.path(),
@@ -398,6 +474,10 @@ async fn detached_runtime_owner_does_not_retain_the_session() -> anyhow::Result<
     })
     .await?;
     assert!(weak_runtime_session.upgrade().is_none());
+    assert_eq!(
+        terminate_requests(&state),
+        vec![CellId::new(CELL_ID.to_string())]
+    );
 
     Ok(())
 }
@@ -434,9 +514,10 @@ async fn service_shutdown_waits_for_tasks_and_preserves_the_runtime_result() -> 
     let shutdown = service.shutdown();
     tokio::pin!(shutdown);
     assert!(futures::poll!(&mut shutdown).is_pending());
-    assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 1);
+    assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 0);
     drop(permit);
     assert_eq!(shutdown.await, Err("runtime shutdown failed".to_string()));
+    assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 1);
 
     Ok(())
 }
@@ -476,17 +557,25 @@ async fn session_initialization_finishing_during_shutdown_is_rejected() -> anyho
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn service_shutdown_cancels_and_joins_the_runtime_owner() -> anyhow::Result<()> {
     let source_temp = TempDir::new()?;
     let (snapshot, _source, _path) = captured_snapshot(&source_temp).await?;
     let wait_started = Arc::new(Notify::new());
     let wait_release = Arc::new(Notify::new());
-    let state = RecordingState::new(
+    let terminate_started = Arc::new(Notify::new());
+    let terminate_release = Arc::new(Notify::new());
+    let mut state = RecordingState::new(
         Ok(yielded(CELL_ID)),
         [Ok(WaitOutcome::LiveCell(completed(CELL_ID)))],
     )
-    .block_wait(Arc::clone(&wait_started), wait_release);
+    .block_wait(Arc::clone(&wait_started), Arc::clone(&wait_release));
+    Arc::get_mut(&mut state)
+        .expect("recording state is not shared yet")
+        .terminate_block = Some((
+        Arc::clone(&terminate_started),
+        Arc::clone(&terminate_release),
+    ));
     let trace_temp = TempDir::new()?;
     let resolver = snapshot_resolver(snapshot, Arc::new(AtomicUsize::new(/*v*/ 0)));
     let exec = test_exec(
@@ -504,7 +593,18 @@ async fn service_shutdown_cancels_and_joins_the_runtime_owner() -> anyhow::Resul
     let timeout = std::time::Duration::from_secs(/*secs*/ 5);
     tokio::time::timeout(timeout, wait_started.notified()).await?;
 
-    tokio::time::timeout(timeout, session.services.code_mode_service.shutdown())
+    let shutdown = session.services.code_mode_service.shutdown();
+    tokio::pin!(shutdown);
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    wait_release.notify_one();
+    tokio::time::timeout(timeout, terminate_started.notified()).await?;
+    assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        terminate_requests(&state),
+        vec![CellId::new(CELL_ID.to_string())]
+    );
+    terminate_release.notify_one();
+    tokio::time::timeout(timeout, &mut shutdown)
         .await?
         .map_err(anyhow::Error::msg)?;
 
@@ -523,6 +623,107 @@ async fn service_shutdown_cancels_and_joins_the_runtime_owner() -> anyhow::Resul
     Ok(())
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_handles_pending_and_ready_bound_starts() -> anyhow::Result<()> {
+    let source_temp = TempDir::new()?;
+    let (snapshot, _source, _path) = captured_snapshot(&source_temp).await?;
+    for (case, release_execute) in [("pending", false), ("ready", true)] {
+        let execute_started = Arc::new(Notify::new());
+        let execute_release = Arc::new(Notify::new());
+        let mut state = RecordingState::new(Ok(completed(CELL_ID)), std::iter::empty());
+        Arc::get_mut(&mut state)
+            .expect("recording state is not shared yet")
+            .execute_block = Some((Arc::clone(&execute_started), Arc::clone(&execute_release)));
+        let trace_temp = TempDir::new()?;
+        let resolver = snapshot_resolver(snapshot.clone(), Arc::new(AtomicUsize::new(/*v*/ 0)));
+        let exec = test_exec(
+            Arc::clone(&state),
+            /*workflow_enabled*/ true,
+            /*resolver*/ Some(resolver),
+            trace_temp.path(),
+        )
+        .await?;
+        let session = Arc::clone(&exec.session);
+        let task = tokio::spawn(async move {
+            run_saved_workflow_once(&exec, "shutdown-start-call", "review").await
+        });
+        let timeout = std::time::Duration::from_secs(/*secs*/ 5);
+        tokio::time::timeout(timeout, execute_started.notified()).await?;
+
+        let shutdown = session.services.code_mode_service.shutdown();
+        tokio::pin!(shutdown);
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        if release_execute {
+            execute_release.notify_one();
+        }
+        tokio::time::timeout(timeout, &mut shutdown)
+            .await?
+            .map_err(anyhow::Error::msg)?;
+
+        assert_eq!(
+            tokio::time::timeout(timeout, task).await??,
+            Err(FunctionCallError::RespondToModel(
+                SAVED_WORKFLOW_EXECUTION_FAILED.to_string()
+            )),
+            "{case}"
+        );
+        assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 1, "{case}");
+        let expected_terminations = release_execute.then(|| vec![CellId::new(CELL_ID.to_string())]);
+        assert_eq!(
+            terminate_requests(&state),
+            expected_terminations.unwrap_or_default(),
+            "{case}"
+        );
+        assert_eq!(
+            ended_statuses(trace_temp.path())?,
+            release_execute
+                .then_some(vec![CodeCellRuntimeStatus::Failed])
+                .unwrap_or_default(),
+            "{case}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_exact_binding_fails_before_trace_or_cleanup() -> anyhow::Result<()> {
+    let source_temp = TempDir::new()?;
+    let (snapshot, _source, _path) = captured_snapshot(&source_temp).await?;
+    let state = RecordingState::new(Ok(completed(CELL_ID)), std::iter::empty());
+    let trace_temp = TempDir::new()?;
+    let resolver = snapshot_resolver(snapshot, Arc::new(AtomicUsize::new(/*v*/ 0)));
+    let exec = test_exec(
+        Arc::clone(&state),
+        /*workflow_enabled*/ true,
+        /*resolver*/ Some(resolver),
+        trace_temp.path(),
+    )
+    .await?;
+
+    for (error, expected) in [
+        (
+            SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE,
+            SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE,
+        ),
+        ("private bound-start error", SAVED_WORKFLOW_EXECUTION_FAILED),
+    ] {
+        *state.execute_error.lock().expect("execute error lock") = Some(error.to_string());
+        assert_eq!(
+            run_saved_workflow_once(&exec, "unbound-call", "review").await,
+            Err(FunctionCallError::RespondToModel(expected.to_string()))
+        );
+    }
+    assert!(terminate_requests(&state).is_empty());
+    assert!(
+        !raw_trace_events(trace_temp.path())?
+            .iter()
+            .any(|event| matches!(event.payload, RawTraceEventPayload::CodeCellStarted { .. }))
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn post_start_failures_are_redacted_and_end_the_trace() -> anyhow::Result<()> {
     let source_temp = TempDir::new()?;
@@ -533,8 +734,19 @@ async fn post_start_failures_are_redacted_and_end_the_trace() -> anyhow::Result<
             Err("private initial response error".to_string()),
             vec![],
         ),
+        ("initial identity", Ok(yielded("other-cell")), vec![]),
         (
-            "identity",
+            "wait",
+            Ok(yielded(CELL_ID)),
+            vec![Err("private wait error".to_string())],
+        ),
+        (
+            "missing",
+            Ok(yielded(CELL_ID)),
+            vec![Ok(WaitOutcome::MissingCell(completed(CELL_ID)))],
+        ),
+        (
+            "wait identity",
             Ok(yielded(CELL_ID)),
             vec![Ok(WaitOutcome::LiveCell(completed("other-cell")))],
         ),
@@ -544,7 +756,7 @@ async fn post_start_failures_are_redacted_and_end_the_trace() -> anyhow::Result<
         let state = RecordingState::new(initial_response, wait_responses);
         let trace_temp = TempDir::new()?;
         let exec = test_exec(
-            state,
+            Arc::clone(&state),
             /*workflow_enabled*/ true,
             /*resolver*/
             Some(snapshot_resolver(
@@ -562,10 +774,77 @@ async fn post_start_failures_are_redacted_and_end_the_trace() -> anyhow::Result<
             )),
             "{case}"
         );
+        if case == "initial identity" {
+            assert!(
+                !raw_trace_events(trace_temp.path())?
+                    .iter()
+                    .any(|event| matches!(
+                        event.payload,
+                        RawTraceEventPayload::CodeCellInitialResponse { .. }
+                    ))
+            );
+        }
+        assert_eq!(
+            terminate_requests(&state),
+            vec![CellId::new(CELL_ID.to_string())],
+            "{case}"
+        );
         assert_eq!(
             ended_statuses(trace_temp.path())?,
             vec![CodeCellRuntimeStatus::Failed],
             "{case}"
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_diagnostics_never_replace_the_fixed_failure() -> anyhow::Result<()> {
+    let source_temp = TempDir::new()?;
+    let (snapshot, _source, _path) = captured_snapshot(&source_temp).await?;
+    let cases = [
+        Ok(WaitOutcome::MissingCell(completed(CELL_ID))),
+        Ok(WaitOutcome::LiveCell(yielded(CELL_ID))),
+        Ok(WaitOutcome::LiveCell(completed("other-cell"))),
+        Err("private terminate error".to_string()),
+    ];
+
+    for terminate_response in cases {
+        let state = RecordingState::new(
+            Err("private initial response error".to_string()),
+            std::iter::empty(),
+        );
+        *state
+            .terminate_response
+            .lock()
+            .expect("terminate response lock") = Some(terminate_response);
+        let trace_temp = TempDir::new()?;
+        let exec = test_exec(
+            Arc::clone(&state),
+            /*workflow_enabled*/ true,
+            /*resolver*/
+            Some(snapshot_resolver(
+                snapshot.clone(),
+                Arc::new(AtomicUsize::new(/*v*/ 0)),
+            )),
+            trace_temp.path(),
+        )
+        .await?;
+
+        assert_eq!(
+            run_saved_workflow_once(&exec, "workflow-call", "review").await,
+            Err(FunctionCallError::RespondToModel(
+                SAVED_WORKFLOW_EXECUTION_FAILED.to_string()
+            ))
+        );
+        assert_eq!(
+            terminate_requests(&state),
+            vec![CellId::new(CELL_ID.to_string())]
+        );
+        assert_eq!(
+            ended_statuses(trace_temp.path())?,
+            vec![CodeCellRuntimeStatus::Failed]
         );
     }
 
@@ -730,6 +1009,14 @@ fn completed(cell_id: &str) -> RuntimeResponse {
         content_items: Vec::new(),
         error_text: None,
     }
+}
+
+fn terminate_requests(state: &RecordingState) -> Vec<CellId> {
+    state
+        .terminate_requests
+        .lock()
+        .expect("terminate lock")
+        .clone()
 }
 
 fn ended_statuses(root: &Path) -> anyhow::Result<Vec<CodeCellRuntimeStatus>> {

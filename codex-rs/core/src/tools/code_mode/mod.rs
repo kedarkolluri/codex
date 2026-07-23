@@ -117,8 +117,9 @@ impl CodeModeService {
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
         self.runtime_tasks.begin_shutdown();
+        self.runtime_tasks.wait().await;
         // Join any initialization already in progress without initializing an unused service.
-        let result = match self
+        match self
             .session
             .get_or_try_init(|| async {
                 Err::<Arc<dyn CodeModeSession>, String>(
@@ -129,9 +130,7 @@ impl CodeModeService {
         {
             Ok(session) => session.shutdown().await,
             Err(_) => Ok(()),
-        };
-        self.runtime_tasks.wait().await;
-        result
+        }
     }
 
     pub(crate) fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId) {
