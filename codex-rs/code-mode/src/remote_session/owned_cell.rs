@@ -50,10 +50,6 @@ impl StartedCellBinding for ProcessOwnedCellBinding {
     }
 
     fn terminate<'a>(&'a self) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
-        Box::pin(
-            self.session
-                .connection
-                .terminate(self.session.remote.clone(), self.cell_id.clone()),
-        )
+        Box::pin(self.session.terminate(self.cell_id.clone()))
     }
 }

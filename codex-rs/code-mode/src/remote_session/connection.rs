@@ -24,6 +24,7 @@ use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -43,6 +44,9 @@ mod reader;
 
 const IPC_CHANNEL_CAPACITY: usize = 128;
 const HOST_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const HOST_PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+type ReapResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 
 pub(super) enum ConnectionError {
     Spawn {
@@ -83,6 +87,7 @@ pub(super) struct Connection {
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
+    reap_result: ReapResultReceiver,
 }
 
 struct CallerCancellation {
@@ -99,6 +104,7 @@ struct ConnectionSupervisor {
     driver_task: JoinHandle<()>,
     reader_task: JoinHandle<Result<(), String>>,
     writer_task: JoinHandle<Result<(), String>>,
+    reap_result_tx: watch::Sender<Option<Result<(), String>>>,
 }
 
 impl CallerCancellation {
@@ -176,7 +182,7 @@ impl Connection {
         {
             Ok(result) => result,
             Err(_) => {
-                kill_and_reap(&mut child).await;
+                let _ = kill_and_reap(&mut child).await;
                 return Err(ConnectionError::Other(
                     "timed out negotiating with the code-mode host".into(),
                 ));
@@ -185,7 +191,7 @@ impl Connection {
         let capabilities = match handshake_result {
             Ok(capabilities) => capabilities,
             Err(err) => {
-                kill_and_reap(&mut child).await;
+                let _ = kill_and_reap(&mut child).await;
                 return Err(ConnectionError::Other(err));
             }
         };
@@ -196,6 +202,7 @@ impl Connection {
         let cancellation = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let failure = Arc::new(std::sync::Mutex::new(None));
+        let (reap_result_tx, reap_result) = watch::channel(None);
 
         let writer_cancellation = cancellation.clone();
         let writer_task = tokio::spawn(async move {
@@ -244,6 +251,7 @@ impl Connection {
                 driver_task,
                 reader_task,
                 writer_task,
+                reap_result_tx,
             }
             .run(),
         );
@@ -254,6 +262,7 @@ impl Connection {
             alive,
             failure,
             cancellation,
+            reap_result,
         })
     }
 
@@ -386,6 +395,23 @@ impl Connection {
             .clone()
             .unwrap_or_else(|| "code-mode host connection closed".to_string())
     }
+
+    pub(super) async fn wait_for_reap(&self) -> Result<(), String> {
+        let mut result_rx = self.reap_result.clone();
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result;
+            }
+            result_rx
+                .changed()
+                .await
+                .map_err(|_| "code-mode host process supervisor stopped".to_string())?;
+        }
+    }
+
+    pub(super) fn is_reaped(&self) -> bool {
+        self.reap_result.borrow().is_some()
+    }
 }
 
 impl Drop for Connection {
@@ -412,9 +438,11 @@ impl ConnectionSupervisor {
             result = &mut self.reader_task => task_failure("reader", result),
             result = &mut self.writer_task => task_failure("writer", result),
             result = self.child.wait() => {
-                child_exited = true;
                 match result {
-                    Ok(status) => format!("code-mode host exited with status {status}"),
+                    Ok(status) => {
+                        child_exited = true;
+                        format!("code-mode host exited with status {status}")
+                    }
                     Err(err) => format!("failed waiting for code-mode host: {err}"),
                 }
             }
@@ -422,9 +450,15 @@ impl ConnectionSupervisor {
         mark_connection_dead(&self.alive, &self.failure, reason.clone());
         let _ = self.event_tx.try_send(DriverEvent::Failed(reason));
         self.cancellation.cancel();
-        if !child_exited {
-            kill_and_reap(&mut self.child).await;
+        let reap_result = if child_exited {
+            Ok(())
+        } else {
+            kill_and_reap(&mut self.child).await
+        };
+        if let Err(error) = &reap_result {
+            warn!(diagnostic = %error, "failed to reap code-mode host process");
         }
+        self.reap_result_tx.send_replace(Some(reap_result));
     }
 }
 
@@ -461,7 +495,19 @@ fn failure_message(failure: &std::sync::Mutex<Option<String>>) -> String {
         .unwrap_or_else(|| "code-mode host connection closed".to_string())
 }
 
-async fn kill_and_reap(child: &mut Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
+async fn kill_and_reap(child: &mut Child) -> Result<(), String> {
+    let kill_result = child.start_kill();
+    match tokio::time::timeout(HOST_PROCESS_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(format!("failed waiting for code-mode host process: {error}")),
+        Err(_) => {
+            let kill_diagnostic = kill_result
+                .err()
+                .map(|error| format!(" after kill failed: {error}"))
+                .unwrap_or_default();
+            Err(format!(
+                "timed out reaping code-mode host process{kill_diagnostic}"
+            ))
+        }
+    }
 }

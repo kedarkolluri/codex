@@ -66,6 +66,7 @@ pub(in crate::remote_session::connection) enum DriverEvent {
         result: Result<DelegateResponse, String>,
     },
     RequestCancelled(RequestId),
+    RequestTimedOut(RequestId),
     Failed(String),
 }
 
@@ -189,6 +190,17 @@ impl PendingRequest {
             | Self::Execute { cancellation, .. }
             | Self::Wait { cancellation, .. } => Some(cancellation),
             Self::Terminate { .. } | Self::ShutdownSession { .. } => None,
+        }
+    }
+
+    pub(super) fn timeout_error(&self) -> Option<&'static str> {
+        match self {
+            Self::OpenSession { .. } => Some("timed out opening a code-mode host session"),
+            Self::Terminate { .. } => Some("timed out terminating a code-mode host cell"),
+            Self::ShutdownSession { .. } => {
+                Some("timed out shutting down a code-mode host session")
+            }
+            Self::Execute { .. } | Self::Wait { .. } => None,
         }
     }
 

@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use codex_code_mode_protocol::host::RequestId;
 use codex_code_mode_protocol::host::SessionId;
 use codex_code_mode_protocol::host::WireCellId;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::types::DeferredWait;
 use super::types::DriverEvent;
@@ -12,6 +14,8 @@ use super::types::InitialResponse;
 use super::types::PendingRequest;
 use super::types::RemoteSession;
 use super::types::UnclaimedExecute;
+
+const CLEANUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) enum CancellationAction {
     Send(RequestId),
@@ -23,6 +27,7 @@ pub(super) enum CancellationAction {
 
 pub(super) struct RequestTracker {
     pending: HashMap<RequestId, PendingRequest>,
+    cleanup_deadlines: HashMap<RequestId, CancellationToken>,
     unclaimed_executes: HashMap<RequestId, UnclaimedExecute>,
     initial_responses: HashMap<RequestId, InitialResponse>,
     deferred_waits: VecDeque<DeferredWait>,
@@ -33,6 +38,7 @@ impl RequestTracker {
     pub(super) fn new() -> Self {
         Self {
             pending: HashMap::new(),
+            cleanup_deadlines: HashMap::new(),
             unclaimed_executes: HashMap::new(),
             initial_responses: HashMap::new(),
             deferred_waits: VecDeque::new(),
@@ -67,6 +73,7 @@ impl RequestTracker {
         pending: PendingRequest,
         event_tx: &mpsc::Sender<DriverEvent>,
     ) {
+        let has_cleanup_deadline = pending.timeout_error().is_some();
         self.pending.insert(id, pending);
         if let Some(cancellation) = self
             .pending
@@ -75,10 +82,32 @@ impl RequestTracker {
         {
             cancellation.spawn_watcher(id, event_tx.clone());
         }
+        if has_cleanup_deadline {
+            let watcher_stop = CancellationToken::new();
+            let watcher = watcher_stop.clone();
+            let event_tx = event_tx.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    biased;
+                    _ = watcher.cancelled() => {}
+                    _ = tokio::time::sleep(CLEANUP_REQUEST_TIMEOUT) => {
+                        let _ = event_tx.send(DriverEvent::RequestTimedOut(id)).await;
+                    }
+                }
+            });
+            self.cleanup_deadlines.insert(id, watcher_stop);
+        }
     }
 
     pub(super) fn remove_pending(&mut self, id: RequestId) -> Option<PendingRequest> {
+        if let Some(watcher_stop) = self.cleanup_deadlines.remove(&id) {
+            watcher_stop.cancel();
+        }
         self.pending.remove(&id)
+    }
+
+    pub(super) fn timeout_error(&self, id: RequestId) -> Option<&'static str> {
+        self.pending.get(&id)?.timeout_error()
     }
 
     pub(super) fn insert_initial_response(&mut self, id: RequestId, response: InitialResponse) {
@@ -172,6 +201,9 @@ impl RequestTracker {
     }
 
     pub(super) fn fail_all(&mut self, reason: &str) {
+        for (_, watcher_stop) in self.cleanup_deadlines.drain() {
+            watcher_stop.cancel();
+        }
         for (_, pending) in self.pending.drain() {
             pending.fail(reason.to_string());
         }

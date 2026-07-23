@@ -130,6 +130,13 @@ impl ConnectionDriver {
             DriverEvent::HostMessage(message) => self.handle_host_message(message),
             DriverEvent::DelegateCompleted { id, result } => self.complete_delegate(id, result),
             DriverEvent::RequestCancelled(id) => self.cancel_request(id),
+            DriverEvent::RequestTimedOut(id) => {
+                let Some(reason) = self.requests.timeout_error(id) else {
+                    return true;
+                };
+                self.fail(reason.to_string());
+                false
+            }
             DriverEvent::Failed(reason) => {
                 self.fail(reason);
                 false
@@ -189,3 +196,7 @@ fn notify_cell_closed(delegate: &Arc<dyn CodeModeSessionDelegate>, cell_id: &Cel
 #[cfg(test)]
 #[path = "driver_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "driver/cleanup_timeout_tests.rs"]
+mod cleanup_timeout_tests;

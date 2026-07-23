@@ -21,6 +21,7 @@ use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::SessionId;
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
+use tracing::warn;
 
 use self::connection::Connection;
 use self::connection::ConnectionError;
@@ -137,6 +138,11 @@ impl OwnedProcessHost {
         if let Some(connection) = self.live_connection() {
             return Ok(connection);
         }
+        if let Some(connection) = self.current_connection()
+            && let Err(error) = connection.wait_for_reap().await
+        {
+            warn!(diagnostic = %error, "previous code-mode host process was not reaped cleanly");
+        }
         let new_connection = Arc::new(Connection::spawn(&self.host_program).await?);
         *self
             .connection
@@ -146,11 +152,15 @@ impl OwnedProcessHost {
     }
 
     fn live_connection(&self) -> Option<Arc<Connection>> {
+        self.current_connection()
+            .filter(|connection| connection.is_alive())
+    }
+
+    fn current_connection(&self) -> Option<Arc<Connection>> {
         self.connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .filter(|connection| connection.is_alive())
             .cloned()
     }
 
@@ -181,6 +191,36 @@ struct SessionBinding {
     cleanup: SessionCleanup,
 }
 
+impl SessionBinding {
+    async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
+        let result = self
+            .connection
+            .terminate(self.remote.clone(), cell_id)
+            .await;
+        self.wait_for_failed_connection().await;
+        result
+    }
+
+    async fn shutdown(&self) -> Result<(), String> {
+        let result = self
+            .connection
+            .shutdown_session(self.remote.clone())
+            .await;
+        self.wait_for_failed_connection().await;
+        result
+    }
+
+    async fn wait_for_failed_connection(&self) {
+        if self.connection.is_alive() {
+            return;
+        }
+        self.cleanup.wait().await;
+        if let Err(error) = self.connection.wait_for_reap().await {
+            warn!(diagnostic = %error, "code-mode host process was not reaped cleanly");
+        }
+    }
+}
+
 struct SessionInner {
     process_host: Arc<OwnedProcessHost>,
     delegate: Arc<dyn CodeModeSessionDelegate>,
@@ -188,7 +228,7 @@ struct SessionInner {
     next_generation: AtomicU64,
     shutdown_requested: AtomicBool,
     shutdown_result: StdMutex<Option<ShutdownResultReceiver>>,
-    retired_cleanups: StdMutex<Vec<SessionCleanup>>,
+    retired_cleanups: StdMutex<Vec<SessionBinding>>,
 }
 
 /// A logical code-mode session assigned to a process-owned host.
@@ -245,7 +285,7 @@ impl ProcessOwnedCodeModeSession {
 
     pub async fn terminate(&self, cell_id: CellId) -> Result<WaitOutcome, String> {
         let binding = self.connection().await?;
-        binding.connection.terminate(binding.remote, cell_id).await
+        binding.terminate(cell_id).await
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
@@ -283,7 +323,7 @@ impl SessionInner {
                         return Ok(binding.clone());
                     }
                     SessionState::Open(binding) => {
-                        self.retain_cleanup(binding.cleanup.clone());
+                        self.retain_cleanup(binding.clone());
                         *state = SessionState::New;
                         continue;
                     }
@@ -312,11 +352,24 @@ impl SessionInner {
                 let cleanup = connection
                     .open_session(remote.clone(), Arc::clone(&self.delegate))
                     .await;
-                cleanup.map(|cleanup| SessionBinding {
-                    connection,
-                    remote: remote.clone(),
-                    cleanup,
-                })
+                match cleanup {
+                    Ok(cleanup) => Ok(SessionBinding {
+                        connection,
+                        remote: remote.clone(),
+                        cleanup,
+                    }),
+                    Err(error) => {
+                        if !connection.is_alive()
+                            && let Err(reap_error) = connection.wait_for_reap().await
+                        {
+                            warn!(
+                                diagnostic = %reap_error,
+                                "failed code-mode host process was not reaped cleanly"
+                            );
+                        }
+                        Err(error)
+                    }
+                }
             }
             Err(err) => Err(err.to_string()),
         };
@@ -376,9 +429,9 @@ impl SessionInner {
                         ShutdownAction::WaitForOpen(result_rx.clone())
                     }
                     SessionState::Open(binding) if !binding.connection.is_alive() => {
-                        let cleanup = binding.cleanup.clone();
+                        let binding = binding.clone();
                         *state = SessionState::Closing;
-                        ShutdownAction::WaitForSessionCleanup(cleanup)
+                        ShutdownAction::WaitForSessionCleanup(binding)
                     }
                     SessionState::Open(binding) => {
                         let binding = binding.clone();
@@ -399,8 +452,8 @@ impl SessionInner {
                     self.wait_for_retired_cleanups().await;
                     return Ok(());
                 }
-                ShutdownAction::WaitForSessionCleanup(cleanup) => {
-                    cleanup.wait().await;
+                ShutdownAction::WaitForSessionCleanup(binding) => {
+                    binding.wait_for_failed_connection().await;
                     self.wait_for_retired_cleanups().await;
                     *self
                         .state
@@ -409,10 +462,7 @@ impl SessionInner {
                     return Ok(());
                 }
                 ShutdownAction::Close(binding) => {
-                    let result = binding.connection.shutdown_session(binding.remote).await;
-                    if result.is_err() && !binding.connection.is_alive() {
-                        binding.cleanup.wait().await;
-                    }
+                    let result = binding.shutdown().await;
                     self.wait_for_retired_cleanups().await;
                     *self
                         .state
@@ -424,14 +474,16 @@ impl SessionInner {
         }
     }
 
-    fn retain_cleanup(&self, cleanup: SessionCleanup) {
+    fn retain_cleanup(&self, binding: SessionBinding) {
         let mut retired = self
             .retired_cleanups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        retired.retain(|cleanup| !cleanup.is_complete());
-        if !cleanup.is_complete() {
-            retired.push(cleanup);
+        retired.retain(|binding| {
+            !binding.cleanup.is_complete() || !binding.connection.is_reaped()
+        });
+        if !binding.cleanup.is_complete() || !binding.connection.is_reaped() {
+            retired.push(binding);
         }
     }
 
@@ -442,8 +494,8 @@ impl SessionInner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
-        for cleanup in retired {
-            cleanup.wait().await;
+        for binding in retired {
+            binding.wait_for_failed_connection().await;
         }
     }
 }
@@ -451,7 +503,7 @@ impl SessionInner {
 enum ShutdownAction {
     WaitForOpen(watch::Receiver<Option<Result<SessionBinding, String>>>),
     Finish,
-    WaitForSessionCleanup(SessionCleanup),
+    WaitForSessionCleanup(SessionBinding),
     Close(SessionBinding),
 }
 
