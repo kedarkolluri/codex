@@ -196,7 +196,7 @@ fn workflow_output_bounds_enforce_the_aggregate_lifetime_cap() {
     };
     assert_eq!(one_under, admitted);
 
-    let one_byte_over = [text_item_with_serialized_len(2)];
+    let one_byte_over = [text_item_with_serialized_len(/*serialized_bytes*/ 2)];
     assert_eq!(
         one_under.admit(&one_byte_over),
         Err(SAVED_WORKFLOW_OUTPUT_REJECTED.to_string())
@@ -211,7 +211,8 @@ fn workflow_output_bounds_enforce_the_aggregate_lifetime_cap() {
 
 #[test]
 fn workflow_output_item_cap_counts_terminal_errors() {
-    let empty_items = vec![text_item_with_serialized_len(2); WORKFLOW_OUTPUT_MAX_ITEMS - 1];
+    let empty_items =
+        vec![text_item_with_serialized_len(/*serialized_bytes*/ 2); WORKFLOW_OUTPUT_MAX_ITEMS - 1];
     let mut bounds = WorkflowOutputBounds::default();
     assert_eq!(bounds.admit_response(&empty_items, Some("")), Ok(()));
     let full = WorkflowOutputBounds {

@@ -178,7 +178,10 @@ async fn workflow_cell_id_exhaustion_is_fatal_before_framing() {
         outgoing_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
-    assert_eq!(driver.requests.allocate_id(), Ok(RequestId::new(1)));
+    assert_eq!(
+        driver.requests.allocate_id(),
+        Ok(RequestId::new(/*value*/ 1))
+    );
 }
 
 #[test]
@@ -274,7 +277,10 @@ async fn retired_workflow_wait_and_terminate_complete_locally() {
         outgoing_rx.try_recv(),
         Err(mpsc::error::TryRecvError::Empty)
     ));
-    assert_eq!(driver.requests.allocate_id(), Ok(RequestId::new(1)));
+    assert_eq!(
+        driver.requests.allocate_id(),
+        Ok(RequestId::new(/*value*/ 1))
+    );
     let (ordinary_tx, _ordinary_rx) = oneshot::channel();
     assert!(driver.handle_command(DriverCommand::Wait {
         session,
