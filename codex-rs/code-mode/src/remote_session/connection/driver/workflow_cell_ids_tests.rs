@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
+use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
@@ -30,6 +31,7 @@ use super::super::output_admission::RemoteOutputAdmission;
 use super::CellProvenance;
 use super::ResolvedCellId;
 use super::WORKFLOW_CELL_ID_REJECTED;
+use super::WORKFLOW_CELL_ID_SPACE_EXHAUSTED;
 use super::WorkflowCellNamespace;
 use crate::NoopCodeModeSessionDelegate;
 use crate::remote_session::connection::handshake::NegotiatedCapabilities;
@@ -97,6 +99,7 @@ fn assert_ordinary(ns: &WorkflowCellNamespace, session: &RemoteSession, id: Wire
 fn negotiated_namespace_preserves_only_current_epoch_ids() {
     let namespace = WorkflowCellNamespace::V1 {
         epoch: CURRENT_EPOCH.to_string(),
+        last_sequence: 0,
     };
     let session = session(/*generation*/ 9);
     let current = workflow_cell_id(CURRENT_EPOCH, /*sequence*/ 1);
@@ -138,6 +141,46 @@ fn negotiated_namespace_preserves_only_current_epoch_ids() {
     }
 }
 
+#[tokio::test]
+async fn workflow_cell_id_exhaustion_is_fatal_before_framing() {
+    let (mut driver, mut outgoing_rx) = driver(&PAIRED_CAPABILITIES);
+    let WorkflowCellNamespace::V1 { last_sequence, .. } = &mut driver.workflow_cell_ids else {
+        panic!("paired capabilities should create a workflow namespace");
+    };
+    *last_sequence = u64::MAX;
+    let session = session(/*generation*/ 1);
+    driver.sessions.insert_ready(
+        session.clone(),
+        Arc::new(NoopCodeModeSessionDelegate),
+        SessionCleanup::new(),
+    );
+    let (response_tx, response_rx) = oneshot::channel();
+    assert!(!driver.handle_command(DriverCommand::Execute {
+        session,
+        request: ExecuteRequest {
+            tool_call_id: "exhausted".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('never framed')".to_string(),
+            output_policy: ExecuteOutputPolicy::SavedWorkflow,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        },
+        caller_cancellation: CancellationToken::new(),
+        response_tx,
+    }));
+    let error = response_rx
+        .await
+        .expect("execute reply")
+        .err()
+        .expect("exhaustion should fail execute");
+    assert_eq!(error, WORKFLOW_CELL_ID_SPACE_EXHAUSTED);
+    assert!(matches!(
+        outgoing_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(driver.requests.allocate_id(), Ok(RequestId::new(1)));
+}
+
 #[test]
 fn legacy_output_only_and_reconnect_keep_existing_generation_rules() {
     let (legacy, _) = driver(&[SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY]);
@@ -146,10 +189,16 @@ fn legacy_output_only_and_reconnect_keep_existing_generation_rules() {
     };
     let (first, _) = driver(&PAIRED_CAPABILITIES);
     let (restarted, _) = driver(&PAIRED_CAPABILITIES);
-    let WorkflowCellNamespace::V1 { epoch: first_epoch } = &first.workflow_cell_ids else {
+    let WorkflowCellNamespace::V1 {
+        epoch: first_epoch, ..
+    } = &first.workflow_cell_ids
+    else {
         panic!("paired capabilities should create a workflow namespace");
     };
-    let WorkflowCellNamespace::V1 { epoch: next_epoch } = &restarted.workflow_cell_ids else {
+    let WorkflowCellNamespace::V1 {
+        epoch: next_epoch, ..
+    } = &restarted.workflow_cell_ids
+    else {
         panic!("paired capabilities should create a workflow namespace");
     };
     assert_ne!(first_epoch, next_epoch);
@@ -175,7 +224,7 @@ fn legacy_output_only_and_reconnect_keep_existing_generation_rules() {
 #[tokio::test]
 async fn retired_workflow_wait_and_terminate_complete_locally() {
     let (mut driver, mut outgoing_rx) = driver(&PAIRED_CAPABILITIES);
-    let WorkflowCellNamespace::V1 { epoch } = &driver.workflow_cell_ids else {
+    let WorkflowCellNamespace::V1 { epoch, .. } = &driver.workflow_cell_ids else {
         panic!("paired capabilities should create a workflow namespace");
     };
     let epoch = epoch.clone();

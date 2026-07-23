@@ -11,15 +11,27 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::NotificationFuture;
+use codex_code_mode_protocol::SAVED_WORKFLOW_EXECUTION_FAILED;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::ToolInvocationFuture;
 use codex_code_mode_protocol::WaitRequest;
+use codex_code_mode_protocol::host::Capability;
+use codex_code_mode_protocol::host::CapabilitySet;
+use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::DelegateRequest;
 use codex_code_mode_protocol::host::DelegateRequestId;
+use codex_code_mode_protocol::host::EncodedFrame;
+use codex_code_mode_protocol::host::FramedReader;
+use codex_code_mode_protocol::host::FramedWriter;
+use codex_code_mode_protocol::host::HostRequest;
 use codex_code_mode_protocol::host::HostResponse;
 use codex_code_mode_protocol::host::HostToClient;
 use codex_code_mode_protocol::host::RequestId;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY;
+use codex_code_mode_protocol::host::SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY;
 use codex_code_mode_protocol::host::SessionId;
+use codex_code_mode_protocol::host::WireCellId;
+use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::WireNestedToolCall;
 use codex_code_mode_protocol::host::WireResult;
 use codex_code_mode_protocol::host::WireRuntimeResponse;
@@ -36,6 +48,8 @@ use super::DriverEvent;
 use super::DriverLifecycle;
 use super::RemoteSession;
 use super::SessionCleanup;
+use super::types::DeliveredExecute;
+use crate::remote_session::connection::handshake::NegotiatedCapabilities;
 
 struct DriverHarness {
     command_tx: mpsc::Sender<DriverCommand>,
@@ -49,10 +63,21 @@ struct DriverHarness {
 
 impl DriverHarness {
     fn start() -> Self {
-        Self::start_configured(|_| {})
+        Self::start_with_capabilities(NegotiatedCapabilities::default())
+    }
+
+    fn start_with_capabilities(capabilities: NegotiatedCapabilities) -> Self {
+        Self::start_configured_with_capabilities(capabilities, |_| {})
     }
 
     fn start_configured(configure: impl FnOnce(&mut ConnectionDriver)) -> Self {
+        Self::start_configured_with_capabilities(NegotiatedCapabilities::default(), configure)
+    }
+
+    fn start_configured_with_capabilities(
+        capabilities: NegotiatedCapabilities,
+        configure: impl FnOnce(&mut ConnectionDriver),
+    ) -> Self {
         let (command_tx, command_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (event_tx, event_rx) = mpsc::channel(/*max_capacity*/ 16);
         let (outgoing_tx, outgoing_rx) = mpsc::channel(/*max_capacity*/ 16);
@@ -63,7 +88,7 @@ impl DriverHarness {
             event_rx,
             event_tx.clone(),
             outgoing_tx,
-            crate::remote_session::connection::handshake::NegotiatedCapabilities::default(),
+            capabilities,
             DriverLifecycle {
                 alive: Arc::clone(&alive),
                 failure: Arc::new(StdMutex::new(None)),
@@ -162,6 +187,18 @@ impl DriverHarness {
             .send(delivered.request_id)
             .expect("claim execute");
         delivered.started
+    }
+
+    async fn respond_execution_started(&self, id: RequestId, cell_id: WireCellId) {
+        self.event_tx
+            .send(DriverEvent::HostMessage(HostToClient::Response {
+                id,
+                result: WireResult::Ok {
+                    value: HostResponse::ExecutionStarted { cell_id },
+                },
+            }))
+            .await
+            .expect("execute response");
     }
 
     async fn start_tool_delegate(&self, session: &RemoteSession, id: DelegateRequestId) {
@@ -327,6 +364,82 @@ fn remote_session() -> RemoteSession {
     }
 }
 
+fn negotiated_capabilities(names: &[&str]) -> NegotiatedCapabilities {
+    let selected = CapabilitySet::try_new(
+        names
+            .iter()
+            .map(|name| Capability::new(*name).expect("workflow capability")),
+    )
+    .expect("selected capabilities");
+    NegotiatedCapabilities::try_from_selected(selected).expect("negotiated capabilities")
+}
+
+fn paired_capabilities() -> NegotiatedCapabilities {
+    negotiated_capabilities(&[
+        SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY,
+        SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY,
+    ])
+}
+
+async fn decode_frame(frame: EncodedFrame) -> ClientToHost {
+    let (reader, writer) = tokio::io::duplex(/*max_buf_size*/ 4096);
+    let writer = tokio::spawn(async move {
+        FramedWriter::new(writer)
+            .write_frame(&frame)
+            .await
+            .expect("write encoded frame");
+    });
+    let message = FramedReader::new(reader)
+        .read()
+        .await
+        .expect("read encoded frame")
+        .expect("encoded frame message");
+    writer.await.expect("frame writer task");
+    message
+}
+
+async fn queue_execute(
+    harness: &mut DriverHarness,
+    session: &RemoteSession,
+    output_policy: ExecuteOutputPolicy,
+) -> (
+    oneshot::Receiver<Result<DeliveredExecute, String>>,
+    RequestId,
+    WireExecuteRequest,
+) {
+    let (response_tx, response_rx) = oneshot::channel();
+    harness
+        .command_tx
+        .send(DriverCommand::Execute {
+            session: session.clone(),
+            request: ExecuteRequest {
+                tool_call_id: "call-1".to_string(),
+                enabled_tools: Vec::new(),
+                source: "await new Promise(() => {})".to_string(),
+                output_policy,
+                yield_time_ms: Some(1),
+                max_output_tokens: None,
+            },
+            caller_cancellation: CancellationToken::new(),
+            response_tx,
+        })
+        .await
+        .expect("execute command");
+    let frame = harness.outgoing_rx.recv().await.expect("execute frame");
+    let ClientToHost::Request {
+        id,
+        request: HostRequest::Execute {
+            session_id,
+            request,
+        },
+    } = decode_frame(frame).await
+    else {
+        panic!("expected execute request frame");
+    };
+    assert_eq!(session_id, session.id);
+    (response_rx, id, request)
+}
+
 async fn next_held_delegate_event(
     events_rx: &mut mpsc::UnboundedReceiver<HeldDelegateEvent>,
 ) -> HeldDelegateEvent {
@@ -336,9 +449,8 @@ async fn next_held_delegate_event(
         .expect("delegate event stream")
 }
 
-#[tokio::test]
-async fn saved_workflow_policy_sends_no_frame_and_connection_remains_usable() {
-    let mut harness = DriverHarness::start();
+async fn assert_saved_workflow_policy_unavailable(capabilities: NegotiatedCapabilities) {
+    let mut harness = DriverHarness::start_with_capabilities(capabilities);
     let session = remote_session();
     harness
         .open(session.clone(), Arc::new(RecordingDelegate::default()))
@@ -381,6 +493,124 @@ async fn saved_workflow_policy_sends_no_frame_and_connection_remains_usable() {
         .await;
     assert_eq!(started.cell_id, CellId::new("ordinary-cell".to_string()));
     assert!(harness.alive.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn saved_workflow_policy_sends_no_frame_and_connection_remains_usable() {
+    for capabilities in [
+        NegotiatedCapabilities::default(),
+        negotiated_capabilities(&[SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY]),
+    ] {
+        assert_saved_workflow_policy_unavailable(capabilities).await;
+    }
+}
+
+#[tokio::test]
+async fn saved_execute_correlates_each_assigned_identity() {
+    let mut harness = DriverHarness::start_with_capabilities(paired_capabilities());
+    let session = remote_session();
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    let (first_rx, first_request_id, first_request) =
+        queue_execute(&mut harness, &session, ExecuteOutputPolicy::SavedWorkflow).await;
+    let first = first_request
+        .workflow_cell_id
+        .expect("first workflow cell ID");
+    let (second_rx, second_request_id, second_request) =
+        queue_execute(&mut harness, &session, ExecuteOutputPolicy::SavedWorkflow).await;
+    let second = second_request
+        .workflow_cell_id
+        .expect("second workflow cell ID");
+    assert_eq!((first.sequence(), second.sequence()), (1, 2));
+    assert_eq!(first.epoch(), second.epoch());
+
+    let first_wire = WireCellId::from(&first);
+    harness
+        .respond_execution_started(first_request_id, first_wire.clone())
+        .await;
+    let delivered = first_rx
+        .await
+        .expect("first execute reply")
+        .expect("first execute should start");
+    harness
+        .execute_claim_tx
+        .send(delivered.request_id)
+        .expect("claim first execute");
+    let started = delivered.started;
+    assert_eq!(started.cell_id, CellId::new(first.as_str().to_string()));
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::InitialResponse {
+            id: first_request_id,
+            result: WireResult::Err {
+                message: "private initial failure".to_string(),
+            },
+        }))
+        .await
+        .expect("initial response");
+    assert_eq!(
+        started.initial_response().await,
+        Err(SAVED_WORKFLOW_EXECUTION_FAILED.to_string())
+    );
+    assert!(harness.alive.load(Ordering::Acquire));
+    harness
+        .event_tx
+        .send(DriverEvent::HostMessage(HostToClient::CellClosed {
+            session_id: session.id.clone(),
+            cell_id: first_wire.clone(),
+        }))
+        .await
+        .expect("cell close");
+
+    harness
+        .start_cell(session, /*request_id*/ 4, "ordinary-cell")
+        .await;
+    harness
+        .respond_execution_started(second_request_id, first_wire)
+        .await;
+
+    assert_eq!(
+        second_rx
+            .await
+            .expect("second execute reply")
+            .err()
+            .expect("swapped identity should fail execute"),
+        SAVED_WORKFLOW_EXECUTION_FAILED
+    );
+    assert!(!harness.alive.load(Ordering::Acquire));
+    assert!(harness.outgoing_rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn ordinary_execute_cannot_claim_the_current_workflow_namespace() {
+    let mut harness = DriverHarness::start_with_capabilities(paired_capabilities());
+    let session = remote_session();
+    harness
+        .open(session.clone(), Arc::new(RecordingDelegate::default()))
+        .await;
+    let (_saved_rx, _, saved_request) =
+        queue_execute(&mut harness, &session, ExecuteOutputPolicy::SavedWorkflow).await;
+    let captured = saved_request
+        .workflow_cell_id
+        .expect("assigned workflow cell ID");
+    let (execute_rx, request_id, _) =
+        queue_execute(&mut harness, &session, ExecuteOutputPolicy::Ordinary).await;
+
+    harness
+        .respond_execution_started(request_id, captured.into())
+        .await;
+
+    assert_eq!(
+        execute_rx
+            .await
+            .expect("execute reply")
+            .err()
+            .expect("captured namespace should fail execute"),
+        "code-mode host returned an invalid execution cell identity"
+    );
+    assert!(!harness.alive.load(Ordering::Acquire));
+    assert!(harness.outgoing_rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -1123,7 +1353,7 @@ async fn cancelled_wait_is_retired_before_next_wait_is_sent() {
 
 #[tokio::test]
 async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
-    let mut harness = DriverHarness::start();
+    let mut harness = DriverHarness::start_with_capabilities(paired_capabilities());
     let session = remote_session();
     let delegate = Arc::new(RecordingDelegate::default());
     harness.open(session.clone(), delegate.clone()).await;
@@ -1137,7 +1367,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
                 tool_call_id: "call-1".to_string(),
                 enabled_tools: Vec::new(),
                 source: "await new Promise(() => {})".to_string(),
-                output_policy: ExecuteOutputPolicy::Ordinary,
+                output_policy: ExecuteOutputPolicy::SavedWorkflow,
                 yield_time_ms: Some(1),
                 max_output_tokens: None,
             },
@@ -1146,16 +1376,26 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
         })
         .await
         .expect("execute command");
-    harness.outgoing_rx.recv().await.expect("execute frame");
+    let execute_frame = harness.outgoing_rx.recv().await.expect("execute frame");
+    let ClientToHost::Request {
+        id: request_id,
+        request: HostRequest::Execute { request, .. },
+    } = decode_frame(execute_frame).await
+    else {
+        panic!("expected execute request frame");
+    };
+    let workflow_cell_id = request.workflow_cell_id.expect("assigned workflow cell ID");
+    let wire_cell_id = WireCellId::from(&workflow_cell_id);
+    let public_cell_id = CellId::new(workflow_cell_id.as_str().to_string());
     cancellation.cancel();
     drop(execute_rx);
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::Response {
-            id: RequestId::new(/*value*/ 2),
+            id: request_id,
             result: WireResult::Ok {
                 value: HostResponse::ExecutionStarted {
-                    cell_id: CellId::new("1".to_string()).into(),
+                    cell_id: wire_cell_id.clone(),
                 },
             },
         }))
@@ -1167,18 +1407,28 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
         .recv()
         .await
         .expect("execute cancellation frame");
-    harness
+    let termination_frame = harness
         .outgoing_rx
         .recv()
         .await
         .expect("abandoned cell termination frame");
+    assert_eq!(
+        decode_frame(termination_frame).await,
+        ClientToHost::Request {
+            id: RequestId::new(/*value*/ 3),
+            request: HostRequest::Terminate {
+                session_id: session.id.clone(),
+                cell_id: wire_cell_id.clone(),
+            },
+        }
+    );
     harness
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::InitialResponse {
-            id: RequestId::new(/*value*/ 2),
+            id: request_id,
             result: WireResult::Ok {
                 value: WireRuntimeResponse::Terminated {
-                    cell_id: CellId::new("1".to_string()).into(),
+                    cell_id: wire_cell_id.clone(),
                     content_items: Vec::new(),
                 },
             },
@@ -1192,7 +1442,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
             result: WireResult::Ok {
                 value: HostResponse::WaitCompleted {
                     outcome: WireWaitOutcome::LiveCell(WireRuntimeResponse::Terminated {
-                        cell_id: CellId::new("1".to_string()).into(),
+                        cell_id: wire_cell_id.clone(),
                         content_items: Vec::new(),
                     }),
                 },
@@ -1204,7 +1454,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
         .event_tx
         .send(DriverEvent::HostMessage(HostToClient::CellClosed {
             session_id: session.id,
-            cell_id: CellId::new("1".to_string()).into(),
+            cell_id: wire_cell_id,
         }))
         .await
         .expect("cell close");
@@ -1213,7 +1463,7 @@ async fn abandoned_execute_is_tracked_and_terminated_after_admission() {
     assert!(harness.alive.load(Ordering::Acquire));
     assert_eq!(
         *delegate.closed_cells.lock().expect("closed cells lock"),
-        vec![CellId::new("1".to_string())]
+        vec![public_cell_id]
     );
 }
 
