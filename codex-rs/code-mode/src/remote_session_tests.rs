@@ -86,8 +86,8 @@ async fn provider_falls_back_to_in_process_session_when_host_is_missing() {
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
         .expect("missing host should fall back to an in-process session");
-    let error = session
-        .execute(ExecuteRequest {
+    let error = Arc::clone(&session)
+        .execute_bound(ExecuteRequest {
             tool_call_id: "call-saved".to_string(),
             enabled_tools: Vec::new(),
             source: "text('unreachable')".to_string(),
