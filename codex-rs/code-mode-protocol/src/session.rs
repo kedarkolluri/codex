@@ -10,8 +10,10 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use crate::CodeModeNestedToolCall;
+use crate::ExecuteOutputPolicy;
 use crate::ExecuteRequest;
 use crate::RuntimeResponse;
+use crate::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use crate::WaitOutcome;
 use crate::WaitRequest;
 
@@ -22,6 +24,9 @@ pub type CodeModeSessionProviderFuture<'a> =
 pub type ToolInvocationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<JsonValue, String>> + Send + 'a>>;
 pub type NotificationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+const STARTED_CELL_BINDING_UNAVAILABLE: &str = "exact started-cell binding is unavailable";
+const STARTED_CELL_BINDING_IDENTITY_MISMATCH: &str = "started-cell binding identity mismatch";
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CellId(String);
@@ -84,6 +89,48 @@ impl StartedCell {
     }
 }
 
+/// Operations pinned to the session binding and generation that started one cell.
+///
+/// Implementations must retain the exact transport/session authority used by the
+/// corresponding execute request. They must never reconnect or resolve a newer
+/// session generation while waiting for or terminating the cell.
+pub trait StartedCellBinding: Send + Sync {
+    fn cell_id(&self) -> &CellId;
+
+    fn wait<'a>(&'a self, yield_time_ms: u64) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
+
+    fn terminate<'a>(&'a self) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
+}
+
+/// A started cell paired with operations bound to its exact session generation.
+pub struct BoundStartedCell {
+    started_cell: StartedCell,
+    binding: Arc<dyn StartedCellBinding>,
+}
+
+impl BoundStartedCell {
+    pub fn new(
+        started_cell: StartedCell,
+        binding: Arc<dyn StartedCellBinding>,
+    ) -> Result<Self, String> {
+        if &started_cell.cell_id != binding.cell_id() {
+            return Err(STARTED_CELL_BINDING_IDENTITY_MISMATCH.to_string());
+        }
+        Ok(Self {
+            started_cell,
+            binding,
+        })
+    }
+
+    pub fn cell_id(&self) -> &CellId {
+        &self.started_cell.cell_id
+    }
+
+    pub fn into_parts(self) -> (StartedCell, Arc<dyn StartedCellBinding>) {
+        (self.started_cell, self.binding)
+    }
+}
+
 /// Host callbacks used by a code-mode session while cells are executing.
 pub trait CodeModeSessionDelegate: Send + Sync {
     fn invoke_tool<'a>(
@@ -114,6 +161,22 @@ pub trait CodeModeSession: Send + Sync {
         &'a self,
         request: ExecuteRequest,
     ) -> CodeModeSessionResultFuture<'a, StartedCell>;
+
+    /// Starts a cell and returns operations pinned to the exact starting session generation.
+    ///
+    /// Implementations that cannot preserve that binding must fail instead of
+    /// falling back to the reconnecting [`Self::wait`] and [`Self::terminate`]
+    /// methods.
+    fn execute_bound(
+        self: Arc<Self>,
+        request: ExecuteRequest,
+    ) -> CodeModeSessionResultFuture<'static, BoundStartedCell> {
+        let error = match request.output_policy {
+            ExecuteOutputPolicy::Ordinary => STARTED_CELL_BINDING_UNAVAILABLE,
+            ExecuteOutputPolicy::SavedWorkflow => SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE,
+        };
+        Box::pin(async move { Err(error.to_string()) })
+    }
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome>;
 

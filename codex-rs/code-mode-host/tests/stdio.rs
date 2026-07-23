@@ -746,10 +746,11 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
 
     let mut request_b = execute_request("await new Promise(() => {});");
     request_b.yield_time_ms = Some(1);
-    let started_b = session_b
-        .execute(request_b)
+    let started_b = Arc::clone(&session_b)
+        .execute_bound(request_b)
         .await
         .expect("start second cell");
+    let (started_b, binding_b) = started_b.into_parts();
     let cell_b = started_b.cell_id.clone();
     assert_eq!(
         started_b
@@ -772,15 +773,9 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
             })
             .await
     });
-    let wait_b_session = Arc::clone(&session_b);
-    let wait_b_cell = cell_b.clone();
+    let wait_b_binding = Arc::clone(&binding_b);
     let wait_b = tokio::spawn(async move {
-        wait_b_session
-            .wait(WaitRequest {
-                cell_id: wait_b_cell,
-                yield_time_ms: 60_000,
-            })
-            .await
+        wait_b_binding.wait(/*yield_time_ms*/ 60_000).await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -809,13 +804,11 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
             .expect("first wait task")
             .is_err()
     );
-    assert!(
-        tokio::time::timeout(Duration::from_secs(5), wait_b)
-            .await
-            .expect("second wait failure timeout")
-            .expect("second wait task")
-            .is_err()
-    );
+    let bound_wait_error = tokio::time::timeout(Duration::from_secs(5), wait_b)
+        .await
+        .expect("second wait failure timeout")
+        .expect("second wait task")
+        .expect_err("bound wait should fail with its original connection");
     let closure_events = [
         next_callback_event(&mut events_a).await,
         next_callback_event(&mut events_a).await,
@@ -847,6 +840,11 @@ async fn child_process_loss_cleans_up_and_rebuilds_the_shared_host() {
             }],
             error_text: None,
         }
+    );
+    assert_eq!(
+        binding_b.terminate().await,
+        Err(bound_wait_error),
+        "bound cell control followed the session onto its replacement connection"
     );
     let stale_error = session_b
         .wait(WaitRequest {

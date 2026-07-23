@@ -16,7 +16,6 @@ use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_code_mode::RuntimeResponse;
 use codex_code_mode::ToolInvocationFuture;
 use codex_code_mode::WaitOutcome;
-use codex_code_mode::WaitRequest;
 use codex_code_mode::host::WireWorkflowCellId;
 use pretty_assertions::assert_eq;
 use tokio_util::sync::CancellationToken;
@@ -84,13 +83,14 @@ async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() 
         .create_session(delegate.clone())
         .await
         .expect("create remote session");
-    let completed = session
-        .execute(execute_request(
+    let completed = Arc::clone(&session)
+        .execute_bound(execute_request(
             r#"text("before"); yield_control(); text("after");"#,
             ExecuteOutputPolicy::SavedWorkflow,
         ))
         .await
         .expect("start saved workflow");
+    let (completed, completed_binding) = completed.into_parts();
     let completed_cell_id = completed.cell_id.clone();
     let completed_identity = WireWorkflowCellId::try_new(completed_cell_id.as_str())
         .expect("client-assigned workflow cell ID");
@@ -109,11 +109,8 @@ async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() 
         }
     );
     assert_eq!(
-        session
-            .wait(WaitRequest {
-                cell_id: completed_cell_id.clone(),
-                yield_time_ms: 60_000,
-            })
+        completed_binding
+            .wait(/*yield_time_ms*/ 60_000)
             .await
             .expect("wait for saved workflow completion"),
         WaitOutcome::LiveCell(RuntimeResponse::Result {
@@ -124,7 +121,29 @@ async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() 
             error_text: None,
         })
     );
+    drop(completed_binding);
 
+    let mut pending_request = execute_request(
+        "await new Promise(() => {});",
+        ExecuteOutputPolicy::SavedWorkflow,
+    );
+    pending_request.yield_time_ms = Some(1);
+    let pending = Arc::clone(&session)
+        .execute_bound(pending_request)
+        .await
+        .expect("start pending saved workflow");
+    let (pending, pending_binding) = pending.into_parts();
+    let pending_cell_id = pending.cell_id.clone();
+    assert_eq!(
+        pending
+            .initial_response()
+            .await
+            .expect("pending saved workflow initial response"),
+        RuntimeResponse::Yielded {
+            cell_id: pending_cell_id.clone(),
+            content_items: Vec::new(),
+        }
+    );
     let ordinary_cell_id = CellId::new("1".to_string());
     let ordinary_response = session
         .execute(execute_request(
@@ -146,7 +165,31 @@ async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() 
             error_text: None,
         }
     );
-    session.shutdown().await.expect("shutdown remote session");
+
+    let weak_session = Arc::downgrade(&session);
+    drop(session);
+    assert!(
+        weak_session.upgrade().is_some(),
+        "bound cell control must retain its starting session"
+    );
+    assert_eq!(
+        pending_binding
+            .terminate()
+            .await
+            .expect("terminate pending saved workflow"),
+        WaitOutcome::LiveCell(RuntimeResponse::Terminated {
+            cell_id: pending_cell_id.clone(),
+            content_items: Vec::new(),
+        })
+    );
+    let retained_session = weak_session.upgrade().expect("retained remote session");
+    retained_session
+        .shutdown()
+        .await
+        .expect("shutdown retained remote session");
+    drop(retained_session);
+    drop(pending_binding);
+    assert!(weak_session.upgrade().is_none());
 
     let mut closed_cells = delegate
         .closed_cells
@@ -154,7 +197,7 @@ async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() 
         .expect("closed cells lock")
         .clone();
     closed_cells.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    let mut expected_closed_cells = vec![completed_cell_id, ordinary_cell_id];
+    let mut expected_closed_cells = vec![completed_cell_id, pending_cell_id, ordinary_cell_id];
     expected_closed_cells.sort_by(|left, right| left.as_str().cmp(right.as_str()));
     assert_eq!(closed_cells, expected_closed_cells);
 }

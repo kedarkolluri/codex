@@ -7,6 +7,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_code_mode_protocol::BoundStartedCell;
 use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSession;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
@@ -28,6 +29,7 @@ use self::connection::SessionCleanup;
 use crate::NoopCodeModeSessionDelegate;
 
 mod connection;
+mod owned_cell;
 
 const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
 
@@ -226,6 +228,14 @@ impl ProcessOwnedCodeModeSession {
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
         let binding = self.connection().await?;
         binding.connection.execute(binding.remote, request).await
+    }
+
+    pub async fn execute_bound(
+        self: Arc<Self>,
+        request: ExecuteRequest,
+    ) -> Result<BoundStartedCell, String> {
+        let session = self.connection().await?;
+        owned_cell::execute(self, session, request).await
     }
 
     pub async fn wait(&self, request: WaitRequest) -> Result<WaitOutcome, String> {
@@ -482,6 +492,13 @@ impl CodeModeSession for ProcessOwnedCodeModeSession {
         request: ExecuteRequest,
     ) -> CodeModeSessionResultFuture<'a, StartedCell> {
         Box::pin(ProcessOwnedCodeModeSession::execute(self, request))
+    }
+
+    fn execute_bound(
+        self: Arc<Self>,
+        request: ExecuteRequest,
+    ) -> CodeModeSessionResultFuture<'static, BoundStartedCell> {
+        Box::pin(ProcessOwnedCodeModeSession::execute_bound(self, request))
     }
 
     fn wait<'a>(&'a self, request: WaitRequest) -> CodeModeSessionResultFuture<'a, WaitOutcome> {
