@@ -86,6 +86,21 @@ async fn provider_falls_back_to_in_process_session_when_host_is_missing() {
         .create_session(Arc::new(NoopCodeModeSessionDelegate))
         .await
         .expect("missing host should fall back to an in-process session");
+    let error = session
+        .execute(ExecuteRequest {
+            tool_call_id: "call-saved".to_string(),
+            enabled_tools: Vec::new(),
+            source: "text('unreachable')".to_string(),
+            output_policy: ExecuteOutputPolicy::SavedWorkflow,
+            yield_time_ms: None,
+            max_output_tokens: None,
+        })
+        .await
+        .err()
+        .expect("in-process fallback should reject saved workflow execution");
+
+    assert_eq!(error, SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE);
+
     let response = session
         .execute(ExecuteRequest {
             tool_call_id: "call-1".to_string(),
@@ -135,7 +150,7 @@ async fn shutdown_before_open_does_not_spawn_the_host() {
 }
 
 #[tokio::test]
-async fn saved_execute_is_rejected_before_opening_the_host() {
+async fn saved_execute_attempts_to_open_the_process_host() {
     let process_host = Arc::new(OwnedProcessHost::new("host-must-not-start".into()));
     let session = ProcessOwnedCodeModeSession::with_process_host(
         Arc::new(NoopCodeModeSessionDelegate),
@@ -152,10 +167,13 @@ async fn saved_execute_is_rejected_before_opening_the_host() {
         })
         .await
         .err()
-        .expect("saved execute should be rejected");
+        .expect("saved execute should attempt to open the process host");
 
-    assert_eq!(error, SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE);
-    assert_eq!(process_host.next_session_id.load(Ordering::Relaxed), 1);
+    assert!(
+        error.starts_with("failed to spawn code-mode host host-must-not-start:"),
+        "unexpected spawn error: {error}"
+    );
+    assert_eq!(process_host.next_session_id.load(Ordering::Relaxed), 2);
     assert!(matches!(
         *session
             .inner

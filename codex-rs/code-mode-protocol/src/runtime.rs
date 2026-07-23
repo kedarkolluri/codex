@@ -11,7 +11,7 @@ use crate::ToolDefinition;
 pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
 pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
 pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
-/// Fixed error returned while saved-workflow output remains unavailable.
+/// Fixed error returned when a session backend cannot provide saved-workflow output.
 pub const SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE: &str =
     "saved workflow output policy is unavailable";
 
@@ -22,7 +22,8 @@ pub enum ExecuteOutputPolicy {
     /// Public `exec` behavior, including asynchronous delegate notifications.
     #[default]
     Ordinary,
-    /// Reserved saved-workflow behavior, unavailable until its bounded output contract is active.
+    /// Bounded output behavior whose availability depends on the session backend
+    /// and its negotiated host capabilities.
     SavedWorkflow,
 }
 

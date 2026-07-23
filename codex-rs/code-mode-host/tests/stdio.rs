@@ -21,12 +21,12 @@ use codex_code_mode::FunctionCallOutputContentItem;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ProcessOwnedCodeModeSessionProvider;
 use codex_code_mode::RuntimeResponse;
-use codex_code_mode::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode::ToolDefinition;
 use codex_code_mode::ToolInvocationFuture;
 use codex_code_mode::WaitOutcome;
 use codex_code_mode::WaitRequest;
 use codex_code_mode::host::MAX_FRAME_BYTES;
+use codex_code_mode::host::WireWorkflowCellId;
 use codex_protocol::ToolName;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -218,25 +218,64 @@ fn execute_request(source: &str) -> ExecuteRequest {
 }
 
 #[tokio::test]
-async fn saved_workflow_rejection_does_not_terminate_the_host_process() {
+async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() {
     let provider = ProcessOwnedCodeModeSessionProvider::with_host_program(
         codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").expect("host binary"),
     );
+    let delegate = Arc::new(RecordingDelegate::default());
     let session = provider
-        .create_session(Arc::new(RecordingDelegate::default()))
+        .create_session(delegate.clone())
         .await
         .expect("create remote session");
-    let mut request = execute_request(r#"text("unreachable");"#);
-    request.output_policy = ExecuteOutputPolicy::SavedWorkflow;
+    let mut completed_request =
+        execute_request(r#"text("before"); yield_control(); text("after");"#);
+    completed_request.output_policy = ExecuteOutputPolicy::SavedWorkflow;
+    let completed = session
+        .execute(completed_request)
+        .await
+        .expect("start saved workflow");
+    let completed_cell_id = completed.cell_id.clone();
+    let completed_identity = WireWorkflowCellId::try_new(completed_cell_id.as_str())
+        .expect("client-assigned workflow cell ID");
 
     assert_eq!(
-        session.execute(request).await.err().as_deref(),
-        Some(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE)
+        completed_identity.sequence(),
+        1,
     );
+    assert_eq!(
+        completed
+            .initial_response()
+            .await
+            .expect("saved workflow initial response"),
+        RuntimeResponse::Yielded {
+            cell_id: completed_cell_id.clone(),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "before".to_string(),
+            }],
+        }
+    );
+    assert_eq!(
+        session
+            .wait(WaitRequest {
+                cell_id: completed_cell_id.clone(),
+                yield_time_ms: 60_000,
+            })
+            .await
+            .expect("wait for saved workflow completion"),
+        WaitOutcome::LiveCell(RuntimeResponse::Result {
+            cell_id: completed_cell_id.clone(),
+            content_items: vec![FunctionCallOutputContentItem::InputText {
+                text: "after".to_string(),
+            }],
+            error_text: None,
+        })
+    );
+
+    let ordinary_cell_id = cell_id("1");
     assert_eq!(
         execute(&session, execute_request(r#"text("ordinary");"#)).await,
         RuntimeResponse::Result {
-            cell_id: cell_id("1"),
+            cell_id: ordinary_cell_id.clone(),
             content_items: vec![FunctionCallOutputContentItem::InputText {
                 text: "ordinary".to_string(),
             }],
@@ -244,6 +283,16 @@ async fn saved_workflow_rejection_does_not_terminate_the_host_process() {
         }
     );
     session.shutdown().await.expect("shutdown remote session");
+
+    let mut closed_cells = delegate
+        .closed_cells
+        .lock()
+        .expect("closed cells lock")
+        .clone();
+    closed_cells.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let mut expected_closed_cells = vec![completed_cell_id, ordinary_cell_id];
+    expected_closed_cells.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    assert_eq!(closed_cells, expected_closed_cells);
 }
 
 async fn execute(session: &Arc<dyn CodeModeSession>, request: ExecuteRequest) -> RuntimeResponse {
