@@ -14,6 +14,7 @@ use codex_code_mode_protocol::host::WireCellId;
 use pretty_assertions::assert_eq;
 
 use super::NegotiatedCapabilities;
+use super::NegotiatedWorkflowCellIdentity;
 use super::negotiate;
 
 async fn negotiate_with_response(response: HostToClient) -> Result<NegotiatedCapabilities, String> {
@@ -91,6 +92,10 @@ async fn client_requires_v2_and_accepts_only_offered_capabilities() {
             selected: selected_capabilities,
         }
     );
+    assert_eq!(
+        result.workflow_cell_identity(),
+        NegotiatedWorkflowCellIdentity::V1
+    );
 }
 
 #[tokio::test]
@@ -99,6 +104,11 @@ async fn client_accepts_legacy_saved_output_selection() {
         Capability::new(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY).expect("saved output capability")
     ])
     .expect("selected capabilities");
+    let legacy_identity = NegotiatedCapabilities {
+        selected: selected.clone(),
+    }
+    .workflow_cell_identity();
+    assert_eq!(legacy_identity, NegotiatedWorkflowCellIdentity::Unavailable);
     assert_eq!(
         negotiate_with_response(HostToClient::HostHello(HostHello::new(
             ProtocolVersion::V2,

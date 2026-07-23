@@ -141,27 +141,27 @@ impl ConnectionDriver {
                     // The host owns a checked, never-reused ID sequence. Retain only live
                     // IDs so client memory scales with concurrency, not session lifetime.
                     let remote_cell_id = cell_id.clone();
-                    let public_id =
-                        match self
-                            .sessions
-                            .admit_cell(&session, cell_id, output_admission.clone())
-                        {
-                            Ok(public_id) => public_id,
-                            Err(CellAdmissionError::MissingSession) => {
-                                let (reason, admission) = output_admission.admit_error(
-                                    "code-mode session closed during execute".to_string(),
-                                );
-                                return self.deliver_admitted(response_tx, Err(reason), admission);
-                            }
-                            Err(CellAdmissionError::DuplicateCell) => {
-                                let reason = format!(
-                                    "code-mode host reused live cell {} in session {}",
-                                    remote_cell_id.as_str(),
-                                    session.id
-                                );
-                                return self.fail_admitted(response_tx, reason, &output_admission);
-                            }
-                        };
+                    let public_id = match self.sessions.admit_cell(
+                        &session,
+                        cell_id,
+                        output_admission.clone(),
+                        &self.workflow_cell_ids,
+                    ) {
+                        Ok(public_id) => public_id,
+                        Err(CellAdmissionError::MissingSession) => {
+                            let (reason, admission) = output_admission
+                                .admit_error("code-mode session closed during execute".to_string());
+                            return self.deliver_admitted(response_tx, Err(reason), admission);
+                        }
+                        Err(CellAdmissionError::DuplicateCell) => {
+                            let reason = format!(
+                                "code-mode host reused live cell {} in session {}",
+                                remote_cell_id.as_str(),
+                                session.id
+                            );
+                            return self.fail_admitted(response_tx, reason, &output_admission);
+                        }
+                    };
                     self.requests.insert_initial_response(
                         id,
                         InitialResponse {

@@ -4,6 +4,7 @@ use codex_code_mode_protocol::CellId;
 use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
+use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
@@ -16,8 +17,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::ConnectionDriver;
-use super::cell_ids::remote_cell_id;
-use super::cell_ids::remote_wait_request;
 use super::output_admission::RemoteOutputAdmission;
 use super::types::CancellableRequest;
 use super::types::DeferredWait;
@@ -25,6 +24,8 @@ use super::types::DeliveredExecute;
 use super::types::DriverCommand;
 use super::types::PendingRequest;
 use super::types::RemoteSession;
+use super::workflow_cell_ids::CellProvenance;
+use super::workflow_cell_ids::ResolvedCellId;
 
 impl ConnectionDriver {
     pub(super) fn handle_command(&mut self, command: DriverCommand) -> bool {
@@ -193,20 +194,34 @@ impl ConnectionDriver {
             return true;
         }
         let public_id = request.cell_id.clone();
-        let request = match remote_wait_request(&session, request) {
-            Ok(request) => request,
+        let resolved = match self.workflow_cell_ids.remote_cell_id(&session, &public_id) {
+            Ok(resolved) => resolved,
             Err(err) => {
                 let _ = response_tx.send(Err(err));
                 return true;
             }
         };
-        let output_admission = match self.sessions.cell_output(&session, &request.cell_id) {
-            Ok(Some(output_admission)) => output_admission,
-            Ok(None) => RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
-            Err(err) => {
+        let ResolvedCellId {
+            wire_id,
+            provenance,
+        } = resolved;
+        let output_admission = match (self.sessions.cell_output(&session, &wire_id), provenance) {
+            (Ok(Some(output_admission)), _) => output_admission,
+            (Ok(None), CellProvenance::SavedWorkflow) => {
+                let _ = response_tx.send(Ok(missing_cell_outcome(public_id)));
+                return true;
+            }
+            (Ok(None), CellProvenance::Ordinary) => {
+                RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary)
+            }
+            (Err(err), _) => {
                 let _ = response_tx.send(Err(err));
                 return true;
             }
+        };
+        let request = WireWaitRequest {
+            cell_id: wire_id,
+            yield_time_ms: request.yield_time_ms,
         };
         if self.requests.has_cancelled_wait(&session, &request.cell_id) {
             self.requests.push_deferred_wait(DeferredWait {
@@ -266,17 +281,27 @@ impl ConnectionDriver {
             return true;
         }
         let public_id = cell_id.clone();
-        let cell_id = match remote_cell_id(&session, &cell_id) {
-            Ok(cell_id) => cell_id,
+        let resolved = match self.workflow_cell_ids.remote_cell_id(&session, &cell_id) {
+            Ok(resolved) => resolved,
             Err(err) => {
                 let _ = response_tx.send(Err(err));
                 return true;
             }
         };
-        let output_admission = match self.sessions.cell_output(&session, &cell_id) {
-            Ok(Some(output_admission)) => output_admission,
-            Ok(None) => RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary),
-            Err(err) => {
+        let ResolvedCellId {
+            wire_id: cell_id,
+            provenance,
+        } = resolved;
+        let output_admission = match (self.sessions.cell_output(&session, &cell_id), provenance) {
+            (Ok(Some(output_admission)), _) => output_admission,
+            (Ok(None), CellProvenance::SavedWorkflow) => {
+                let _ = response_tx.send(Ok(missing_cell_outcome(public_id)));
+                return true;
+            }
+            (Ok(None), CellProvenance::Ordinary) => {
+                RemoteOutputAdmission::new(ExecuteOutputPolicy::Ordinary)
+            }
+            (Err(err), _) => {
                 let _ = response_tx.send(Err(err));
                 return true;
             }
@@ -341,4 +366,12 @@ impl ConnectionDriver {
             .insert_pending(request_id, pending, &self.event_tx);
         self.queue_frame(frame)
     }
+}
+
+fn missing_cell_outcome(cell_id: CellId) -> WaitOutcome {
+    WaitOutcome::MissingCell(RuntimeResponse::Result {
+        error_text: Some(format!("exec cell {cell_id} not found")),
+        cell_id,
+        content_items: Vec::new(),
+    })
 }

@@ -60,7 +60,12 @@ async fn dropped_terminate_caller_still_records_terminal_before_cell_close() {
     let output_admission = saved_admission();
     let public_cell_id = driver
         .sessions
-        .admit_cell(&session, remote_cell_id.clone(), output_admission.clone())
+        .admit_cell(
+            &session,
+            remote_cell_id.clone(),
+            output_admission.clone(),
+            &driver.workflow_cell_ids,
+        )
         .unwrap_or_else(|_| panic!("live cell"));
     let initial_id = RequestId::new(/*value*/ 9);
     let initial_rx = insert_initial(&mut driver, initial_id, "cell", output_admission);
