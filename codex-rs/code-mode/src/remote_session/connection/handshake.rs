@@ -27,6 +27,22 @@ pub(super) struct NegotiatedCapabilities {
     selected: CapabilitySet,
 }
 
+impl NegotiatedCapabilities {
+    pub(super) fn try_from_selected(selected: CapabilitySet) -> Result<Self, String> {
+        let output = selected.contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
+        let identity = selected.contains_name(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY);
+        if identity && !output {
+            Err(HOST_SELECTED_INVALID_WORKFLOW_CAPABILITIES.to_string())
+        } else {
+            Ok(Self { selected })
+        }
+    }
+
+    pub(super) fn selected(&self) -> &CapabilitySet {
+        &self.selected
+    }
+}
+
 pub(super) async fn negotiate<R, W>(
     reader: &mut FramedReader<R>,
     writer: &mut FramedWriter<W>,
@@ -68,13 +84,7 @@ where
             }) {
                 return Err(HOST_SELECTED_UNOFFERED_CAPABILITY.to_string());
             }
-            let selected = hello.capabilities().clone();
-            let selected_output = selected.contains_name(SAVED_WORKFLOW_OUTPUT_V1_CAPABILITY);
-            let selected_identity = selected.contains_name(SAVED_WORKFLOW_CELL_ID_V1_CAPABILITY);
-            if selected_identity && !selected_output {
-                return Err(HOST_SELECTED_INVALID_WORKFLOW_CAPABILITIES.to_string());
-            }
-            Ok(NegotiatedCapabilities { selected })
+            NegotiatedCapabilities::try_from_selected(hello.capabilities().clone())
         }
         Some(HostToClient::HandshakeRejected { .. }) => Err(HOST_REJECTED_HANDSHAKE.to_string()),
         Some(_) => Err(HOST_RETURNED_INVALID_HANDSHAKE.to_string()),

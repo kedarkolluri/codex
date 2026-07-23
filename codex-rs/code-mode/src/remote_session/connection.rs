@@ -182,10 +182,13 @@ impl Connection {
                 ));
             }
         };
-        if let Err(err) = handshake_result {
-            kill_and_reap(&mut child).await;
-            return Err(ConnectionError::Other(err));
-        }
+        let capabilities = match handshake_result {
+            Ok(capabilities) => capabilities,
+            Err(err) => {
+                kill_and_reap(&mut child).await;
+                return Err(ConnectionError::Other(err));
+            }
+        };
 
         let (command_tx, command_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(IPC_CHANNEL_CAPACITY);
@@ -223,6 +226,7 @@ impl Connection {
             event_rx,
             event_tx.clone(),
             outgoing_tx,
+            capabilities,
             DriverLifecycle {
                 alive: Arc::clone(&alive),
                 failure: Arc::clone(&failure),

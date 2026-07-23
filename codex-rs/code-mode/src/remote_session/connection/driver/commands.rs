@@ -10,6 +10,7 @@ use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
 use codex_code_mode_protocol::host::EncodedFrame;
 use codex_code_mode_protocol::host::HostRequest;
+use codex_code_mode_protocol::host::WireExecuteRequest;
 use codex_code_mode_protocol::host::WireWaitRequest;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -130,15 +131,16 @@ impl ConnectionDriver {
             request.output_policy,
             self.terminal_echo_budget.clone(),
         );
-        let request = match request.try_into() {
-            Ok(request) => request,
-            Err(err) => {
-                let _ = response_tx.send(Err(format!(
-                    "failed to encode code-mode execute request: {err}"
-                )));
-                return true;
-            }
-        };
+        let request =
+            match WireExecuteRequest::try_from_domain(request, self.capabilities.selected()) {
+                Ok(request) => request,
+                Err(err) => {
+                    let _ = response_tx.send(Err(format!(
+                        "failed to encode code-mode execute request: {err}"
+                    )));
+                    return true;
+                }
+            };
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
             Err(err) => {

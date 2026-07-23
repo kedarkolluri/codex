@@ -45,6 +45,7 @@ pub(super) struct ConnectionDriver {
     sessions: SessionRegistry,
     delegates: DelegateRuntime,
     terminal_echo_budget: TerminalEchoBudget,
+    capabilities: super::handshake::NegotiatedCapabilities,
     alive: Arc<AtomicBool>,
     failure: Arc<std::sync::Mutex<Option<String>>>,
     cancellation: CancellationToken,
@@ -57,6 +58,7 @@ impl ConnectionDriver {
         event_rx: mpsc::Receiver<DriverEvent>,
         event_tx: mpsc::Sender<DriverEvent>,
         outgoing_tx: mpsc::Sender<EncodedFrame>,
+        capabilities: super::handshake::NegotiatedCapabilities,
         lifecycle: DriverLifecycle,
     ) -> (Self, mpsc::UnboundedSender<RequestId>) {
         let (execute_claim_tx, execute_claim_rx) = mpsc::unbounded_channel();
@@ -71,6 +73,7 @@ impl ConnectionDriver {
                 sessions: SessionRegistry::new(),
                 delegates: DelegateRuntime::new(event_tx),
                 terminal_echo_budget: TerminalEchoBudget::new(),
+                capabilities,
                 alive: lifecycle.alive,
                 failure: lifecycle.failure,
                 cancellation: lifecycle.cancellation,
