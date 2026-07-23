@@ -56,6 +56,8 @@ const CELL_ID: &str = "saved-cell";
 
 struct RecordingState {
     create_count: AtomicUsize,
+    shutdown_count: AtomicUsize,
+    shutdown_result: Mutex<Result<(), String>>,
     requests: Mutex<Vec<ExecuteRequest>>,
     wait_requests: Mutex<Vec<WaitRequest>>,
     initial_response: Mutex<Option<Result<RuntimeResponse, String>>>,
@@ -70,6 +72,8 @@ impl RecordingState {
     ) -> Arc<Self> {
         Arc::new(Self {
             create_count: AtomicUsize::new(/*v*/ 0),
+            shutdown_count: AtomicUsize::new(/*v*/ 0),
+            shutdown_result: Mutex::new(Ok(())),
             requests: Mutex::new(Vec::new()),
             wait_requests: Mutex::new(Vec::new()),
             initial_response: Mutex::new(Some(initial_response)),
@@ -87,6 +91,7 @@ impl RecordingState {
 
 struct RecordingProvider {
     state: Arc<RecordingState>,
+    create_block: Option<(Arc<Notify>, Arc<Notify>)>,
 }
 
 impl CodeModeSessionProvider for RecordingProvider {
@@ -94,11 +99,18 @@ impl CodeModeSessionProvider for RecordingProvider {
         &'a self,
         _delegate: Arc<dyn CodeModeSessionDelegate>,
     ) -> CodeModeSessionProviderFuture<'a> {
-        self.state.create_count.fetch_add(1, Ordering::SeqCst);
-        let session: Arc<dyn CodeModeSession> = Arc::new(RecordingSession {
-            state: Arc::clone(&self.state),
-        });
-        Box::pin(async move { Ok(session) })
+        let state = Arc::clone(&self.state);
+        let create_block = self.create_block.clone();
+        Box::pin(async move {
+            state.create_count.fetch_add(1, Ordering::SeqCst);
+            if let Some((started, release)) = create_block {
+                let released = release.notified();
+                started.notify_one();
+                released.await;
+            }
+            let session: Arc<dyn CodeModeSession> = Arc::new(RecordingSession { state });
+            Ok(session)
+        })
     }
 }
 
@@ -157,7 +169,14 @@ impl CodeModeSession for RecordingSession {
     }
 
     fn shutdown<'a>(&'a self) -> CodeModeSessionResultFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
+        self.state.shutdown_count.fetch_add(1, Ordering::SeqCst);
+        let result = self
+            .state
+            .shutdown_result
+            .lock()
+            .expect("shutdown result lock")
+            .clone();
+        Box::pin(async move { result })
     }
 }
 
@@ -291,6 +310,7 @@ async fn caller_cancellation_does_not_drop_the_runtime_owner() -> anyhow::Result
         trace_temp.path(),
     )
     .await?;
+    let session_owner = Arc::clone(&exec.session);
 
     let task = tokio::spawn(async move {
         run_saved_workflow_once(&exec, "cancelled-workflow-call", "review").await
@@ -315,6 +335,190 @@ async fn caller_cancellation_does_not_drop_the_runtime_owner() -> anyhow::Result
         }
     })
     .await?;
+    drop(session_owner);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detached_runtime_owner_does_not_retain_the_session() -> anyhow::Result<()> {
+    let source_temp = TempDir::new()?;
+    let (snapshot, _source, _path) = captured_snapshot(&source_temp).await?;
+    let wait_started = Arc::new(Notify::new());
+    let wait_release = Arc::new(Notify::new());
+    let state = RecordingState::new(
+        Ok(yielded(CELL_ID)),
+        [Ok(WaitOutcome::LiveCell(completed(CELL_ID)))],
+    )
+    .block_wait(Arc::clone(&wait_started), wait_release);
+    let trace_temp = TempDir::new()?;
+    let resolver = snapshot_resolver(snapshot, Arc::new(AtomicUsize::new(/*v*/ 0)));
+    let exec = test_exec(
+        state,
+        /*workflow_enabled*/ true,
+        /*resolver*/ Some(resolver),
+        trace_temp.path(),
+    )
+    .await?;
+    let session_owner = Arc::clone(&exec.session);
+    let weak_session = Arc::downgrade(&session_owner);
+    let task = tokio::spawn(async move {
+        run_saved_workflow_once(&exec, "detached-workflow-call", "review").await
+    });
+    let timeout = std::time::Duration::from_secs(/*secs*/ 5);
+    tokio::time::timeout(timeout, wait_started.notified()).await?;
+    let weak_runtime_session = Arc::downgrade(
+        session_owner
+            .services
+            .code_mode_service
+            .session
+            .get()
+            .expect("runtime session"),
+    );
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("caller task should be cancelled")
+            .is_cancelled()
+    );
+
+    drop(session_owner);
+
+    assert!(weak_session.upgrade().is_none());
+    assert!(weak_runtime_session.upgrade().is_some());
+    tokio::time::timeout(timeout, async {
+        loop {
+            if ended_statuses(trace_temp.path())
+                .is_ok_and(|statuses| statuses == [CodeCellRuntimeStatus::Failed])
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    assert!(weak_runtime_session.upgrade().is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_shutdown_waits_for_tasks_and_preserves_the_runtime_result() -> anyhow::Result<()> {
+    let state = RecordingState::new(
+        Err("runtime must not initialize".to_string()),
+        std::iter::empty(),
+    );
+    let service = CodeModeService::new(Arc::new(RecordingProvider {
+        state: Arc::clone(&state),
+        create_block: None,
+    }));
+    let permit = service.reserve_runtime_task().expect("reserve task");
+    let shutdown = service.shutdown();
+    tokio::pin!(shutdown);
+
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert!(service.reserve_runtime_task().is_err());
+    drop(permit);
+    assert_eq!(shutdown.await, Ok(()));
+    assert_eq!(state.create_count.load(Ordering::SeqCst), 0);
+
+    let state = RecordingState::new(Err("unused".to_string()), std::iter::empty());
+    *state.shutdown_result.lock().expect("shutdown result lock") =
+        Err("runtime shutdown failed".to_string());
+    let service = CodeModeService::new(Arc::new(RecordingProvider {
+        state: Arc::clone(&state),
+        create_block: None,
+    }));
+    let _runtime_session = service.session().await.map_err(anyhow::Error::msg)?;
+    let permit = service.reserve_runtime_task().expect("reserve task");
+    let shutdown = service.shutdown();
+    tokio::pin!(shutdown);
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 1);
+    drop(permit);
+    assert_eq!(shutdown.await, Err("runtime shutdown failed".to_string()));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_initialization_finishing_during_shutdown_is_rejected() -> anyhow::Result<()> {
+    let state = RecordingState::new(Err("unused".to_string()), std::iter::empty());
+    let create_started = Arc::new(Notify::new());
+    let create_release = Arc::new(Notify::new());
+    let service = Arc::new(CodeModeService::new(Arc::new(RecordingProvider {
+        state: Arc::clone(&state),
+        create_block: Some((Arc::clone(&create_started), Arc::clone(&create_release))),
+    })));
+    let init_service = Arc::clone(&service);
+    let init = tokio::spawn(async move { init_service.session().await });
+    create_started.notified().await;
+    let shutdown = service.shutdown();
+    tokio::pin!(shutdown);
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert!(service.reserve_runtime_task().is_err());
+
+    create_release.notify_one();
+
+    assert_eq!(shutdown.await, Ok(()));
+    let Err(error) = init.await? else {
+        panic!("initialization completed during shutdown");
+    };
+    assert_eq!(error, "code mode session is shutting down");
+    assert_eq!(
+        (
+            state.create_count.load(Ordering::SeqCst),
+            state.shutdown_count.load(Ordering::SeqCst),
+        ),
+        (1, 1)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn service_shutdown_cancels_and_joins_the_runtime_owner() -> anyhow::Result<()> {
+    let source_temp = TempDir::new()?;
+    let (snapshot, _source, _path) = captured_snapshot(&source_temp).await?;
+    let wait_started = Arc::new(Notify::new());
+    let wait_release = Arc::new(Notify::new());
+    let state = RecordingState::new(
+        Ok(yielded(CELL_ID)),
+        [Ok(WaitOutcome::LiveCell(completed(CELL_ID)))],
+    )
+    .block_wait(Arc::clone(&wait_started), wait_release);
+    let trace_temp = TempDir::new()?;
+    let resolver = snapshot_resolver(snapshot, Arc::new(AtomicUsize::new(/*v*/ 0)));
+    let exec = test_exec(
+        Arc::clone(&state),
+        /*workflow_enabled*/ true,
+        /*resolver*/ Some(resolver),
+        trace_temp.path(),
+    )
+    .await?;
+    let session = Arc::clone(&exec.session);
+    let task =
+        tokio::spawn(
+            async move { run_saved_workflow_once(&exec, "shutdown-call", "review").await },
+        );
+    let timeout = std::time::Duration::from_secs(/*secs*/ 5);
+    tokio::time::timeout(timeout, wait_started.notified()).await?;
+
+    tokio::time::timeout(timeout, session.services.code_mode_service.shutdown())
+        .await?
+        .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(
+        tokio::time::timeout(timeout, task).await??,
+        Err(FunctionCallError::RespondToModel(
+            SAVED_WORKFLOW_EXECUTION_FAILED.to_string()
+        ))
+    );
+    assert_eq!(state.shutdown_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ended_statuses(trace_temp.path())?,
+        vec![CodeCellRuntimeStatus::Failed]
+    );
 
     Ok(())
 }
@@ -414,8 +618,10 @@ async fn test_exec(
         .set_enabled(Feature::Workflow, workflow_enabled)
         .expect("workflow feature should be configurable");
     turn.config = Arc::new(config);
-    session.services.code_mode_service =
-        CodeModeService::new(Arc::new(RecordingProvider { state }));
+    session.services.code_mode_service = CodeModeService::new(Arc::new(RecordingProvider {
+        state,
+        create_block: None,
+    }));
     if let Some(resolver) = resolver {
         session.services.thread_extension_data.insert(resolver);
     }

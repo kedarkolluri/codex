@@ -1,6 +1,7 @@
 //! One-shot execution of an immutable saved-workflow source snapshot.
 
 use codex_code_mode::CellId;
+use codex_code_mode::CodeModeSession;
 use codex_code_mode::ExecuteOutputPolicy;
 use codex_code_mode::ExecuteRequest;
 use codex_code_mode::RuntimeResponse;
@@ -17,10 +18,10 @@ use tokio::sync::oneshot;
 use tracing::warn;
 
 use crate::function_tool::FunctionCallError;
-use crate::session::session::Session;
 
 use super::DEFAULT_WAIT_YIELD_TIME_MS;
 use super::ExecContext;
+use super::delegate::CodeModeDispatchBroker;
 
 const SOURCE_RESOLVER_UNAVAILABLE: &str = "saved workflow discovery is unavailable";
 const SOURCE_NOT_FOUND: &str = "saved workflow was not found";
@@ -31,7 +32,7 @@ const SOURCE_LOAD_FAILED: &str = "saved workflow source is unavailable";
 /// Source capture completes before the code-mode service can initialize a session. The exact
 /// captured bytes are then used for both execution and tracing; this path never reopens the
 /// snapshot metadata path. This private staging seam is not exposed through a model, CLI, or
-/// app-server entrypoint until its runtime task can be supervised by the session.
+/// app-server entrypoint until its real-host and failure-path gates are complete.
 pub(crate) async fn run_saved_workflow_once(
     exec: &ExecContext,
     call_id: &str,
@@ -70,10 +71,21 @@ pub(crate) async fn run_saved_workflow_once(
     }
 
     let source = snapshot.source().to_string();
-    let started_cell = exec
+    let runtime_task = exec
         .session
         .services
         .code_mode_service
+        .reserve_runtime_task()
+        .map_err(|error| runtime_error("reserve owner", error))?;
+    let runtime_session = exec
+        .session
+        .services
+        .code_mode_service
+        .session()
+        .await
+        .map_err(|error| runtime_error("initialize", error))?;
+    let dispatch_broker = Arc::clone(&exec.session.services.code_mode_service.dispatch_broker);
+    let started_cell = runtime_session
         .execute(ExecuteRequest {
             tool_call_id: call_id.to_string(),
             enabled_tools: Vec::new(),
@@ -96,20 +108,35 @@ pub(crate) async fn run_saved_workflow_once(
             source,
         );
     let owner = RuntimeCellOwner {
-        session: Arc::clone(&exec.session),
+        runtime_session,
+        dispatch_broker,
         cell_id: cell_id.clone(),
         trace,
         content_items: Vec::new(),
         ended: false,
     };
-    exec.session
-        .services
-        .code_mode_service
-        .mark_cell_ready_for_dispatch(&cell_id);
+    owner.dispatch_broker.mark_cell_ready_for_dispatch(&cell_id);
 
     let (result_tx, result_rx) = oneshot::channel();
+    let cancellation = runtime_task.cancellation_token();
     tokio::spawn(async move {
-        let result = observe_to_terminal(owner, started_cell).await;
+        let _runtime_task = runtime_task;
+        let mut owner = owner;
+        let result = tokio::select! {
+            // Session shutdown wins simultaneous completion so a closed runtime cannot report
+            // a newly successful workflow result.
+            biased;
+            _ = cancellation.cancelled() => {
+                owner.record_ended(&RuntimeResponse::Result {
+                    cell_id: owner.cell_id.clone(),
+                    content_items: Vec::new(),
+                    error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
+                });
+                Err(respond_to_model(SAVED_WORKFLOW_EXECUTION_FAILED))
+            }
+            result = observe_to_terminal(&mut owner, started_cell) => result,
+        };
+        drop(owner);
         let _ = result_tx.send(result);
     });
     result_rx.await.map_err(|_| {
@@ -119,7 +146,7 @@ pub(crate) async fn run_saved_workflow_once(
 }
 
 async fn observe_to_terminal(
-    mut owner: RuntimeCellOwner,
+    owner: &mut RuntimeCellOwner,
     started_cell: StartedCell,
 ) -> Result<RuntimeResponse, FunctionCallError> {
     let mut response = started_cell
@@ -140,9 +167,7 @@ async fn observe_to_terminal(
             } => {
                 owner.content_items.extend(content_items);
                 response = match owner
-                    .session
-                    .services
-                    .code_mode_service
+                    .runtime_session
                     .wait(WaitRequest {
                         cell_id: owner.cell_id.clone(),
                         yield_time_ms: DEFAULT_WAIT_YIELD_TIME_MS,
@@ -166,7 +191,8 @@ async fn observe_to_terminal(
 }
 
 struct RuntimeCellOwner {
-    session: Arc<Session>,
+    runtime_session: Arc<dyn CodeModeSession>,
+    dispatch_broker: Arc<CodeModeDispatchBroker>,
     cell_id: CellId,
     trace: CodeCellTraceContext,
     content_items: Vec<codex_code_mode::FunctionCallOutputContentItem>,
@@ -179,7 +205,7 @@ impl RuntimeCellOwner {
         self.ended = true;
     }
 
-    fn with_accumulated_output(mut self, response: RuntimeResponse) -> RuntimeResponse {
+    fn with_accumulated_output(&mut self, response: RuntimeResponse) -> RuntimeResponse {
         match response {
             RuntimeResponse::Terminated {
                 cell_id,
@@ -219,10 +245,7 @@ impl Drop for RuntimeCellOwner {
                 error_text: Some(SAVED_WORKFLOW_EXECUTION_FAILED.to_string()),
             });
         }
-        self.session
-            .services
-            .code_mode_service
-            .finish_cell_dispatch(&self.cell_id);
+        self.dispatch_broker.close_cell(&self.cell_id);
     }
 }
 
