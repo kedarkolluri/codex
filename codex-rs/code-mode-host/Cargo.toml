@@ -8,6 +8,10 @@ license.workspace = true
 name = "codex-code-mode-host"
 path = "src/main.rs"
 
+[[bin]]
+name = "codex-code-mode-host-test-fixture"
+path = "src/test_fixture.rs"
+
 [lib]
 doctest = false
 name = "codex_code_mode_host"
