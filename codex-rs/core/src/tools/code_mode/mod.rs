@@ -2,11 +2,12 @@ mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
 mod response_adapter;
+mod runtime_task_supervisor;
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the next stacked slice exposes this terminal runner through workflow_run"
+        reason = "the runner stays private until exact-binding cleanup and entrypoint tests complete"
     )
 )]
 mod saved_workflow_run_once;
@@ -14,8 +15,6 @@ mod wait_handler;
 pub(crate) mod wait_spec;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_code_mode::CellId;
@@ -54,6 +53,8 @@ use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
 pub(crate) use execute_handler::CodeModeExecuteHandler;
 use response_adapter::into_function_call_output_content_items;
+use runtime_task_supervisor::RuntimeTaskPermit;
+use runtime_task_supervisor::RuntimeTaskSupervisor;
 pub(crate) use wait_handler::CodeModeWaitHandler;
 
 pub(crate) const PUBLIC_TOOL_NAME: &str = codex_code_mode::PUBLIC_TOOL_NAME;
@@ -75,7 +76,7 @@ pub(crate) struct CodeModeService {
     session: OnceCell<Arc<dyn CodeModeSession>>,
     session_provider: Arc<dyn CodeModeSessionProvider>,
     dispatch_broker: Arc<CodeModeDispatchBroker>,
-    shutting_down: AtomicBool,
+    runtime_tasks: RuntimeTaskSupervisor,
 }
 
 impl CodeModeService {
@@ -85,7 +86,7 @@ impl CodeModeService {
             session: OnceCell::new(),
             session_provider,
             dispatch_broker,
-            shutting_down: AtomicBool::new(false),
+            runtime_tasks: RuntimeTaskSupervisor::new(),
         }
     }
 
@@ -115,9 +116,9 @@ impl CodeModeService {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), String> {
-        self.shutting_down.store(true, Ordering::Release);
+        self.runtime_tasks.begin_shutdown();
         // Join any initialization already in progress without initializing an unused service.
-        match self
+        let result = match self
             .session
             .get_or_try_init(|| async {
                 Err::<Arc<dyn CodeModeSession>, String>(
@@ -128,7 +129,9 @@ impl CodeModeService {
         {
             Ok(session) => session.shutdown().await,
             Err(_) => Ok(()),
-        }
+        };
+        self.runtime_tasks.wait().await;
+        result
     }
 
     pub(crate) fn mark_cell_ready_for_dispatch(&self, cell_id: &codex_code_mode::CellId) {
@@ -137,6 +140,12 @@ impl CodeModeService {
 
     pub(crate) fn finish_cell_dispatch(&self, cell_id: &CellId) {
         self.dispatch_broker.close_cell(cell_id);
+    }
+
+    fn reserve_runtime_task(&self) -> Result<RuntimeTaskPermit, String> {
+        self.runtime_tasks
+            .reserve()
+            .ok_or_else(|| "code mode session is shutting down".to_string())
     }
 
     pub(crate) fn start_turn_worker(
@@ -163,19 +172,19 @@ impl CodeModeService {
     }
 
     async fn session(&self) -> Result<Arc<dyn CodeModeSession>, String> {
-        if self.shutting_down.load(Ordering::Acquire) {
+        if self.runtime_tasks.is_shutting_down() {
             return Err("code mode session is shutting down".to_string());
         }
         self.session
             .get_or_try_init(|| async {
-                if self.shutting_down.load(Ordering::Acquire) {
+                if self.runtime_tasks.is_shutting_down() {
                     return Err("code mode session is shutting down".to_string());
                 }
                 let session = self
                     .session_provider
                     .create_session(self.dispatch_broker.clone())
                     .await?;
-                if self.shutting_down.load(Ordering::Acquire) {
+                if self.runtime_tasks.is_shutting_down() {
                     let _ = session.shutdown().await;
                     return Err("code mode session is shutting down".to_string());
                 }
