@@ -238,10 +238,7 @@ async fn process_owned_saved_workflow_runs_and_controls_cells_on_spawned_host() 
     let completed_identity = WireWorkflowCellId::try_new(completed_cell_id.as_str())
         .expect("client-assigned workflow cell ID");
 
-    assert_eq!(
-        completed_identity.sequence(),
-        1,
-    );
+    assert_eq!(completed_identity.sequence(), 1,);
     assert_eq!(
         completed
             .initial_response()
