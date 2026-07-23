@@ -1,11 +1,16 @@
+use std::ffi::OsStr;
+
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
+use anyhow::ensure;
 use codex_code_mode_protocol::host::FramedReader;
 use codex_code_mode_protocol::host::FramedWriter;
 
 #[path = "test_fixture/host.rs"]
 mod host;
+#[path = "test_fixture/mismatched_identity.rs"]
+mod mismatched_identity;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -13,24 +18,47 @@ async fn main() -> Result<()> {
     let executable_stem = current_exe
         .file_stem()
         .context("fixture executable has no file stem")?;
-    let mode = match host::NegotiationMode::from_executable_stem(executable_stem) {
-        Some(mode) => mode,
-        None => bail!(
-            "unknown fixture executable stem `{}`; expected `{}`, `{}`, or `{}`",
+    let negotiation_mode = host::NegotiationMode::from_executable_stem(executable_stem);
+    let mismatched_identity_mode =
+        executable_stem == OsStr::new(mismatched_identity::MISMATCHED_WORKFLOW_ID_MODE);
+    if negotiation_mode.is_none() && !mismatched_identity_mode {
+        bail!(
+            "unknown fixture executable stem `{}`; expected `{}`, `{}`, `{}`, or `{}`",
             executable_stem.to_string_lossy(),
             host::NO_SAVED_CAPABILITIES_MODE,
             host::LEGACY_OUTPUT_ONLY_MODE,
             host::INVALID_WORKFLOW_CAPABILITIES_MODE,
-        ),
-    };
-    if let Some(arg) = std::env::args_os().nth(1) {
-        bail!("unknown fixture argument `{}`", arg.to_string_lossy());
+            mismatched_identity::MISMATCHED_WORKFLOW_ID_MODE,
+        );
     }
 
-    host::run_negotiation_fixture(
-        mode,
-        FramedReader::new(tokio::io::stdin()),
-        FramedWriter::new(tokio::io::stdout()),
-    )
-    .await
+    let mut args = std::env::args_os().skip(1);
+    let role = match args.next() {
+        None => mismatched_identity::FixtureRole::Host,
+        Some(arg) if arg == OsStr::new(mismatched_identity::STDIN_OBSERVER_ARG) => {
+            mismatched_identity::FixtureRole::StdinObserver
+        }
+        Some(arg) if arg == OsStr::new(mismatched_identity::STDOUT_OBSERVER_ARG) => {
+            mismatched_identity::FixtureRole::StdoutObserver
+        }
+        Some(arg) => bail!("unknown fixture argument `{}`", arg.to_string_lossy()),
+    };
+    ensure!(args.next().is_none(), "fixture received too many arguments");
+    if !matches!(&role, mismatched_identity::FixtureRole::Host) {
+        ensure!(
+            mismatched_identity_mode,
+            "observers are only valid for the mismatched workflow-ID fixture"
+        );
+    }
+
+    if let Some(mode) = negotiation_mode {
+        host::run_negotiation_fixture(
+            mode,
+            FramedReader::new(tokio::io::stdin()),
+            FramedWriter::new(tokio::io::stdout()),
+        )
+        .await
+    } else {
+        mismatched_identity::run(current_exe, role).await
+    }
 }
