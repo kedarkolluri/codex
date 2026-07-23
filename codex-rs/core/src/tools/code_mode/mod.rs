@@ -2,6 +2,14 @@ mod delegate;
 mod execute_handler;
 pub(crate) mod execute_spec;
 mod response_adapter;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the next stacked slice exposes this terminal runner through workflow_run"
+    )
+)]
+mod saved_workflow_run_once;
 mod wait_handler;
 pub(crate) mod wait_spec;
 
