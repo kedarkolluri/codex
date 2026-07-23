@@ -71,6 +71,7 @@ fn direct_driver_with_outgoing() -> (
         event_rx,
         event_tx,
         outgoing_tx,
+        crate::remote_session::connection::handshake::NegotiatedCapabilities::default(),
         DriverLifecycle {
             alive: Arc::clone(&alive),
             failure: Arc::new(StdMutex::new(None)),
@@ -445,6 +446,7 @@ async fn invalid_typed_host_cell_id_fails_connection_and_pending_request() {
         event_rx,
         event_tx.clone(),
         outgoing_tx,
+        crate::remote_session::connection::handshake::NegotiatedCapabilities::default(),
         DriverLifecycle {
             alive: Arc::clone(&alive),
             failure: Arc::clone(&failure),
