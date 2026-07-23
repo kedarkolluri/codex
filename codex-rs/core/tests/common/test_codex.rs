@@ -22,6 +22,7 @@ use codex_core::config::Config;
 use codex_core::resolve_installation_id;
 use codex_core::shell::Shell;
 use codex_core::shell::get_shell_by_model_provided_path;
+use codex_core::test_support::CodeModeSessionProvider;
 use codex_core::thread_store_from_config;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
@@ -311,6 +312,7 @@ pub struct TestCodexBuilder {
     supports_openai_form_elicitation: bool,
     external_time_provider: Option<Arc<dyn TimeProvider>>,
     code_mode_host_program: Option<PathBuf>,
+    code_mode_session_provider: Option<Arc<dyn CodeModeSessionProvider>>,
     history_mode: Option<ThreadHistoryMode>,
 }
 
@@ -425,6 +427,16 @@ impl TestCodexBuilder {
 
     pub fn with_code_mode_host_program(mut self, host_program: PathBuf) -> Self {
         self.code_mode_host_program = Some(host_program);
+        self.code_mode_session_provider = None;
+        self
+    }
+
+    pub fn with_code_mode_session_provider(
+        mut self,
+        session_provider: Arc<dyn CodeModeSessionProvider>,
+    ) -> Self {
+        self.code_mode_host_program = None;
+        self.code_mode_session_provider = Some(session_provider);
         self
     }
 
@@ -648,12 +660,17 @@ impl TestCodexBuilder {
             /*attestation_provider*/ None,
             /*external_time_provider*/ self.external_time_provider.clone(),
         );
-        let code_mode_host_program = self
-            .code_mode_host_program
-            .take()
-            .or_else(|| codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").ok());
-        let thread_manager = if config.features.enabled(Feature::CodeModeHost)
-            && let Some(code_mode_host_program) = code_mode_host_program
+        let thread_manager = if let Some(session_provider) = self.code_mode_session_provider.take()
+        {
+            codex_core::test_support::with_code_mode_session_provider(
+                thread_manager,
+                session_provider,
+            )
+        } else if config.features.enabled(Feature::CodeModeHost)
+            && let Some(code_mode_host_program) = self
+                .code_mode_host_program
+                .take()
+                .or_else(|| codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").ok())
         {
             codex_core::test_support::with_code_mode_host_program(
                 thread_manager,
@@ -1278,6 +1295,7 @@ pub fn test_codex() -> TestCodexBuilder {
         supports_openai_form_elicitation: false,
         external_time_provider: None,
         code_mode_host_program: None,
+        code_mode_session_provider: None,
         history_mode: None,
     }
 }

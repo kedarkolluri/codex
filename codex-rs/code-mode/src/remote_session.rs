@@ -13,9 +13,7 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::CodeModeSessionProvider;
 use codex_code_mode_protocol::CodeModeSessionProviderFuture;
 use codex_code_mode_protocol::CodeModeSessionResultFuture;
-use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
-use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
@@ -35,7 +33,10 @@ const CODE_MODE_HOST_PATH_ENV: &str = "CODEX_CODE_MODE_HOST_PATH";
 
 type ShutdownResultReceiver = watch::Receiver<Option<Result<(), String>>>;
 
-/// Creates code-mode sessions backed by one lazily spawned process host.
+/// Creates sessions backed by one lazily spawned host process.
+///
+/// If the host program is not found, future sessions use the in-process backend,
+/// whose supported output policies may differ from the process-owned backend.
 pub struct ProcessOwnedCodeModeSessionProvider {
     state: StdMutex<ProviderState>,
 }
@@ -223,9 +224,6 @@ impl ProcessOwnedCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
-        if request.output_policy == ExecuteOutputPolicy::SavedWorkflow {
-            return Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string());
-        }
         let binding = self.connection().await?;
         binding.connection.execute(binding.remote, request).await
     }

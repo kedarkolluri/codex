@@ -38,6 +38,8 @@ use crate::responses_metadata::subagent_metadata_kind;
 use crate::thread_manager;
 use crate::unified_exec;
 
+pub use codex_code_mode::CodeModeSessionProvider;
+
 static TEST_MODEL_PRESETS: Lazy<Vec<ModelPreset>> = Lazy::new(|| {
     let mut response = bundled_models_response()
         .unwrap_or_else(|err| panic!("bundled models.json should parse: {err}"));
@@ -78,6 +80,13 @@ pub fn with_code_mode_host_program(
     host_program: PathBuf,
 ) -> ThreadManager {
     thread_manager.with_code_mode_host_program_for_tests(host_program)
+}
+
+pub fn with_code_mode_session_provider(
+    thread_manager: ThreadManager,
+    session_provider: Arc<dyn CodeModeSessionProvider>,
+) -> ThreadManager {
+    thread_manager.with_code_mode_session_provider_for_tests(session_provider)
 }
 
 pub fn thread_manager_with_models_provider(
