@@ -24,7 +24,7 @@ workspace = true
 anyhow = { workspace = true }
 codex-code-mode = { workspace = true }
 codex-code-mode-protocol = { workspace = true }
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
