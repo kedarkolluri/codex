@@ -134,12 +134,21 @@ impl ConnectionDriver {
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,
+                expected_cell_identity,
                 output_admission,
                 cancellation,
             } => match result {
                 Ok(HostResponse::ExecutionStarted { cell_id }) => {
-                    // The host owns a checked, never-reused ID sequence. Retain only live
-                    // IDs so client memory scales with concurrency, not session lifetime.
+                    if !self
+                        .workflow_cell_ids
+                        .execution_started_matches(&expected_cell_identity, &cell_id)
+                    {
+                        let reason = "code-mode host returned an invalid execution cell identity"
+                            .to_string();
+                        return self.fail_admitted(response_tx, reason, &output_admission);
+                    }
+                    // Ordinary IDs come from the host; workflow IDs come from the client.
+                    // Both sequences are checked for reuse, so retain only live IDs.
                     let remote_cell_id = cell_id.clone();
                     let public_id = match self.sessions.admit_cell(
                         &session,

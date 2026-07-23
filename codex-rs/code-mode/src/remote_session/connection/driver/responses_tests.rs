@@ -49,6 +49,7 @@ use super::super::types::CancellableRequest;
 use super::super::types::DeliveredExecute;
 use super::super::types::InitialResponse;
 use super::super::types::PendingRequest;
+use super::super::workflow_cell_ids::ExpectedCellIdentity;
 use super::ConnectionDriver;
 
 fn direct_driver() -> (ConnectionDriver, Arc<AtomicBool>) {
@@ -169,6 +170,7 @@ fn insert_execute_for_session(
             response_tx,
             initial_response_tx,
             initial_response_rx,
+            expected_cell_identity: ExpectedCellIdentity::HostAllocated,
             output_admission,
             cancellation: CancellableRequest::new(CancellationToken::new()),
         },

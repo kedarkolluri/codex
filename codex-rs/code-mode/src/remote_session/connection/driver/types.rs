@@ -20,6 +20,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::cleanup::SessionCleanup;
 use super::output_admission::RemoteOutputAdmission;
+use super::workflow_cell_ids::ExpectedCellIdentity;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::remote_session) struct RemoteSession {
@@ -148,6 +149,7 @@ pub(super) enum PendingRequest {
         response_tx: oneshot::Sender<Result<DeliveredExecute, String>>,
         initial_response_tx: oneshot::Sender<Result<RuntimeResponse, String>>,
         initial_response_rx: oneshot::Receiver<Result<RuntimeResponse, String>>,
+        expected_cell_identity: ExpectedCellIdentity,
         output_admission: RemoteOutputAdmission,
         cancellation: CancellableRequest,
     },

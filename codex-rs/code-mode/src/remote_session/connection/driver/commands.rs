@@ -5,7 +5,6 @@ use codex_code_mode_protocol::CodeModeSessionDelegate;
 use codex_code_mode_protocol::ExecuteOutputPolicy;
 use codex_code_mode_protocol::ExecuteRequest;
 use codex_code_mode_protocol::RuntimeResponse;
-use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::WaitOutcome;
 use codex_code_mode_protocol::WaitRequest;
 use codex_code_mode_protocol::host::ClientToHost;
@@ -25,7 +24,9 @@ use super::types::DriverCommand;
 use super::types::PendingRequest;
 use super::types::RemoteSession;
 use super::workflow_cell_ids::CellProvenance;
+use super::workflow_cell_ids::ExpectedCellIdentity;
 use super::workflow_cell_ids::ResolvedCellId;
+use super::workflow_cell_ids::WorkflowCellIdAllocationError;
 
 impl ConnectionDriver {
     pub(super) fn handle_command(&mut self, command: DriverCommand) -> bool {
@@ -124,24 +125,45 @@ impl ConnectionDriver {
             let _ = response_tx.send(Err(err));
             return true;
         }
-        if request.output_policy == ExecuteOutputPolicy::SavedWorkflow {
-            let _ = response_tx.send(Err(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE.to_string()));
-            return true;
-        }
+        let expected_cell_identity = match request.output_policy {
+            ExecuteOutputPolicy::Ordinary => ExpectedCellIdentity::HostAllocated,
+            ExecuteOutputPolicy::SavedWorkflow => {
+                match self.workflow_cell_ids.allocate_saved_cell_id() {
+                    Ok(cell_id) => ExpectedCellIdentity::SavedWorkflow(cell_id),
+                    Err(err) => {
+                        let keep_running =
+                            matches!(err, WorkflowCellIdAllocationError::Unavailable);
+                        let _ = response_tx.send(Err(err.to_string()));
+                        return keep_running;
+                    }
+                }
+            }
+        };
         let output_admission = RemoteOutputAdmission::with_terminal_echo_budget(
             request.output_policy,
             self.terminal_echo_budget.clone(),
         );
-        let request =
-            match WireExecuteRequest::try_from_domain(request, self.capabilities.selected()) {
-                Ok(request) => request,
-                Err(err) => {
-                    let _ = response_tx.send(Err(format!(
-                        "failed to encode code-mode execute request: {err}"
-                    )));
-                    return true;
-                }
-            };
+        let request = match &expected_cell_identity {
+            ExpectedCellIdentity::HostAllocated => {
+                WireExecuteRequest::try_from_domain(request, self.capabilities.selected())
+            }
+            ExpectedCellIdentity::SavedWorkflow(cell_id) => {
+                WireExecuteRequest::try_from_domain_with_workflow_cell_id(
+                    request,
+                    self.capabilities.selected(),
+                    cell_id.clone(),
+                )
+            }
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(err) => {
+                let _ = response_tx.send(Err(format!(
+                    "failed to encode code-mode execute request: {err}"
+                )));
+                return true;
+            }
+        };
         let request_id = match self.requests.allocate_id() {
             Ok(id) => id,
             Err(err) => {
@@ -174,6 +196,7 @@ impl ConnectionDriver {
                 response_tx,
                 initial_response_tx,
                 initial_response_rx,
+                expected_cell_identity,
                 output_admission,
                 cancellation,
             },

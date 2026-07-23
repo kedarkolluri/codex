@@ -1,4 +1,7 @@
+use std::fmt;
+
 use codex_code_mode_protocol::CellId;
+use codex_code_mode_protocol::SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE;
 use codex_code_mode_protocol::host::WireCellId;
 use codex_code_mode_protocol::host::WireWorkflowCellId;
 use uuid::Uuid;
@@ -9,6 +12,8 @@ use super::types::RemoteSession;
 use crate::remote_session::connection::handshake::NegotiatedWorkflowCellIdentity;
 
 const WORKFLOW_CELL_ID_REJECTED: &str = "workflow cell identity was rejected";
+const WORKFLOW_CELL_ID_SPACE_EXHAUSTED: &str = "code-mode workflow cell ID space exhausted";
+const WORKFLOW_CELL_ID_ALLOCATION_FAILED: &str = "failed to allocate code-mode workflow cell ID";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CellProvenance {
@@ -22,9 +27,31 @@ pub(super) struct ResolvedCellId {
     pub(super) provenance: CellProvenance,
 }
 
+pub(super) enum ExpectedCellIdentity {
+    HostAllocated,
+    SavedWorkflow(WireWorkflowCellId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkflowCellIdAllocationError {
+    Unavailable,
+    Exhausted,
+    Internal,
+}
+
+impl fmt::Display for WorkflowCellIdAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str(SAVED_WORKFLOW_OUTPUT_POLICY_UNAVAILABLE),
+            Self::Exhausted => formatter.write_str(WORKFLOW_CELL_ID_SPACE_EXHAUSTED),
+            Self::Internal => formatter.write_str(WORKFLOW_CELL_ID_ALLOCATION_FAILED),
+        }
+    }
+}
+
 pub(super) enum WorkflowCellNamespace {
     Unavailable,
-    V1 { epoch: String },
+    V1 { epoch: String, last_sequence: u64 },
 }
 
 impl WorkflowCellNamespace {
@@ -33,7 +60,40 @@ impl WorkflowCellNamespace {
             NegotiatedWorkflowCellIdentity::Unavailable => Self::Unavailable,
             NegotiatedWorkflowCellIdentity::V1 => Self::V1 {
                 epoch: Uuid::new_v4().simple().to_string(),
+                last_sequence: 0,
             },
+        }
+    }
+
+    pub(super) fn allocate_saved_cell_id(
+        &mut self,
+    ) -> Result<WireWorkflowCellId, WorkflowCellIdAllocationError> {
+        let Self::V1 {
+            epoch,
+            last_sequence,
+        } = self
+        else {
+            return Err(WorkflowCellIdAllocationError::Unavailable);
+        };
+        let sequence = last_sequence
+            .checked_add(1)
+            .ok_or(WorkflowCellIdAllocationError::Exhausted)?;
+        let cell_id = WireWorkflowCellId::try_new(format!("wf:1:{epoch}:{sequence}"))
+            .map_err(|_| WorkflowCellIdAllocationError::Internal)?;
+        *last_sequence = sequence;
+        Ok(cell_id)
+    }
+
+    pub(super) fn execution_started_matches(
+        &self,
+        expected: &ExpectedCellIdentity,
+        actual: &WireCellId,
+    ) -> bool {
+        match expected {
+            ExpectedCellIdentity::HostAllocated => {
+                self.provenance(actual) == CellProvenance::Ordinary
+            }
+            ExpectedCellIdentity::SavedWorkflow(expected) => expected.as_str() == actual.as_str(),
         }
     }
 
@@ -70,7 +130,7 @@ impl WorkflowCellNamespace {
     }
 
     fn provenance(&self, wire_id: &WireCellId) -> CellProvenance {
-        let Self::V1 { epoch } = self else {
+        let Self::V1 { epoch, .. } = self else {
             return CellProvenance::Ordinary;
         };
         match WireWorkflowCellId::try_from(wire_id.clone()) {
