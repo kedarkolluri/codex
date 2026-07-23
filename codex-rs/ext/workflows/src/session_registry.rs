@@ -4,6 +4,7 @@ use std::sync::Arc;
 use codex_core_workflows::WorkflowRegistry;
 use codex_core_workflows::WorkflowRoot;
 use codex_core_workflows::WorkflowRootAssembly;
+use codex_core_workflows::WorkflowSourceResolver;
 use codex_core_workflows::load_workflows_from_roots;
 use codex_exec_server::Environment;
 use codex_exec_server::LocalFileSystem;
@@ -80,7 +81,12 @@ pub(crate) enum WorkflowProjectSource {
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct WorkflowThreadState {
+    inner: Arc<WorkflowThreadStateInner>,
+}
+
+struct WorkflowThreadStateInner {
     config: WorkflowExtensionConfig,
     project_source: WorkflowProjectSource,
     registry: OnceCell<WorkflowSessionRegistryResult>,
@@ -92,26 +98,44 @@ impl WorkflowThreadState {
         project_source: WorkflowProjectSource,
     ) -> Self {
         Self {
-            config,
-            project_source,
-            registry: OnceCell::new(),
+            inner: Arc::new(WorkflowThreadStateInner {
+                config,
+                project_source,
+                registry: OnceCell::new(),
+            }),
         }
     }
 
+    pub(crate) fn source_resolver(&self) -> WorkflowSourceResolver {
+        let state = self.clone();
+        WorkflowSourceResolver::new(move |name| {
+            let state = state.clone();
+            async move {
+                let session_registry = state.registry().await.map_err(|error| error.to_string())?;
+                session_registry
+                    .registry()
+                    .source_snapshot_by_name(&name)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        })
+    }
+
     async fn registry(&self) -> WorkflowSessionRegistryResult {
-        self.registry
+        self.inner
+            .registry
             .get_or_init(|| self.build_registry())
             .await
             .clone()
     }
 
     async fn build_registry(&self) -> WorkflowSessionRegistryResult {
-        let mut assembly = WorkflowRootAssembly::new(self.config.codex_home.clone());
-        if let Some(user_home) = self.config.user_home.clone() {
+        let mut assembly = WorkflowRootAssembly::new(self.inner.config.codex_home.clone());
+        if let Some(user_home) = self.inner.config.user_home.clone() {
             assembly = assembly.with_user_home(user_home);
         }
 
-        assembly = match &self.project_source {
+        assembly = match &self.inner.project_source {
             WorkflowProjectSource::Executor {
                 environment_id,
                 cwd,
@@ -127,7 +151,7 @@ impl WorkflowThreadState {
                 let project_root = executor_project_root(
                     file_system.as_ref(),
                     cwd,
-                    &self.config.project_root_markers,
+                    &self.inner.config.project_root_markers,
                 )
                 .await
                 .map_err(Arc::new)?;
@@ -143,7 +167,7 @@ impl WorkflowThreadState {
             WorkflowProjectSource::Host { cwd } => {
                 let file_system = LocalFileSystem::unsandboxed();
                 let project_root =
-                    host_project_root(&file_system, cwd, &self.config.project_root_markers)
+                    host_project_root(&file_system, cwd, &self.inner.config.project_root_markers)
                         .await
                         .map_err(Arc::new)?;
                 assembly.with_host_project(project_root)

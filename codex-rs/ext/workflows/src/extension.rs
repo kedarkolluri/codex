@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use codex_core_workflows::WorkflowSourceResolver;
 use codex_exec_server::EnvironmentManager;
 use codex_extension_api::ExtensionFuture;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -23,6 +24,7 @@ where
         let config = (self.config_from_host)(input.config);
         if !config.enabled {
             input.thread_store.remove::<WorkflowThreadState>();
+            input.thread_store.remove::<WorkflowSourceResolver>();
             return Box::pin(std::future::ready(()));
         }
 
@@ -48,9 +50,9 @@ where
                 cwd: config.fallback_cwd.clone(),
             },
         };
-        input
-            .thread_store
-            .insert(WorkflowThreadState::new(config, project_source));
+        let state = WorkflowThreadState::new(config, project_source);
+        input.thread_store.insert(state.source_resolver());
+        input.thread_store.insert(state);
         Box::pin(std::future::ready(()))
     }
 }

@@ -10,6 +10,7 @@ mod model;
 mod registry;
 mod root_assembly;
 mod source;
+mod source_resolver;
 
 pub use codex_code_mode_protocol::WORKFLOW_SOURCE_MAX_BYTES;
 pub use loader::load_workflows_from_roots;
@@ -21,3 +22,5 @@ pub use registry::WorkflowRegistry;
 pub use root_assembly::WorkflowRootAssembly;
 pub use source::WorkflowSourceLoadError;
 pub use source::WorkflowSourceSnapshot;
+pub use source_resolver::WorkflowSourceResolver;
+pub use source_resolver::WorkflowSourceResolverError;
